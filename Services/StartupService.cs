@@ -1,0 +1,53 @@
+using System.Diagnostics;
+using Microsoft.Win32;
+
+namespace ClipThat.Services;
+
+/// <summary>
+/// Manages automatic launch with Windows via the current user's Run registry key.
+/// </summary>
+public sealed class StartupService
+{
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+    private const string ValueName = "ClipThat";
+
+    /// <summary>
+    /// Returns true if ClipThat is currently registered to start with Windows.
+    /// </summary>
+    public bool IsEnabled()
+    {
+        using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
+        object? value = key?.GetValue(ValueName);
+        return value is string command && !string.IsNullOrWhiteSpace(command);
+    }
+
+    /// <summary>
+    /// Adds or removes the ClipThat startup registry entry with the --minimized flag.
+    /// </summary>
+    public void SetEnabled(bool enabled)
+    {
+        using RegistryKey key = Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true)
+            ?? throw new InvalidOperationException("Nie można otworzyć klucza rejestru autostartu.");
+
+        if (enabled)
+        {
+            string? executablePath = Environment.ProcessPath;
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                using Process currentProcess = Process.GetCurrentProcess();
+                executablePath = currentProcess.MainModule?.FileName;
+            }
+
+            if (string.IsNullOrWhiteSpace(executablePath))
+            {
+                throw new InvalidOperationException("Nie udało się ustalić ścieżki pliku wykonywalnego ClipThat.");
+            }
+
+            key.SetValue(ValueName, $"\"{executablePath}\" --minimized", RegistryValueKind.String);
+        }
+        else
+        {
+            key.DeleteValue(ValueName, throwOnMissingValue: false);
+        }
+    }
+}

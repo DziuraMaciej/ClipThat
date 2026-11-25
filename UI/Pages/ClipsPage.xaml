@@ -1,0 +1,59 @@
+<Page x:Class="ClipThat.UI.Pages.ClipsPage"
+      xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+      Title="Nagrania">
+
+    <Grid Margin="24,16,24,24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="0,0,0,16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0">
+                <TextBlock Text="Nagrania"
+                           FontSize="24"
+                           FontWeight="SemiBold"
+                           Margin="0,0,0,4" />
+                <TextBlock x:Name="FolderPathText"
+                           Opacity="0.7"
+                           TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                <ui:Button Content="Odśwież"
+                           Icon="{ui:SymbolIcon ArrowClockwise24}"
+                           Margin="0,0,8,0"
+                           Click="RefreshButton_Click" />
+                <ui:Button Content="Otwórz folder"
+                           Appearance="Primary"
+                           Icon="{ui:SymbolIcon FolderOpen24}"
+                           Click="OpenFolderButton_Click" />
+            </StackPanel>
+        </Grid>
+
+        <TextBlock x:Name="EmptyStateText"
+                   Grid.Row="1"
+                   Text="Brak zapisanych nagrań w wybranym folderze."
+                   Opacity="0.7"
+                   Margin="0,8,0,8"
+                   Visibility="Collapsed" />
+
+        <ListView x:Name="ClipsListView"
+                  Grid.Row="2"
+                  MouseDoubleClick="ClipsListView_MouseDoubleClick">
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="Nazwa pliku" Width="320" DisplayMemberBinding="{Binding FileName}" />
+                    <GridViewColumn Header="Data utworzenia" Width="170" DisplayMemberBinding="{Binding CreatedAtText}" />
+                    <GridViewColumn Header="Rozmiar" Width="110" DisplayMemberBinding="{Binding SizeText}" />
+                </GridView>
+            </ListView.View>
+        </ListView>
+    </Grid>
+</Page>

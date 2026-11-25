@@ -1,0 +1,42 @@
+<ui:FluentWindow x:Class="ClipThat.UI.MainWindow"
+                 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
+                 xmlns:pages="clr-namespace:ClipThat.UI.Pages"
+                 Title="ClipThat"
+                 Width="960"
+                 Height="660"
+                 MinWidth="760"
+                 MinHeight="520"
+                 WindowStartupLocation="CenterScreen"
+                 ExtendsContentIntoTitleBar="True"
+                 WindowBackdropType="Mica"
+                 WindowCornerPreference="Round">
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <ui:TitleBar Grid.Row="0"
+                     Title="ClipThat"
+                     CloseWindowByDoubleClickOnIcon="True" />
+
+        <ui:NavigationView x:Name="RootNavigation"
+                           Grid.Row="1"
+                           IsBackButtonVisible="Collapsed"
+                           IsPaneToggleVisible="True"
+                           PaneDisplayMode="Left"
+                           OpenPaneLength="210">
+            <ui:NavigationView.MenuItems>
+                <ui:NavigationViewItem Content="Ustawienia"
+                                       Icon="{ui:SymbolIcon Settings24}"
+                                       TargetPageType="{x:Type pages:SettingsPage}" />
+                <ui:NavigationViewItem Content="Nagrania"
+                                       Icon="{ui:SymbolIcon Video24}"
+                                       TargetPageType="{x:Type pages:ClipsPage}" />
+            </ui:NavigationView.MenuItems>
+        </ui:NavigationView>
+    </Grid>
+</ui:FluentWindow>
