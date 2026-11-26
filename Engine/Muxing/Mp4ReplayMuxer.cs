@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -18,20 +19,34 @@ public sealed class Mp4ReplayMuxer
     private const long DefaultAacDuration100Ns =
         (DualAudioCaptureService.AacFrameSampleCount * TimeSpan.TicksPerSecond) / DualAudioCaptureService.TargetSampleRate;
 
+    // ISO/IEC 14496-12 (MP4) FourCC box and handler identifiers
+    private const uint BoxTypeMoov = 0x6D6F6F76u;      // "moov"
+    private const uint BoxTypeMvhd = 0x6D766864u;      // "mvhd"
+    private const uint BoxTypeTrak = 0x7472616Bu;      // "trak"
+    private const uint BoxTypeTkhd = 0x746B6864u;      // "tkhd"
+    private const uint BoxTypeMdia = 0x6D646961u;      // "mdia"
+    private const uint BoxTypeHdlr = 0x68646C72u;      // "hdlr"
+    private const uint BoxTypeUuid = 0x75756964u;      // "uuid"
+    private const uint HandlerTypeSound = 0x736F756Eu; // "soun"
+
     /// <summary>
-    /// Deterministic MP4 track registration order (OBS-style 3-track layout when microphone is active):
+    /// Deterministic MP4 track registration order for Windows Media Foundation compatibility:
+    /// Windows Media Foundation's MPEG-4 demuxer selects the LAST audio stream by default.
+    /// When microphone packets exist (3 audio tracks):
     /// Stream 0: H.264 Video,
-    /// Stream 1: Combined Mix Audio (default audio track for Discord, browsers, Windows Media Player),
-    /// Stream 2: Isolated System Audio,
-    /// Stream 3: Isolated Microphone Audio.
-    /// When microphone capture is disabled or absent, System Audio is registered directly as Stream 1.
+    /// Stream 1 (0:a:0): Isolated System Audio,
+    /// Stream 2 (0:a:1): Isolated Microphone Audio,
+    /// Stream 3 (0:a:2, LAST): Combined Mix Audio (System + Mic mix — default track for WMP, VLC, browsers, Discord).
+    /// When microphone capture is disabled or absent (1 audio track):
+    /// Stream 0: H.264 Video,
+    /// Stream 1 (0:a:0): System Audio.
     /// </summary>
     private static readonly MediaTrackType[] DeterministicTrackOrder =
     {
         MediaTrackType.Video,
-        MediaTrackType.CombinedMixAudio,
         MediaTrackType.SystemAudio,
-        MediaTrackType.MicrophoneAudio
+        MediaTrackType.MicrophoneAudio,
+        MediaTrackType.CombinedMixAudio
     };
 
     /// <summary>
@@ -121,12 +136,12 @@ public sealed class Mp4ReplayMuxer
             throw new InvalidOperationException("Brak pakietów wideo do zapisania w pliku MP4.");
         }
 
-        // Only include the 3-track layout (CombinedMix + System + Mic) when microphone packets are present;
+        // Only include the 3-track layout (System + Mic + CombinedMix last) when microphone packets are present;
         // otherwise fall back to SystemAudio as Stream 1.
         bool includeCombinedMix = hasMicrophoneAudio && hasCombinedMixAudio;
 
         // Stable timestamp ordering ensures smooth MP4 interleaving across video and audio streams
-        // while preserving deterministic track priority (Video -> CombinedMixAudio -> SystemAudio -> MicrophoneAudio)
+        // while preserving deterministic track priority (Video -> SystemAudio -> MicrophoneAudio -> CombinedMixAudio)
         // and exact encoder packet order within each track.
         orderedPackets.Sort(static (a, b) =>
         {
@@ -171,18 +186,18 @@ public sealed class Mp4ReplayMuxer
 
             sinkWriter = MediaFactory.MFCreateSinkWriterFromURL(outputFilePath, null, sinkAttributes);
 
-            // Register streams in strict deterministic order:
+            // Register streams in strict deterministic order (CombinedMixAudio LAST for Windows Media Foundation):
             // Stream 0: H.264 Video
             // When microphone packets are present:
-            //   Stream 1: Combined Mix Audio (default track for Discord, browsers, Media Player)
-            //   Stream 2: System Audio
-            //   Stream 3: Microphone Audio
+            //   Stream 1 (0:a:0): System Audio
+            //   Stream 2 (0:a:1): Microphone Audio
+            //   Stream 3 (0:a:2): Combined Mix Audio (default track for WMP, VLC, browsers, Discord)
             // Otherwise:
-            //   Stream 1: System Audio
+            //   Stream 1 (0:a:0): System Audio
             int videoStreamIndex = -1;
-            int combinedMixAudioStreamIndex = -1;
             int systemAudioStreamIndex = -1;
             int microphoneAudioStreamIndex = -1;
+            int combinedMixAudioStreamIndex = -1;
 
             foreach (MediaTrackType trackType in DeterministicTrackOrder)
             {
@@ -193,18 +208,6 @@ public sealed class Mp4ReplayMuxer
                         videoStreamIndex = sinkWriter.AddStream(videoMediaType);
                         sinkWriter.SetInputMediaType(videoStreamIndex, videoMediaType, null);
                         break;
-
-                    case MediaTrackType.CombinedMixAudio when includeCombinedMix:
-                    {
-                        byte[] mixUserData = snapshot.CombinedMixAudioUserData is { Length: > 0 }
-                            ? snapshot.CombinedMixAudioUserData
-                            : DefaultAac48kStereoUserData;
-
-                        combinedMixAudioMediaType = CreateAacMediaType(mixUserData);
-                        combinedMixAudioStreamIndex = sinkWriter.AddStream(combinedMixAudioMediaType);
-                        sinkWriter.SetInputMediaType(combinedMixAudioStreamIndex, combinedMixAudioMediaType, null);
-                        break;
-                    }
 
                     case MediaTrackType.SystemAudio when hasSystemAudio:
                     {
@@ -229,17 +232,42 @@ public sealed class Mp4ReplayMuxer
                         sinkWriter.SetInputMediaType(microphoneAudioStreamIndex, microphoneAudioMediaType, null);
                         break;
                     }
+
+                    case MediaTrackType.CombinedMixAudio when includeCombinedMix:
+                    {
+                        byte[] mixUserData = snapshot.CombinedMixAudioUserData is { Length: > 0 }
+                            ? snapshot.CombinedMixAudioUserData
+                            : DefaultAac48kStereoUserData;
+
+                        combinedMixAudioMediaType = CreateAacMediaType(mixUserData);
+                        combinedMixAudioStreamIndex = sinkWriter.AddStream(combinedMixAudioMediaType);
+                        sinkWriter.SetInputMediaType(combinedMixAudioStreamIndex, combinedMixAudioMediaType, null);
+                        break;
+                    }
                 }
             }
 
-            if (videoStreamIndex != 0 ||
-                (includeCombinedMix && combinedMixAudioStreamIndex != 1) ||
-                (includeCombinedMix && hasSystemAudio && systemAudioStreamIndex != 2) ||
-                (includeCombinedMix && hasSystemAudio && hasMicrophoneAudio && microphoneAudioStreamIndex != 3) ||
-                (!includeCombinedMix && hasSystemAudio && systemAudioStreamIndex != 1))
+            int expectedNextIndex = 1;
+            bool invalidStreamOrder = videoStreamIndex != 0;
+            if (hasSystemAudio)
+            {
+                invalidStreamOrder |= systemAudioStreamIndex != expectedNextIndex++;
+            }
+
+            if (hasMicrophoneAudio)
+            {
+                invalidStreamOrder |= microphoneAudioStreamIndex != expectedNextIndex++;
+            }
+
+            if (includeCombinedMix)
+            {
+                invalidStreamOrder |= combinedMixAudioStreamIndex != expectedNextIndex++;
+            }
+
+            if (invalidStreamOrder)
             {
                 throw new InvalidOperationException(
-                    $"Nieoczekiwana kolejność strumieni MP4 (Video={videoStreamIndex}, CombinedMix={combinedMixAudioStreamIndex}, SystemAudio={systemAudioStreamIndex}, MicrophoneAudio={microphoneAudioStreamIndex}).");
+                    $"Nieoczekiwana kolejność strumieni MP4 (Video={videoStreamIndex}, SystemAudio={systemAudioStreamIndex}, MicrophoneAudio={microphoneAudioStreamIndex}, CombinedMix={combinedMixAudioStreamIndex}).");
             }
 
             sinkWriter.BeginWriting();
@@ -291,6 +319,12 @@ public sealed class Mp4ReplayMuxer
 
             sinkWriter.Finalize();
             finalized = true;
+
+            // Release the sink writer before opening the finalized MP4 in-place for moov/tkhd patching.
+            SafeDispose(sinkWriter);
+            sinkWriter = null;
+
+            TryPatchAudioTrackSelectionFlags(outputFilePath);
             return outputFilePath;
         }
         finally
@@ -526,14 +560,362 @@ public sealed class Mp4ReplayMuxer
         }
     }
 
+    /// <summary>
+    /// Patches <c>moov -&gt; trak -&gt; tkhd</c> audio track headers in-place so Windows Media Player,
+    /// VLC, browsers, and Discord select the LAST audio track (<c>CombinedMixAudio</c> when 3 tracks exist,
+    /// or <c>SystemAudio</c> when 1 track exists) by default while keeping all isolated tracks selectable
+    /// in VLC and video editors:
+    /// <list type="bullet">
+    /// <item>Sets <c>alternate_group = 1</c> (big-endian <c>0x0001</c>) on every audio track.</item>
+    /// <item>Sets <c>tkhd</c> flags to <c>0x000003</c> (<c>track_enabled | track_in_movie</c>) on ONLY the last audio track.</item>
+    /// <item>Sets <c>tkhd</c> flags to <c>0x000002</c> (<c>track_in_movie</c>, disabled by default) on all earlier audio tracks.</item>
+    /// </list>
+    /// </summary>
+    public static void PatchAudioTrackSelectionFlags(string mp4FilePath)
+    {
+        if (string.IsNullOrWhiteSpace(mp4FilePath))
+        {
+            throw new ArgumentException("Ścieżka pliku MP4 nie może być pusta.", nameof(mp4FilePath));
+        }
+
+        using FileStream stream = OpenFileStreamWithRetry(
+            mp4FilePath,
+            FileMode.Open,
+            FileAccess.ReadWrite,
+            FileShare.None);
+
+        if (!TryFindChildBox(stream, 0, stream.Length, BoxTypeMoov, out Mp4BoxHeader moov))
+        {
+            return;
+        }
+
+        Span<byte> handlerBytes = stackalloc byte[4];
+        Span<byte> enabledTrackFlags = stackalloc byte[3] { 0x00, 0x00, 0x03 };
+        Span<byte> alternateTrackFlags = stackalloc byte[3] { 0x00, 0x00, 0x02 };
+        Span<byte> alternateGroupOne = stackalloc byte[2] { 0x00, 0x01 };
+
+        var audioTrackPatchTargets = new List<(long FlagsOffset, long AlternateGroupOffset)>(4);
+
+        long offset = moov.PayloadStart;
+        while (offset + 8 <= moov.BoxEnd)
+        {
+            if (!TryReadBoxHeader(stream, offset, moov.BoxEnd, out Mp4BoxHeader child))
+            {
+                break;
+            }
+
+            if (child.Type == BoxTypeTrak &&
+                TryFindChildBox(stream, child.PayloadStart, child.BoxEnd, BoxTypeMdia, out Mp4BoxHeader mdia) &&
+                TryFindChildBox(stream, mdia.PayloadStart, mdia.BoxEnd, BoxTypeHdlr, out Mp4BoxHeader hdlr) &&
+                hdlr.PayloadLength >= 12)
+            {
+                stream.Position = hdlr.PayloadStart + 8;
+                if (ReadExact(stream, handlerBytes) &&
+                    BinaryPrimitives.ReadUInt32BigEndian(handlerBytes) == HandlerTypeSound &&
+                    TryFindChildBox(stream, child.PayloadStart, child.BoxEnd, BoxTypeTkhd, out Mp4BoxHeader tkhd) &&
+                    tkhd.PayloadLength >= 4)
+                {
+                    stream.Position = tkhd.PayloadStart;
+                    int version = stream.ReadByte();
+                    long alternateGroupRelativeOffset = version switch
+                    {
+                        0 when tkhd.PayloadLength >= 36 => 34,
+                        1 when tkhd.PayloadLength >= 48 => 46,
+                        _ => -1
+                    };
+
+                    if (alternateGroupRelativeOffset >= 0)
+                    {
+                        audioTrackPatchTargets.Add((
+                            tkhd.PayloadStart + 1,
+                            tkhd.PayloadStart + alternateGroupRelativeOffset));
+                    }
+                }
+            }
+
+            offset = child.BoxEnd;
+        }
+
+        if (audioTrackPatchTargets.Count == 0)
+        {
+            return;
+        }
+
+        int lastAudioIndex = audioTrackPatchTargets.Count - 1;
+        for (int i = 0; i < audioTrackPatchTargets.Count; i++)
+        {
+            (long flagsOffset, long alternateGroupOffset) = audioTrackPatchTargets[i];
+            bool isLastAudioTrack = i == lastAudioIndex;
+
+            // Write 24-bit FullBox flags right after the 1-byte version field.
+            stream.Position = flagsOffset;
+            stream.Write(isLastAudioTrack ? enabledTrackFlags : alternateTrackFlags);
+
+            // Write 16-bit big-endian alternate_group = 1 on every audio track.
+            stream.Position = alternateGroupOffset;
+            stream.Write(alternateGroupOne);
+        }
+
+        stream.Flush();
+    }
+
+    /// <summary>
+    /// Reads duration (from <c>moov -&gt; mvhd</c>) and audio track count (from <c>moov -&gt; trak -&gt; mdia -&gt; hdlr</c>)
+    /// directly from an MP4 file's ISO BMFF boxes without spawning external processes.
+    /// </summary>
+    public static bool TryReadMp4Metadata(string mp4FilePath, out TimeSpan duration, out int audioTrackCount)
+    {
+        duration = TimeSpan.Zero;
+        audioTrackCount = 0;
+
+        if (string.IsNullOrWhiteSpace(mp4FilePath) || !File.Exists(mp4FilePath))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var stream = new FileStream(
+                mp4FilePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+
+            if (!TryFindChildBox(stream, 0, stream.Length, BoxTypeMoov, out Mp4BoxHeader moov))
+            {
+                return false;
+            }
+
+            Span<byte> buffer12 = stackalloc byte[12];
+            Span<byte> handlerBytes = stackalloc byte[4];
+
+            long offset = moov.PayloadStart;
+            while (offset + 8 <= moov.BoxEnd)
+            {
+                if (!TryReadBoxHeader(stream, offset, moov.BoxEnd, out Mp4BoxHeader child))
+                {
+                    break;
+                }
+
+                if (child.Type == BoxTypeMvhd && child.PayloadLength >= 20)
+                {
+                    stream.Position = child.PayloadStart;
+                    int version = stream.ReadByte();
+                    if (version == 0)
+                    {
+                        stream.Position = child.PayloadStart + 12;
+                        if (ReadExact(stream, buffer12[..8]))
+                        {
+                            uint timescale = BinaryPrimitives.ReadUInt32BigEndian(buffer12[..4]);
+                            uint rawDuration = BinaryPrimitives.ReadUInt32BigEndian(buffer12[4..8]);
+                            if (timescale > 0 && rawDuration > 0)
+                            {
+                                duration = TimeSpan.FromSeconds((double)rawDuration / timescale);
+                            }
+                        }
+                    }
+                    else if (version == 1 && child.PayloadLength >= 32)
+                    {
+                        stream.Position = child.PayloadStart + 20;
+                        if (ReadExact(stream, buffer12))
+                        {
+                            uint timescale = BinaryPrimitives.ReadUInt32BigEndian(buffer12[..4]);
+                            ulong rawDuration = BinaryPrimitives.ReadUInt64BigEndian(buffer12[4..12]);
+                            if (timescale > 0 && rawDuration > 0)
+                            {
+                                duration = TimeSpan.FromSeconds((double)rawDuration / timescale);
+                            }
+                        }
+                    }
+                }
+                else if (child.Type == BoxTypeTrak &&
+                         TryFindChildBox(stream, child.PayloadStart, child.BoxEnd, BoxTypeMdia, out Mp4BoxHeader mdia) &&
+                         TryFindChildBox(stream, mdia.PayloadStart, mdia.BoxEnd, BoxTypeHdlr, out Mp4BoxHeader hdlr) &&
+                         hdlr.PayloadLength >= 12)
+                {
+                    stream.Position = hdlr.PayloadStart + 8;
+                    if (ReadExact(stream, handlerBytes) &&
+                        BinaryPrimitives.ReadUInt32BigEndian(handlerBytes) == HandlerTypeSound)
+                    {
+                        audioTrackCount++;
+                    }
+                }
+
+                offset = child.BoxEnd;
+            }
+
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            return false;
+        }
+    }
+
+    private static void TryPatchAudioTrackSelectionFlags(string mp4FilePath)
+    {
+        try
+        {
+            PatchAudioTrackSelectionFlags(mp4FilePath);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"Nie udało się zaktualizować flag ścieżek audio w pliku MP4 '{mp4FilePath}': {ex.Message}");
+        }
+    }
+
+    private static FileStream OpenFileStreamWithRetry(
+        string path,
+        FileMode mode,
+        FileAccess access,
+        FileShare share)
+    {
+        const int maxAttempts = 6;
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return new FileStream(path, mode, access, share);
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(30 * attempt);
+            }
+        }
+    }
+
+    private static bool TryFindChildBox(
+        Stream stream,
+        long startOffset,
+        long containerEnd,
+        uint targetType,
+        out Mp4BoxHeader foundBox)
+    {
+        long offset = startOffset;
+        while (offset + 8 <= containerEnd)
+        {
+            if (!TryReadBoxHeader(stream, offset, containerEnd, out Mp4BoxHeader box))
+            {
+                break;
+            }
+
+            if (box.Type == targetType)
+            {
+                foundBox = box;
+                return true;
+            }
+
+            offset = box.BoxEnd;
+        }
+
+        foundBox = default;
+        return false;
+    }
+
+    private static bool TryReadBoxHeader(
+        Stream stream,
+        long offset,
+        long containerEnd,
+        out Mp4BoxHeader box)
+    {
+        box = default;
+        if (offset < 0 || containerEnd - offset < 8)
+        {
+            return false;
+        }
+
+        Span<byte> header = stackalloc byte[8];
+        stream.Position = offset;
+        if (!ReadExact(stream, header))
+        {
+            return false;
+        }
+
+        uint size32 = BinaryPrimitives.ReadUInt32BigEndian(header[..4]);
+        uint type = BinaryPrimitives.ReadUInt32BigEndian(header[4..8]);
+        long headerSize = 8;
+        long boxSize;
+
+        if (size32 == 0)
+        {
+            boxSize = containerEnd - offset;
+        }
+        else if (size32 == 1)
+        {
+            if (containerEnd - offset < 16)
+            {
+                return false;
+            }
+
+            Span<byte> largeSizeBytes = stackalloc byte[8];
+            if (!ReadExact(stream, largeSizeBytes))
+            {
+                return false;
+            }
+
+            ulong size64 = BinaryPrimitives.ReadUInt64BigEndian(largeSizeBytes);
+            if (size64 < 16 || size64 > (ulong)(containerEnd - offset))
+            {
+                return false;
+            }
+
+            headerSize = 16;
+            boxSize = (long)size64;
+        }
+        else
+        {
+            if (size32 < 8)
+            {
+                return false;
+            }
+
+            boxSize = size32;
+        }
+
+        if (type == BoxTypeUuid)
+        {
+            headerSize += 16;
+        }
+
+        if (boxSize < headerSize || boxSize > containerEnd - offset)
+        {
+            return false;
+        }
+
+        box = new Mp4BoxHeader(type, offset, offset + headerSize, offset + boxSize);
+        return true;
+    }
+
+    private static bool ReadExact(Stream stream, Span<byte> destination)
+    {
+        int totalRead = 0;
+        while (totalRead < destination.Length)
+        {
+            int read = stream.Read(destination[totalRead..]);
+            if (read <= 0)
+            {
+                return false;
+            }
+
+            totalRead += read;
+        }
+
+        return true;
+    }
+
     private static int GetTrackOrderPriority(MediaTrackType trackType) => trackType switch
     {
         MediaTrackType.Video => 0,
-        MediaTrackType.CombinedMixAudio => 1,
-        MediaTrackType.SystemAudio => 2,
-        MediaTrackType.MicrophoneAudio => 3,
+        MediaTrackType.SystemAudio => 1,
+        MediaTrackType.MicrophoneAudio => 2,
+        MediaTrackType.CombinedMixAudio => 3,
         _ => 4
     };
 
     private readonly record struct IndexedPacket(EncodedPacket Packet, int OriginalIndex);
+
+    private readonly record struct Mp4BoxHeader(uint Type, long BoxStart, long PayloadStart, long BoxEnd)
+    {
+        public long PayloadLength => BoxEnd - PayloadStart;
+    }
 }

@@ -30,15 +30,13 @@ public partial class MonitorLayoutControl : UserControl
     private const int MdtEffectiveDpi = 0;
     private static readonly nint HwndTopMost = new(-1);
 
-    private static readonly Brush SelectedFillBrush = CreateFrozenBrush(0x38, 0x00, 0x78, 0xD4);
-    private static readonly Brush SelectedBorderBrush = CreateFrozenBrush(0xFF, 0x60, 0xCD, 0xFF);
     private static readonly Brush DefaultFillBrush = CreateFrozenBrush(0x24, 0xFF, 0xFF, 0xFF);
     private static readonly Brush DefaultBorderBrush = CreateFrozenBrush(0x45, 0xFF, 0xFF, 0xFF);
     private static readonly Brush HoverFillBrush = CreateFrozenBrush(0x34, 0xFF, 0xFF, 0xFF);
     private static readonly Brush HoverBorderBrush = CreateFrozenBrush(0x70, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush PrimaryBadgeFillBrush = CreateFrozenBrush(0x40, 0x60, 0xCD, 0xFF);
-    private static readonly Brush PrimaryBadgeTextBrush = CreateFrozenBrush(0xFF, 0xBF, 0xEB, 0xFF);
     private static readonly Brush IdentifyOverlayFillBrush = CreateFrozenBrush(0xDD, 0x18, 0x18, 0x1B);
+    private static readonly Brush PrimaryTextBrush = CreateFrozenBrush(0xFF, 0xF3, 0xF3, 0xF3);
+    private static readonly Brush SecondaryTextBrush = CreateFrozenBrush(0xFF, 0xA8, 0xA8, 0xA8);
 
     private readonly List<Window> _identifyWindows = new();
     private DisplayService? _displayService;
@@ -237,7 +235,7 @@ public partial class MonitorLayoutControl : UserControl
             Text = display.DisplayIndex.ToString(),
             FontSize = indexFontSize,
             FontWeight = FontWeights.Bold,
-            Foreground = Brushes.White,
+            Foreground = PrimaryTextBrush,
             HorizontalAlignment = HorizontalAlignment.Center
         });
 
@@ -247,8 +245,7 @@ public partial class MonitorLayoutControl : UserControl
             {
                 Text = $"{display.Bounds.Width}×{display.Bounds.Height} • {display.RefreshRate} Hz",
                 FontSize = Math.Clamp(tileHeight * 0.095, 10.0, 12.0),
-                Opacity = 0.85,
-                Foreground = Brushes.White,
+                Foreground = SecondaryTextBrush,
                 HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(0, 2, 0, 0)
             });
@@ -256,21 +253,25 @@ public partial class MonitorLayoutControl : UserControl
 
         if (display.IsPrimary && tileWidth >= 88.0 && tileHeight >= 76.0)
         {
-            contentStack.Children.Add(new Border
+            var primaryBadgeText = new TextBlock
             {
-                Background = PrimaryBadgeFillBrush,
+                Text = "Ekran główny",
+                FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold
+            };
+            primaryBadgeText.SetResourceReference(TextBlock.ForegroundProperty, "SystemAccentColorSecondaryBrush");
+
+            var primaryBadge = new Border
+            {
                 CornerRadius = new CornerRadius(9),
                 Padding = new Thickness(7, 2, 7, 2),
                 Margin = new Thickness(0, 6, 0, 0),
                 HorizontalAlignment = HorizontalAlignment.Center,
-                Child = new TextBlock
-                {
-                    Text = "Ekran główny",
-                    FontSize = 10.5,
-                    FontWeight = FontWeights.SemiBold,
-                    Foreground = PrimaryBadgeTextBrush
-                }
-            });
+                Child = primaryBadgeText
+            };
+            primaryBadge.SetResourceReference(Border.BackgroundProperty, "SystemAccentTintStrongBrush");
+
+            contentStack.Children.Add(primaryBadge);
         }
 
         string primaryNote = display.IsPrimary ? "\nEkran główny" : string.Empty;
@@ -279,14 +280,23 @@ public partial class MonitorLayoutControl : UserControl
             Width = tileWidth,
             Height = tileHeight,
             CornerRadius = new CornerRadius(8),
-            Background = isSelected ? SelectedFillBrush : DefaultFillBrush,
-            BorderBrush = isSelected ? SelectedBorderBrush : DefaultBorderBrush,
             BorderThickness = isSelected ? new Thickness(2.5) : new Thickness(1.2),
             Cursor = Cursors.Hand,
             Padding = new Thickness(6),
             ToolTip = $"{display.FriendlyName}\n{display.Bounds.Width}×{display.Bounds.Height} • {display.RefreshRate} Hz{primaryNote}",
             Child = contentStack
         };
+
+        if (isSelected)
+        {
+            tile.SetResourceReference(Border.BackgroundProperty, "SystemAccentTintBrush");
+            tile.SetResourceReference(Border.BorderBrushProperty, "SystemAccentColorPrimaryBrush");
+        }
+        else
+        {
+            tile.Background = DefaultFillBrush;
+            tile.BorderBrush = DefaultBorderBrush;
+        }
 
         if (!isSelected)
         {
@@ -337,7 +347,7 @@ public partial class MonitorLayoutControl : UserControl
             Text = display.DisplayIndex.ToString(),
             FontSize = 60,
             FontWeight = FontWeights.Bold,
-            Foreground = Brushes.White,
+            Foreground = PrimaryTextBrush,
             HorizontalAlignment = HorizontalAlignment.Center,
             LineHeight = 64
         });
@@ -346,8 +356,7 @@ public partial class MonitorLayoutControl : UserControl
         {
             Text = $"{display.Bounds.Width}×{display.Bounds.Height}",
             FontSize = 11.5,
-            Opacity = 0.78,
-            Foreground = Brushes.White,
+            Foreground = SecondaryTextBrush,
             HorizontalAlignment = HorizontalAlignment.Center,
             Margin = new Thickness(0, 2, 0, 0)
         });
@@ -355,11 +364,11 @@ public partial class MonitorLayoutControl : UserControl
         var container = new Border
         {
             Background = IdentifyOverlayFillBrush,
-            BorderBrush = SelectedBorderBrush,
             BorderThickness = new Thickness(2),
             CornerRadius = new CornerRadius(14),
             Child = stack
         };
+        container.SetResourceReference(Border.BorderBrushProperty, "SystemAccentColorPrimaryBrush");
 
         return new Window
         {

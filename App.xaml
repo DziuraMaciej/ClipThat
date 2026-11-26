@@ -9,6 +9,12 @@
                 <ui:ThemesDictionary Theme="Dark" />
                 <ui:ControlsDictionary />
             </ResourceDictionary.MergedDictionaries>
+
+            <!-- Dynamic surface brushes (initialized to inactive solid 3-tier dark grays) -->
+            <SolidColorBrush x:Key="AppRailBrush" Color="#141414" />
+            <SolidColorBrush x:Key="AppCardBrush" Color="#202020" />
+            <SolidColorBrush x:Key="AppClipItemBrush" Color="#262626" />
+            <SolidColorBrush x:Key="AppWorkspaceBrush" Color="#2B2B2B" />
         </ResourceDictionary>
     </Application.Resources>
 </Application>

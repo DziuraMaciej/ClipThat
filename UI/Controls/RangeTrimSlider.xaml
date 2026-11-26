@@ -1,0 +1,202 @@
+<UserControl x:Class="ClipThat.UI.Controls.RangeTrimSlider"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Height="42"
+             SnapsToDevicePixels="True"
+             UseLayoutRounding="True">
+    <UserControl.Resources>
+        <Style x:Key="LeftTrimThumbStyle" TargetType="Thumb">
+            <Setter Property="Width" Value="14" />
+            <Setter Property="Height" Value="34" />
+            <Setter Property="Cursor" Value="SizeWE" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Border x:Name="HandleBody"
+                                Background="{DynamicResource SystemAccentColorPrimaryBrush}"
+                                BorderBrush="{DynamicResource SystemAccentColorSecondaryBrush}"
+                                BorderThickness="1"
+                                CornerRadius="5,0,0,5">
+                            <StackPanel Orientation="Horizontal"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center">
+                                <Rectangle Width="1.5"
+                                           Height="14"
+                                           RadiusX="0.75"
+                                           RadiusY="0.75"
+                                           Fill="#AA09090B"
+                                           Margin="0,0,2,0" />
+                                <Rectangle Width="1.5"
+                                           Height="14"
+                                           RadiusX="0.75"
+                                           RadiusY="0.75"
+                                           Fill="#AA09090B" />
+                            </StackPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="HandleBody" Property="Background" Value="{DynamicResource SystemAccentColorSecondaryBrush}" />
+                                <Setter TargetName="HandleBody" Property="BorderBrush" Value="#FFFFFFFF" />
+                            </Trigger>
+                            <Trigger Property="IsDragging" Value="True">
+                                <Setter TargetName="HandleBody" Property="Background" Value="{DynamicResource SystemAccentColorTertiaryBrush}" />
+                                <Setter TargetName="HandleBody" Property="BorderBrush" Value="#FFFFFFFF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="RightTrimThumbStyle" TargetType="Thumb">
+            <Setter Property="Width" Value="14" />
+            <Setter Property="Height" Value="34" />
+            <Setter Property="Cursor" Value="SizeWE" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Border x:Name="HandleBody"
+                                Background="{DynamicResource SystemAccentColorPrimaryBrush}"
+                                BorderBrush="{DynamicResource SystemAccentColorSecondaryBrush}"
+                                BorderThickness="1"
+                                CornerRadius="0,5,5,0">
+                            <StackPanel Orientation="Horizontal"
+                                        HorizontalAlignment="Center"
+                                        VerticalAlignment="Center">
+                                <Rectangle Width="1.5"
+                                           Height="14"
+                                           RadiusX="0.75"
+                                           RadiusY="0.75"
+                                           Fill="#AA09090B"
+                                           Margin="0,0,2,0" />
+                                <Rectangle Width="1.5"
+                                           Height="14"
+                                           RadiusX="0.75"
+                                           RadiusY="0.75"
+                                           Fill="#AA09090B" />
+                            </StackPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="HandleBody" Property="Background" Value="{DynamicResource SystemAccentColorSecondaryBrush}" />
+                                <Setter TargetName="HandleBody" Property="BorderBrush" Value="#FFFFFFFF" />
+                            </Trigger>
+                            <Trigger Property="IsDragging" Value="True">
+                                <Setter TargetName="HandleBody" Property="Background" Value="{DynamicResource SystemAccentColorTertiaryBrush}" />
+                                <Setter TargetName="HandleBody" Property="BorderBrush" Value="#FFFFFFFF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </UserControl.Resources>
+
+    <Grid>
+        <Grid.Style>
+            <Style TargetType="Grid">
+                <Setter Property="Opacity" Value="1.0" />
+                <Style.Triggers>
+                    <Trigger Property="IsEnabled" Value="False">
+                        <Setter Property="Opacity" Value="0.45" />
+                    </Trigger>
+                </Style.Triggers>
+            </Style>
+        </Grid.Style>
+
+        <Canvas x:Name="TrackCanvas"
+                Background="Transparent"
+                Cursor="Hand"
+                ClipToBounds="True"
+                SizeChanged="TrackCanvas_SizeChanged"
+                MouseLeftButtonDown="TrackCanvas_MouseLeftButtonDown"
+                MouseMove="TrackCanvas_MouseMove"
+                MouseLeftButtonUp="TrackCanvas_MouseLeftButtonUp"
+                LostMouseCapture="TrackCanvas_LostMouseCapture">
+
+            <!-- Full clip length background track -->
+            <Border x:Name="FullTrackBorder"
+                    Height="24"
+                    CornerRadius="4"
+                    Background="#22FFFFFF"
+                    BorderBrush="#36FFFFFF"
+                    BorderThickness="1"
+                    IsHitTestVisible="False" />
+
+            <!-- Semi-transparent dark overlay dimming excluded region [0 .. StartValue] -->
+            <Border x:Name="LeftDimOverlay"
+                    Height="24"
+                    CornerRadius="4,0,0,4"
+                    Background="#C409090B"
+                    IsHitTestVisible="False"
+                    Visibility="Collapsed" />
+
+            <!-- Semi-transparent dark overlay dimming excluded region [EndValue .. Maximum] -->
+            <Border x:Name="RightDimOverlay"
+                    Height="24"
+                    CornerRadius="0,4,4,0"
+                    Background="#C409090B"
+                    IsHitTestVisible="False"
+                    Visibility="Collapsed" />
+
+            <!-- Bright accent highlight bar between StartValue and EndValue -->
+            <Border x:Name="SelectedRangeHighlight"
+                    Height="26"
+                    Background="{DynamicResource SystemAccentTintBrush}"
+                    BorderBrush="{DynamicResource SystemAccentColorPrimaryBrush}"
+                    BorderThickness="0,2.5,0,2.5"
+                    IsHitTestVisible="False" />
+
+            <!-- Subtle playback progress fill within selected range [StartValue .. CurrentPosition] -->
+            <Border x:Name="PlayedRangeHighlight"
+                    Height="21"
+                    Background="{DynamicResource SystemAccentTintStrongBrush}"
+                    IsHitTestVisible="False"
+                    Visibility="Collapsed" />
+
+            <!-- Left draggable trim handle (Początek) -->
+            <Thumb x:Name="StartThumb"
+                   Style="{StaticResource LeftTrimThumbStyle}"
+                   ToolTip="Początek"
+                   DragStarted="StartThumb_DragStarted"
+                   DragDelta="StartThumb_DragDelta"
+                   DragCompleted="Thumb_DragCompleted" />
+
+            <!-- Right draggable trim handle (Koniec) -->
+            <Thumb x:Name="EndThumb"
+                   Style="{StaticResource RightTrimThumbStyle}"
+                   ToolTip="Koniec"
+                   DragStarted="EndThumb_DragStarted"
+                   DragDelta="EndThumb_DragDelta"
+                   DragCompleted="Thumb_DragCompleted" />
+
+            <!-- Interactive playhead pin at CurrentPosition (hit-test transparent so trim handles stay unobstructed) -->
+            <Grid x:Name="PlayheadIndicator"
+                  Width="12"
+                  Height="38"
+                  IsHitTestVisible="False"
+                  Visibility="Collapsed">
+                <Border x:Name="PlayheadLine"
+                        Width="2.5"
+                        Height="32"
+                        CornerRadius="1.25"
+                        Background="#FFFFFFFF"
+                        BorderBrush="#8809090B"
+                        BorderThickness="0.5"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Bottom"
+                        Margin="0,0,0,1" />
+                <Ellipse x:Name="PlayheadHead"
+                         Width="10"
+                         Height="10"
+                         Fill="#FFFFFFFF"
+                         Stroke="#CC09090B"
+                         StrokeThickness="1.25"
+                         HorizontalAlignment="Center"
+                         VerticalAlignment="Top" />
+            </Grid>
+        </Canvas>
+    </Grid>
+</UserControl>

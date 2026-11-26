@@ -4,16 +4,24 @@
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  xmlns:pages="clr-namespace:ClipThat.UI.Pages"
                  Title="ClipThat"
-                 Width="960"
-                 Height="660"
+                 Width="1100"
+                 Height="720"
                  MinWidth="760"
                  MinHeight="520"
                  WindowStartupLocation="CenterScreen"
+                 Background="Transparent"
                  ExtendsContentIntoTitleBar="True"
                  WindowBackdropType="Mica"
-                 WindowCornerPreference="Round">
+                 WindowCornerPreference="Round"
+                 TextElement.Foreground="#F3F3F3">
 
-    <Grid>
+    <ui:FluentWindow.Resources>
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#F3F3F3" />
+        </Style>
+    </ui:FluentWindow.Resources>
+
+    <Grid TextElement.Foreground="#F3F3F3">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
@@ -21,14 +29,20 @@
 
         <ui:TitleBar Grid.Row="0"
                      Title="ClipThat"
+                     Background="{DynamicResource AppRailBrush}"
                      CloseWindowByDoubleClickOnIcon="True" />
 
         <ui:NavigationView x:Name="RootNavigation"
                            Grid.Row="1"
+                           Background="{DynamicResource AppRailBrush}"
+                           FrameMargin="0"
                            IsBackButtonVisible="Collapsed"
                            IsPaneToggleVisible="True"
                            PaneDisplayMode="Left"
                            OpenPaneLength="210">
+            <ui:NavigationView.Resources>
+                <SolidColorBrush x:Key="NavigationViewContentBackground" Color="Transparent" />
+            </ui:NavigationView.Resources>
             <ui:NavigationView.MenuItems>
                 <ui:NavigationViewItem Content="Ustawienia"
                                        Icon="{ui:SymbolIcon Settings24}"

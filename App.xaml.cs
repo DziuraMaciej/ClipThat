@@ -1,10 +1,14 @@
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Media;
 using ClipThat.Engine;
 using ClipThat.Models;
 using ClipThat.Services;
 using ClipThat.UI;
+using Microsoft.Win32;
+using Wpf.Ui.Appearance;
 using Drawing = System.Drawing;
 using WinForms = System.Windows.Forms;
 
@@ -22,6 +26,7 @@ public partial class App : Application
     private readonly AudioDeviceService _audioDeviceService = new();
     private readonly ResourceEstimatorService _resourceEstimatorService = new();
     private readonly StartupService _startupService = new();
+    private readonly ClipEditorService _clipEditorService = new();
     private readonly IReplayEngine _replayEngine;
 
     public App()
@@ -40,6 +45,7 @@ public partial class App : Application
     private long _lastHotkeyTriggerTickMs;
     private int _hotkeySaveInProgress;
     private bool _isShuttingDown;
+    private bool _userPreferenceEventsSubscribed;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
@@ -47,6 +53,14 @@ public partial class App : Application
 
         try
         {
+            ApplySystemAccent();
+
+            if (!_userPreferenceEventsSubscribed)
+            {
+                SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+                _userPreferenceEventsSubscribed = true;
+            }
+
             AppSettings settings = _settingsService.Load();
 
             _replayEngine.StatusChanged += OnEngineStatusChanged;
@@ -201,33 +215,68 @@ public partial class App : Application
             return;
         }
 
-        if (_mainWindow is not null)
+        try
         {
-            if (_mainWindow.WindowState == WindowState.Minimized)
+            if (_mainWindow is not null)
             {
-                _mainWindow.WindowState = WindowState.Normal;
+                if (_mainWindow.WindowState == WindowState.Minimized)
+                {
+                    _mainWindow.WindowState = WindowState.Normal;
+                }
+
+                _mainWindow.Show();
+                _mainWindow.Activate();
+                return;
             }
 
-            _mainWindow.Activate();
-            return;
-        }
+            if (_globalHotkeyService is null)
+            {
+                InitializeGlobalHotkey(_settingsService.Load());
+            }
 
-        if (_globalHotkeyService is null)
+            var window = new MainWindow(
+                _settingsService,
+                _displayService,
+                _audioDeviceService,
+                _resourceEstimatorService,
+                _startupService,
+                _globalHotkeyService!,
+                _replayEngine,
+                _clipEditorService);
+
+            _mainWindow = window;
+            window.Closed += OnMainWindowClosed;
+            window.Show();
+            window.Activate();
+        }
+        catch (Exception ex)
         {
-            InitializeGlobalHotkey(_settingsService.Load());
-        }
+            if (_mainWindow is not null)
+            {
+                try
+                {
+                    _mainWindow.Closed -= OnMainWindowClosed;
+                    _mainWindow.Close();
+                }
+                catch
+                {
+                    // Ignore cleanup errors for a partially initialized window.
+                }
 
-        _mainWindow = new MainWindow(
-            _settingsService,
-            _displayService,
-            _audioDeviceService,
-            _resourceEstimatorService,
-            _startupService,
-            _globalHotkeyService!,
-            _replayEngine);
-        _mainWindow.Closed += OnMainWindowClosed;
-        _mainWindow.Show();
-        _mainWindow.Activate();
+                _mainWindow = null;
+            }
+
+            string logPath = LogUiException("ShowMainWindow", ex);
+            string innerDetails = ex.InnerException is not null
+                ? $"\n\nPrzyczyna wewnętrzna ({ex.InnerException.GetType().Name}):\n{ex.InnerException.Message}"
+                : string.Empty;
+
+            MessageBox.Show(
+                $"Nie udało się otworzyć okna głównego ClipThat:\n{ex.Message}{innerDetails}\n\nPełny zrzut błędu zapisano w:\n{logPath}",
+                "ClipThat — Błąd otwierania okna",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+        }
     }
 
     private void OnMainWindowClosed(object? sender, EventArgs e)
@@ -329,6 +378,112 @@ public partial class App : Application
         }
     }
 
+    public static void ApplySystemAccent()
+    {
+        try
+        {
+            ApplicationThemeManager.Apply(
+                ApplicationTheme.Dark,
+                Wpf.Ui.Controls.WindowBackdropType.Mica,
+                updateAccent: true);
+            ApplicationAccentColorManager.ApplySystemAccent();
+
+            ResourceDictionary? resources = Current?.Resources;
+            if (resources is null)
+            {
+                return;
+            }
+
+            Color systemAccent = ApplicationAccentColorManager.SystemAccent;
+            Color primaryAccent = ApplicationAccentColorManager.SecondaryAccent;
+            Color secondaryAccent = ApplicationAccentColorManager.TertiaryAccent;
+            Color tertiaryAccent = BlendWithWhite(secondaryAccent, 0.35);
+
+            resources["SystemAccentColorBrush"] = CreateFrozenBrush(systemAccent);
+            resources["SystemAccentColorPrimaryBrush"] = CreateFrozenBrush(primaryAccent);
+            resources["SystemAccentColorSecondaryBrush"] = CreateFrozenBrush(secondaryAccent);
+            resources["SystemAccentColorTertiaryBrush"] = CreateFrozenBrush(tertiaryAccent);
+            resources["SystemAccentTintBrush"] = CreateFrozenBrush(
+                Color.FromArgb(0x26, primaryAccent.R, primaryAccent.G, primaryAccent.B));
+            resources["SystemAccentTintStrongBrush"] = CreateFrozenBrush(
+                Color.FromArgb(0x3D, primaryAccent.R, primaryAccent.G, primaryAccent.B));
+            resources["SystemAccentBorderSubtleBrush"] = CreateFrozenBrush(
+                Color.FromArgb(0x7A, primaryAccent.R, primaryAccent.G, primaryAccent.B));
+        }
+        catch (Exception ex)
+        {
+            LogUiException("ApplySystemAccent", ex);
+        }
+    }
+
+    private static string LogUiException(string context, Exception ex)
+    {
+        string fullDetails = ex.ToString();
+        Debug.WriteLine($"[ClipThat] {context} exception:\n{fullDetails}");
+        Trace.WriteLine($"[ClipThat] {context} exception:\n{fullDetails}");
+
+        string logDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "ClipThat");
+        string logPath = Path.Combine(logDirectory, "ui-errors.log");
+
+        try
+        {
+            Directory.CreateDirectory(logDirectory);
+            string entry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {context}\r\n{fullDetails}\r\n{new string('-', 80)}\r\n";
+            File.AppendAllText(logPath, entry);
+        }
+        catch
+        {
+            // Ignore file logging failures so error reporting itself never throws.
+        }
+
+        return logPath;
+    }
+
+    private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+    {
+        if (_isShuttingDown)
+        {
+            return;
+        }
+
+        if (e.Category is UserPreferenceCategory.Color or UserPreferenceCategory.General or UserPreferenceCategory.VisualStyle)
+        {
+            Dispatcher.InvokeAsync(ApplySystemAccent);
+        }
+    }
+
+    private void UnsubscribeUserPreferenceChanged()
+    {
+        if (_userPreferenceEventsSubscribed)
+        {
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            _userPreferenceEventsSubscribed = false;
+        }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        UnsubscribeUserPreferenceChanged();
+        base.OnExit(e);
+    }
+
+    private static SolidColorBrush CreateFrozenBrush(Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
+    }
+
+    private static Color BlendWithWhite(Color color, double ratio)
+    {
+        byte r = (byte)Math.Clamp(Math.Round(color.R + ((255 - color.R) * ratio)), 0, 255);
+        byte g = (byte)Math.Clamp(Math.Round(color.G + ((255 - color.G) * ratio)), 0, 255);
+        byte b = (byte)Math.Clamp(Math.Round(color.B + ((255 - color.B) * ratio)), 0, 255);
+        return Color.FromArgb(color.A, r, g, b);
+    }
+
     private async Task ExitApplicationAsync()
     {
         if (_isShuttingDown)
@@ -337,6 +492,7 @@ public partial class App : Application
         }
 
         _isShuttingDown = true;
+        UnsubscribeUserPreferenceChanged();
 
         try
         {

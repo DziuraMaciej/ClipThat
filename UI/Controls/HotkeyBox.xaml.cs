@@ -26,8 +26,6 @@ public partial class HotkeyBox : UserControl
 
     private static readonly Brush IdleBackgroundBrush = CreateFrozenBrush(0x1A, 0xFF, 0xFF, 0xFF);
     private static readonly Brush IdleBorderBrush = CreateFrozenBrush(0x33, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush RecordingBackgroundBrush = CreateFrozenBrush(0x28, 0x00, 0x78, 0xD4);
-    private static readonly Brush RecordingBorderBrush = CreateFrozenBrush(0xFF, 0x60, 0xCD, 0xFF);
 
     private GlobalHotkeyService? _hotkeyService;
     private uint _currentModifiers;
@@ -85,8 +83,8 @@ public partial class HotkeyBox : UserControl
         _hotkeyService.Unregister();
 
         ClearWarning();
-        CaptureBorder.Background = RecordingBackgroundBrush;
-        CaptureBorder.BorderBrush = RecordingBorderBrush;
+        CaptureBorder.SetResourceReference(Border.BackgroundProperty, "SystemAccentTintBrush");
+        CaptureBorder.SetResourceReference(Border.BorderBrushProperty, "SystemAccentColorPrimaryBrush");
         HotkeyDisplayText.Text = "Naciśnij kombinację klawiszy...";
         HintText.Text = "Esc — anuluj";
 

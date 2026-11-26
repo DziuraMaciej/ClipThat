@@ -1,9 +1,11 @@
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Media;
 using ClipThat.Engine;
 using ClipThat.Services;
 using ClipThat.UI.Pages;
 using Wpf.Ui.Abstractions;
-using Wpf.Ui.Appearance;
 using Wpf.Ui.Controls;
 
 namespace ClipThat.UI;
@@ -14,6 +16,20 @@ namespace ClipThat.UI;
 /// </summary>
 public partial class MainWindow : FluentWindow
 {
+    private const string NavigationRailBackgroundTag = "ClipThatNavRailBackground";
+
+    // Window Active — translucent Mica glass tints preserving relative brightness across every tier
+    private static readonly SolidColorBrush ActiveRailBrush = CreateFrozenBrush(0x88, 0x0A, 0x0A, 0x0A);
+    private static readonly SolidColorBrush ActiveCardBrush = CreateFrozenBrush(0x52, 0x18, 0x18, 0x18);
+    private static readonly SolidColorBrush ActiveClipItemBrush = CreateFrozenBrush(0x38, 0x24, 0x24, 0x24);
+    private static readonly SolidColorBrush ActiveWorkspaceBrush = CreateFrozenBrush(0x16, 0xFF, 0xFF, 0xFF);
+
+    // Window Inactive — solid opaque 3-tier dark grays
+    private static readonly SolidColorBrush InactiveRailBrush = CreateFrozenBrush(0xFF, 0x14, 0x14, 0x14);
+    private static readonly SolidColorBrush InactiveCardBrush = CreateFrozenBrush(0xFF, 0x20, 0x20, 0x20);
+    private static readonly SolidColorBrush InactiveClipItemBrush = CreateFrozenBrush(0xFF, 0x26, 0x26, 0x26);
+    private static readonly SolidColorBrush InactiveWorkspaceBrush = CreateFrozenBrush(0xFF, 0x2B, 0x2B, 0x2B);
+
     private readonly WindowPageProvider _pageProvider;
 
     public MainWindow(
@@ -23,11 +39,12 @@ public partial class MainWindow : FluentWindow
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
         GlobalHotkeyService globalHotkeyService,
-        IReplayEngine replayEngine)
+        IReplayEngine replayEngine,
+        ClipEditorService clipEditorService)
     {
         InitializeComponent();
 
-        ApplicationThemeManager.Apply(ApplicationTheme.Dark, WindowBackdropType.Mica, updateAccent: true);
+        App.ApplySystemAccent();
 
         _pageProvider = new WindowPageProvider(
             settingsService,
@@ -36,20 +53,102 @@ public partial class MainWindow : FluentWindow
             resourceEstimatorService,
             startupService,
             globalHotkeyService,
-            replayEngine);
+            replayEngine,
+            clipEditorService);
 
         RootNavigation.SetPageProviderService(_pageProvider);
         Loaded += MainWindow_Loaded;
+        Activated += MainWindow_Activated;
+        Deactivated += MainWindow_Deactivated;
     }
 
     private void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
         Loaded -= MainWindow_Loaded;
+        EnsureNavigationPaneBackground();
+        UpdateSurfaceBrushes(IsActive);
         RootNavigation.Navigate(typeof(SettingsPage));
+    }
+
+    private void MainWindow_Activated(object? sender, EventArgs e)
+    {
+        UpdateSurfaceBrushes(IsActive);
+    }
+
+    private void MainWindow_Deactivated(object? sender, EventArgs e)
+    {
+        UpdateSurfaceBrushes(IsActive);
+    }
+
+    private void EnsureNavigationPaneBackground()
+    {
+        RootNavigation.ApplyTemplate();
+
+        if (VisualTreeHelper.GetChildrenCount(RootNavigation) == 0 ||
+            VisualTreeHelper.GetChild(RootNavigation, 0) is not Grid templateRootGrid ||
+            templateRootGrid.ColumnDefinitions.Count < 2)
+        {
+            return;
+        }
+
+        if (templateRootGrid.Children.OfType<Border>().Any(border => Equals(border.Tag, NavigationRailBackgroundTag)))
+        {
+            return;
+        }
+
+        // WPF-UI's LeftNavigationViewTemplate does not bind NavigationView.Background to its left pane,
+        // so attach a background layer scoped strictly to column 0 (leaving column 1 transparent for Mica).
+        var railBackground = new Border
+        {
+            Tag = NavigationRailBackgroundTag,
+            IsHitTestVisible = false,
+            SnapsToDevicePixels = true
+        };
+        Grid.SetColumn(railBackground, 0);
+        Panel.SetZIndex(railBackground, -1);
+        railBackground.SetBinding(
+            Border.BackgroundProperty,
+            new Binding(nameof(Control.Background)) { Source = RootNavigation });
+
+        templateRootGrid.Children.Insert(0, railBackground);
+    }
+
+    private static void UpdateSurfaceBrushes(bool isActive)
+    {
+        ResourceDictionary? resources = Application.Current?.Resources;
+        if (resources is null)
+        {
+            return;
+        }
+
+        if (isActive)
+        {
+            resources["AppRailBrush"] = ActiveRailBrush;
+            resources["AppCardBrush"] = ActiveCardBrush;
+            resources["AppClipItemBrush"] = ActiveClipItemBrush;
+            resources["AppWorkspaceBrush"] = ActiveWorkspaceBrush;
+        }
+        else
+        {
+            resources["AppRailBrush"] = InactiveRailBrush;
+            resources["AppCardBrush"] = InactiveCardBrush;
+            resources["AppClipItemBrush"] = InactiveClipItemBrush;
+            resources["AppWorkspaceBrush"] = InactiveWorkspaceBrush;
+        }
+    }
+
+    private static SolidColorBrush CreateFrozenBrush(byte a, byte r, byte g, byte b)
+    {
+        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
+        brush.Freeze();
+        return brush;
     }
 
     protected override void OnClosed(EventArgs e)
     {
+        Loaded -= MainWindow_Loaded;
+        Activated -= MainWindow_Activated;
+        Deactivated -= MainWindow_Deactivated;
         _pageProvider.DetachAll();
         base.OnClosed(e);
     }
@@ -61,7 +160,8 @@ public partial class MainWindow : FluentWindow
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
         GlobalHotkeyService globalHotkeyService,
-        IReplayEngine replayEngine) : INavigationViewPageProvider
+        IReplayEngine replayEngine,
+        ClipEditorService clipEditorService) : INavigationViewPageProvider
     {
         private SettingsPage? _settingsPage;
         private ClipsPage? _clipsPage;
@@ -82,7 +182,7 @@ public partial class MainWindow : FluentWindow
 
             if (pageType == typeof(ClipsPage))
             {
-                return _clipsPage ??= new ClipsPage(settingsService, replayEngine);
+                return _clipsPage ??= new ClipsPage(settingsService, replayEngine, clipEditorService);
             }
 
             return null;
