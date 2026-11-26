@@ -479,19 +479,19 @@ public sealed class Mp4ReplayMuxer
                                 }
                             }
 
-                            videoStream.Write(packet.Buffer, 0, packet.Length);
+                            videoStream.Write(packet.Data);
                             break;
 
                         case MediaTrackType.SystemAudio when sysStream is not null:
-                            WriteAdtsAacFrame(sysStream, packet.Buffer, packet.Length, adtsHeader);
+                            WriteAdtsAacFrame(sysStream, packet.Data, adtsHeader);
                             break;
 
                         case MediaTrackType.MicrophoneAudio when micStream is not null:
-                            WriteAdtsAacFrame(micStream, packet.Buffer, packet.Length, adtsHeader);
+                            WriteAdtsAacFrame(micStream, packet.Data, adtsHeader);
                             break;
 
                         case MediaTrackType.CombinedMixAudio when mixStream is not null:
-                            WriteAdtsAacFrame(mixStream, packet.Buffer, packet.Length, adtsHeader);
+                            WriteAdtsAacFrame(mixStream, packet.Data, adtsHeader);
                             break;
                     }
                 }
@@ -587,9 +587,9 @@ public sealed class Mp4ReplayMuxer
         }
     }
 
-    private static void WriteAdtsAacFrame(FileStream stream, byte[] rawAacPayload, int length, Span<byte> headerBuffer)
+    private static void WriteAdtsAacFrame(FileStream stream, ReadOnlySpan<byte> rawAacPayload, Span<byte> headerBuffer)
     {
-        if (length <= 0)
+        if (rawAacPayload.IsEmpty)
         {
             return;
         }
@@ -598,7 +598,7 @@ public sealed class Mp4ReplayMuxer
         const int profile = 1;
         const int freqIdx = 3;
         const int chanCfg = 2;
-        int frameLength = length + 7;
+        int frameLength = rawAacPayload.Length + 7;
 
         headerBuffer[0] = 0xFF;
         headerBuffer[1] = 0xF1;
@@ -609,10 +609,10 @@ public sealed class Mp4ReplayMuxer
         headerBuffer[6] = 0xFC;
 
         stream.Write(headerBuffer);
-        stream.Write(rawAacPayload, 0, length);
+        stream.Write(rawAacPayload);
     }
 
-    private static void WritePacketSample(
+    private static unsafe void WritePacketSample(
         IMFSinkWriter sinkWriter,
         int streamIndex,
         EncodedPacket packet,
@@ -628,24 +628,27 @@ public sealed class Mp4ReplayMuxer
             sample.Set(SampleAttributeKeys.CleanPoint, 1u);
         }
 
-        using IMFMediaBuffer buffer = MediaFactory.MFCreateMemoryBuffer(packet.Length);
-        buffer.Lock(out nint dstPtr, out int maxLength, out _);
-        try
+        using (IMFMediaBuffer buffer = MediaFactory.MFCreateMemoryBuffer(packet.Length))
         {
-            if (maxLength < packet.Length)
+            buffer.Lock(out nint dstPtr, out int maxLength, out _);
+            try
             {
-                throw new InvalidOperationException("Za mały bufor próbki Media Foundation podczas zapisu MP4.");
+                if (maxLength < packet.Length)
+                {
+                    throw new InvalidOperationException("Za mały bufor próbki Media Foundation podczas zapisu MP4.");
+                }
+
+                packet.Data.CopyTo(new Span<byte>((void*)dstPtr, packet.Length));
+            }
+            finally
+            {
+                buffer.Unlock();
             }
 
-            Marshal.Copy(packet.Buffer, 0, dstPtr, packet.Length);
-        }
-        finally
-        {
-            buffer.Unlock();
+            buffer.CurrentLength = packet.Length;
+            sample.AddBuffer(buffer);
         }
 
-        buffer.CurrentLength = packet.Length;
-        sample.AddBuffer(buffer);
         sinkWriter.WriteSample(streamIndex, sample);
     }
 

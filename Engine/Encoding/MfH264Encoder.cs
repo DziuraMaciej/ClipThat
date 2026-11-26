@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -254,6 +253,10 @@ public sealed class MfH264Encoder : IDisposable
                     SubmitInputSampleLocked(inputSample);
                 }
 
+                // Release input IMFSample (and its underlying NV12 IMFMediaBuffer) immediately after ProcessInput.
+                SafeDisposeSample(inputSample);
+                inputSample = null;
+
                 DrainSyncOutputsLocked(ref syncPackets);
             }
 
@@ -388,7 +391,17 @@ public sealed class MfH264Encoder : IDisposable
             int hr = CoCreateInstance(ref clsid, nint.Zero, ClsCtxInprocServer, ref iid, out nint transformPtr);
             if (hr >= 0 && transformPtr != nint.Zero)
             {
-                var directTransform = new IMFTransform(transformPtr);
+                IMFTransform directTransform;
+                try
+                {
+                    directTransform = new IMFTransform(transformPtr);
+                }
+                catch
+                {
+                    Marshal.Release(transformPtr);
+                    throw;
+                }
+
                 if (TryConfigureTransform(
                         directTransform,
                         activate: null,
@@ -532,13 +545,34 @@ public sealed class MfH264Encoder : IDisposable
 
             if (activatesPtr != nint.Zero && count > 0)
             {
-                for (int i = 0; i < count; i++)
+                int wrappedCount = 0;
+                try
                 {
-                    nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                    if (itemPtr != nint.Zero)
+                    for (int i = 0; i < count; i++)
                     {
-                        results.Add(new IMFActivate(itemPtr));
+                        nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                        if (itemPtr != nint.Zero)
+                        {
+                            results.Add(new IMFActivate(itemPtr));
+                        }
+
+                        wrappedCount = i + 1;
                     }
+                }
+                catch
+                {
+                    DisposeCandidateList(results, excludeIndex: -1);
+                    results.Clear();
+                    for (int i = wrappedCount; i < count; i++)
+                    {
+                        nint remainingPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                        if (remainingPtr != nint.Zero)
+                        {
+                            Marshal.Release(remainingPtr);
+                        }
+                    }
+
+                    throw;
                 }
             }
         }
@@ -613,13 +647,34 @@ public sealed class MfH264Encoder : IDisposable
 
             if (activatesPtr != nint.Zero && count > 0)
             {
-                for (int i = 0; i < count; i++)
+                int wrappedCount = 0;
+                try
                 {
-                    nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                    if (itemPtr != nint.Zero)
+                    for (int i = 0; i < count; i++)
                     {
-                        results.Add(new IMFActivate(itemPtr));
+                        nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                        if (itemPtr != nint.Zero)
+                        {
+                            results.Add(new IMFActivate(itemPtr));
+                        }
+
+                        wrappedCount = i + 1;
                     }
+                }
+                catch
+                {
+                    DisposeCandidateList(results, excludeIndex: -1);
+                    results.Clear();
+                    for (int i = wrappedCount; i < count; i++)
+                    {
+                        nint remainingPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                        if (remainingPtr != nint.Zero)
+                        {
+                            Marshal.Release(remainingPtr);
+                        }
+                    }
+
+                    throw;
                 }
             }
         }
@@ -688,6 +743,7 @@ public sealed class MfH264Encoder : IDisposable
     {
         IMFDXGIDeviceManager? dxgiManager = null;
         IMFMediaEventGenerator? eventGenerator = null;
+        bool d3dManagerAttached = false;
 
         try
         {
@@ -730,6 +786,7 @@ public sealed class MfH264Encoder : IDisposable
                     dxgiManager = MediaFactory.MFCreateDXGIDeviceManager();
                     dxgiManager.ResetDevice(_gpuProcessor.Device).CheckError();
                     transform.ProcessMessage(TMessageType.MessageSetD3DManager, (nuint)dxgiManager.NativePointer);
+                    d3dManagerAttached = true;
                     usesGpuInput = true;
                 }
                 catch (Exception ex)
@@ -812,10 +869,21 @@ public sealed class MfH264Encoder : IDisposable
                 $"Tier {tier}: Skipped MFT \"{friendlyName}\":\n{ex}");
 
             SafeDisposeComObject(eventGenerator);
-            SafeDisposeComObject(dxgiManager);
 
             if (transform is not null)
             {
+                if (d3dManagerAttached)
+                {
+                    try
+                    {
+                        transform.ProcessMessage(TMessageType.MessageSetD3DManager, nuint.Zero);
+                    }
+                    catch
+                    {
+                        // Best-effort detachment of IMFDXGIDeviceManager from failed hardware MFT.
+                    }
+                }
+
                 try
                 {
                     MediaFactory.MFShutdownObject(transform);
@@ -828,6 +896,7 @@ public sealed class MfH264Encoder : IDisposable
                 SafeDisposeComObject(transform);
             }
 
+            SafeDisposeComObject(dxgiManager);
             TryShutdownActivate(activate);
             return false;
         }
@@ -977,11 +1046,11 @@ public sealed class MfH264Encoder : IDisposable
             return;
         }
 
-        ICodecAPI? codecApi = null;
+        object? rawCodecApi = null;
         try
         {
-            codecApi = Marshal.GetUniqueObjectForIUnknown(codecApiPtr) as ICodecAPI;
-            if (codecApi is null)
+            rawCodecApi = Marshal.GetUniqueObjectForIUnknown(codecApiPtr);
+            if (rawCodecApi is not ICodecAPI codecApi)
             {
                 return;
             }
@@ -1007,9 +1076,9 @@ public sealed class MfH264Encoder : IDisposable
         }
         finally
         {
-            if (codecApi is not null)
+            if (rawCodecApi is not null)
             {
-                Marshal.ReleaseComObject(codecApi);
+                Marshal.ReleaseComObject(rawCodecApi);
             }
 
             Marshal.Release(codecApiPtr);
@@ -1030,11 +1099,11 @@ public sealed class MfH264Encoder : IDisposable
             return;
         }
 
-        ICodecAPI? codecApi = null;
+        object? rawCodecApi = null;
         try
         {
-            codecApi = Marshal.GetUniqueObjectForIUnknown(codecApiPtr) as ICodecAPI;
-            if (codecApi is null)
+            rawCodecApi = Marshal.GetUniqueObjectForIUnknown(codecApiPtr);
+            if (rawCodecApi is not ICodecAPI codecApi)
             {
                 return;
             }
@@ -1054,9 +1123,9 @@ public sealed class MfH264Encoder : IDisposable
         }
         finally
         {
-            if (codecApi is not null)
+            if (rawCodecApi is not null)
             {
-                Marshal.ReleaseComObject(codecApi);
+                Marshal.ReleaseComObject(rawCodecApi);
             }
 
             Marshal.Release(codecApiPtr);
@@ -1202,52 +1271,61 @@ public sealed class MfH264Encoder : IDisposable
 
             if (mediaEvent is null || mediaEvent.NativePointer == nint.Zero)
             {
+                SafeDisposeComObject(mediaEvent);
                 continue;
             }
 
+            MediaEventTypes eventType;
+            Result errorStatus = Result.Ok;
+            // Release the IMFMediaEvent COM reference immediately after reading its metadata,
+            // before invoking ProcessOutput or dispatching packets.
             using (mediaEvent)
             {
-                MediaEventTypes eventType = mediaEvent.EventType;
-                switch (eventType)
+                eventType = mediaEvent.EventType;
+                if (eventType == MediaEventTypes.Error)
                 {
-                    case MediaEventTypes.TransformNeedInput:
-                        if (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
-                        {
-                            Interlocked.Increment(ref _needInputEventCount);
-                            Interlocked.Increment(ref _availableInputSlots);
-                            SignalInputWorkSafe();
-                        }
-
-                        break;
-
-                    case MediaEventTypes.TransformHaveOutput:
-                        Interlocked.Increment(ref _haveOutputEventCount);
-                        HandleAsyncHaveOutput();
-                        break;
-
-                    case MediaEventTypes.TransformDrainComplete:
-                        _drainCompleteEvent.Set();
-                        if (Volatile.Read(ref _stopping) != 0)
-                        {
-                            return;
-                        }
-
-                        break;
-
-                    case MediaEventTypes.Error:
-                        Result status = mediaEvent.Status;
-                        if (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
-                        {
-                            var eventEx = new SharpGenException(status);
-                            EngineLogger.Error(
-                                "MfH264Encoder",
-                                $"MFT \"{EncoderName}\" ({ActiveTier}) emitted MEError (HR=0x{status.Code:X8}).",
-                                eventEx);
-                            _onEncoderError?.Invoke(eventEx);
-                        }
-
-                        return;
+                    errorStatus = mediaEvent.Status;
                 }
+            }
+
+            switch (eventType)
+            {
+                case MediaEventTypes.TransformNeedInput:
+                    if (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
+                    {
+                        Interlocked.Increment(ref _needInputEventCount);
+                        Interlocked.Increment(ref _availableInputSlots);
+                        SignalInputWorkSafe();
+                    }
+
+                    break;
+
+                case MediaEventTypes.TransformHaveOutput:
+                    Interlocked.Increment(ref _haveOutputEventCount);
+                    HandleAsyncHaveOutput();
+                    break;
+
+                case MediaEventTypes.TransformDrainComplete:
+                    _drainCompleteEvent.Set();
+                    if (Volatile.Read(ref _stopping) != 0)
+                    {
+                        return;
+                    }
+
+                    break;
+
+                case MediaEventTypes.Error:
+                    if (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
+                    {
+                        var eventEx = new SharpGenException(errorStatus);
+                        EngineLogger.Error(
+                            "MfH264Encoder",
+                            $"MFT \"{EncoderName}\" ({ActiveTier}) emitted MEError (HR=0x{errorStatus.Code:X8}).",
+                            eventEx);
+                        _onEncoderError?.Invoke(eventEx);
+                    }
+
+                    return;
             }
         }
     }
@@ -1470,17 +1548,23 @@ public sealed class MfH264Encoder : IDisposable
         };
 
         IMFSample? callerAllocatedSample = null;
-        if (!_mftProvidesOutputSamples)
-        {
-            callerAllocatedSample = MediaFactory.MFCreateSample();
-            int bufferCapacity = Math.Max(_outputStreamInfo.Size, DefaultOutputBufferBytes);
-            using IMFMediaBuffer memoryBuffer = MediaFactory.MFCreateMemoryBuffer(bufferCapacity);
-            callerAllocatedSample.AddBuffer(memoryBuffer);
-            outputBuffer.Sample = callerAllocatedSample;
-        }
+        nint callerSamplePtr = nint.Zero;
 
         try
         {
+            if (!_mftProvidesOutputSamples)
+            {
+                callerAllocatedSample = MediaFactory.MFCreateSample();
+                callerSamplePtr = callerAllocatedSample.NativePointer;
+                int bufferCapacity = Math.Max(_outputStreamInfo.Size, DefaultOutputBufferBytes);
+                using (IMFMediaBuffer memoryBuffer = MediaFactory.MFCreateMemoryBuffer(bufferCapacity))
+                {
+                    callerAllocatedSample.AddBuffer(memoryBuffer);
+                }
+
+                outputBuffer.Sample = callerAllocatedSample;
+            }
+
             Result hr = _transform.ProcessOutput(
                 ProcessOutputFlags.None,
                 cOutputBufferCount: 1,
@@ -1529,16 +1613,13 @@ public sealed class MfH264Encoder : IDisposable
         }
         finally
         {
-            outputBuffer.Events?.Dispose();
+            SafeDisposeComObject(outputBuffer.Events);
+            outputBuffer.Events = null;
 
-            if (outputBuffer.Sample is not null)
-            {
-                outputBuffer.Sample.Dispose();
-            }
-            else
-            {
-                callerAllocatedSample?.Dispose();
-            }
+            IMFSample? returnedSample = outputBuffer.Sample;
+            outputBuffer.Sample = null;
+
+            DisposeProcessOutputSamples(callerAllocatedSample, callerSamplePtr, returnedSample);
         }
     }
 
@@ -1597,52 +1678,53 @@ public sealed class MfH264Encoder : IDisposable
 
     private EncodedPacket? ExtractPacketFromSample(IMFSample sample)
     {
-        using IMFMediaBuffer contiguousBuffer = sample.ConvertToContiguousBuffer();
+        long timestamp100Ns = TryGetSampleTime(sample);
+        long duration100Ns = TryGetSampleDuration(sample);
+        bool isCleanPoint = sample.GetUInt32(SampleAttributeKeys.CleanPoint, out uint cleanPoint).Success &&
+                            cleanPoint != 0;
 
-        byte[]? rented = null;
-        int currentLength;
-        contiguousBuffer.Lock(out nint dataPtr, out _, out currentLength);
+        EncodedPacket? packet = null;
+        int currentLength = 0;
+        bool hasAnnexBKeyframe = false;
+
+        // Explicitly dispose the contiguous IMFMediaBuffer immediately after copying bytes out.
+        using (IMFMediaBuffer contiguousBuffer = sample.ConvertToContiguousBuffer())
+        {
+            contiguousBuffer.Lock(out nint dataPtr, out _, out currentLength);
+            try
+            {
+                if (currentLength <= 0 || dataPtr == nint.Zero)
+                {
+                    return null;
+                }
+
+                unsafe
+                {
+                    var nativeSpan = new ReadOnlySpan<byte>((void*)dataPtr, currentLength);
+                    hasAnnexBKeyframe = ContainsAnnexBKeyframeNal(nativeSpan);
+                }
+
+                bool isKeyframe = isCleanPoint || hasAnnexBKeyframe;
+                packet = EncodedPacket.CreateFromNativeMemory(
+                    MediaTrackType.Video,
+                    dataPtr,
+                    currentLength,
+                    timestamp100Ns,
+                    duration100Ns,
+                    isKeyframe);
+            }
+            finally
+            {
+                contiguousBuffer.Unlock();
+            }
+        }
+
         try
         {
-            if (currentLength <= 0 || dataPtr == nint.Zero)
-            {
-                return null;
-            }
-
-            rented = ArrayPool<byte>.Shared.Rent(currentLength);
-            Marshal.Copy(dataPtr, rented, 0, currentLength);
-        }
-        catch
-        {
-            if (rented is not null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
-
-            throw;
-        }
-        finally
-        {
-            contiguousBuffer.Unlock();
-        }
-
-        try
-        {
-            long timestamp100Ns = TryGetSampleTime(sample);
-            long duration100Ns = TryGetSampleDuration(sample);
-            ReadOnlySpan<byte> payload = rented.AsSpan(0, currentLength);
-
-            // Detect keyframes using BOTH MFSampleExtension_CleanPoint != 0 AND Annex-B NAL unit inspection
-            // (nalUnitType == 5 IDR or nalUnitType == 7 SPS), since AMDh264Encoder frequently emits Annex-B
-            // SPS/PPS/IDR packets without setting MFSampleExtension_CleanPoint.
-            bool isCleanPoint = sample.GetUInt32(SampleAttributeKeys.CleanPoint, out uint cleanPoint).Success &&
-                                cleanPoint != 0;
-            bool hasAnnexBKeyframe = ContainsAnnexBKeyframeNal(payload);
-            bool isKeyframe = isCleanPoint || hasAnnexBKeyframe;
-
+            bool isKeyframe = packet.IsKeyframe;
             if (isKeyframe && _sequenceHeader is null)
             {
-                byte[]? extractedHeader = TryExtractAnnexBSpsPps(payload);
+                byte[]? extractedHeader = TryExtractAnnexBSpsPps(packet.Data);
                 if (extractedHeader is not null)
                 {
                     _sequenceHeader = extractedHeader;
@@ -1669,17 +1751,11 @@ public sealed class MfH264Encoder : IDisposable
                     $"Tier={ActiveTier}, Encoder=\"{EncoderName}\"");
             }
 
-            return new EncodedPacket(
-                MediaTrackType.Video,
-                rented,
-                currentLength,
-                timestamp100Ns,
-                duration100Ns,
-                isKeyframe);
+            return packet;
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(rented);
+            packet.Dispose();
             throw;
         }
     }
@@ -1740,6 +1816,62 @@ public sealed class MfH264Encoder : IDisposable
         for (int i = 0; i < packets.Count; i++)
         {
             packets[i].Dispose();
+        }
+    }
+
+    private static void DisposeProcessOutputSamples(
+        IMFSample? callerAllocatedSample,
+        nint callerSamplePtr,
+        IMFSample? returnedSample)
+    {
+        if (returnedSample is not null)
+        {
+            if (callerAllocatedSample is not null)
+            {
+                if (ReferenceEquals(returnedSample, callerAllocatedSample))
+                {
+                    SafeDisposeSample(callerAllocatedSample);
+                }
+                else if (callerSamplePtr != nint.Zero && returnedSample.NativePointer == callerSamplePtr)
+                {
+                    // Vortice OutputDataBuffer.__MarshalFrom wraps the existing native IMFSample* in a second
+                    // managed IMFSample instance without AddRef(). Detach the alias without calling Release()
+                    // and dispose the caller-allocated wrapper once to release the single COM reference and
+                    // suppress finalizers on both managed wrappers.
+                    DetachComAliasWithoutRelease(returnedSample);
+                    SafeDisposeSample(callerAllocatedSample);
+                }
+                else
+                {
+                    // MFT replaced OutputDataBuffer.Sample with a distinct native sample: dispose both.
+                    SafeDisposeSample(returnedSample);
+                    SafeDisposeSample(callerAllocatedSample);
+                }
+            }
+            else
+            {
+                SafeDisposeSample(returnedSample);
+            }
+        }
+        else if (callerAllocatedSample is not null)
+        {
+            SafeDisposeSample(callerAllocatedSample);
+        }
+    }
+
+    private static void DetachComAliasWithoutRelease(ComObject alias)
+    {
+        try
+        {
+            alias.NativePointer = nint.Zero;
+        }
+        catch
+        {
+            // Best-effort pointer detachment.
+        }
+        finally
+        {
+            GC.SuppressFinalize(alias);
         }
     }
 
@@ -2019,6 +2151,18 @@ public sealed class MfH264Encoder : IDisposable
                     catch
                     {
                         // Best-effort end streaming notification.
+                    }
+
+                    if (_usesGpuInput)
+                    {
+                        try
+                        {
+                            _transform.ProcessMessage(TMessageType.MessageSetD3DManager, nuint.Zero);
+                        }
+                        catch
+                        {
+                            // Best-effort detachment of IMFDXGIDeviceManager before MFT shutdown.
+                        }
                     }
 
                     try

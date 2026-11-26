@@ -25,18 +25,6 @@ internal interface IGraphicsCaptureItemInterop
 }
 
 /// <summary>
-/// Native WinRT/DXGI interop interface for extracting an underlying DXGI/D3D11 resource pointer
-/// from a WinRT <see cref="IDirect3DSurface"/> without copying pixels to CPU memory.
-/// </summary>
-[ComImport]
-[Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")]
-[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-internal interface IDirect3DDxgiInterfaceAccess
-{
-    nint GetInterface([In] ref Guid iid);
-}
-
-/// <summary>
 /// COM and WinRT interop helpers bridging Windows.Graphics.Capture with Vortice Direct3D11.
 /// </summary>
 internal static class CaptureInterop
@@ -202,15 +190,17 @@ internal static class CaptureInterop
 
     /// <summary>
     /// Extracts the underlying GPU <see cref="ID3D11Texture2D"/> from a WinRT capture frame surface
-    /// without copying pixel data to CPU RAM. The caller owns and must dispose the returned texture.
+    /// without copying pixel data to CPU RAM or allocating per-frame managed COM RCWs.
+    /// The caller owns and must dispose the returned texture.
     /// </summary>
-    public static ID3D11Texture2D GetTextureFromSurface(IDirect3DSurface surface)
+    public static unsafe ID3D11Texture2D GetTextureFromSurface(IDirect3DSurface surface)
     {
         ArgumentNullException.ThrowIfNull(surface);
 
         nint surfaceAbi = nint.Zero;
         nint accessAbi = nint.Zero;
-        IDirect3DDxgiInterfaceAccess? access = null;
+        nint texturePtr = nint.Zero;
+        bool textureOwnershipTransferred = false;
 
         try
         {
@@ -224,22 +214,29 @@ internal static class CaptureInterop
             int hr = Marshal.QueryInterface(surfaceAbi, ref accessIid, out accessAbi);
             Marshal.ThrowExceptionForHR(hr);
 
-            access = (IDirect3DDxgiInterfaceAccess)Marshal.GetUniqueObjectForIUnknown(accessAbi);
+            // Call IDirect3DDxgiInterfaceAccess::GetInterface (COM vtable slot 3 after IUnknown)
+            // directly to avoid allocating a per-frame managed RCW at 60 FPS.
+            void** vtable = *(void***)accessAbi;
+            var getInterfaceFn = (delegate* unmanaged[Stdcall]<nint, Guid*, nint*, int>)vtable[3];
             Guid textureIid = Direct3D11Texture2DIid;
-            nint texturePtr = access.GetInterface(ref textureIid);
+            hr = getInterfaceFn(accessAbi, &textureIid, &texturePtr);
+            Marshal.ThrowExceptionForHR(hr);
+
             if (texturePtr == nint.Zero)
             {
                 throw new InvalidOperationException("Nie udało się uzyskać wskaźnika ID3D11Texture2D z powierzchni WinRT.");
             }
 
             // Vortice ComObject(IntPtr) takes ownership of the COM reference returned by GetInterface.
-            return new ID3D11Texture2D(texturePtr);
+            var texture = new ID3D11Texture2D(texturePtr);
+            textureOwnershipTransferred = true;
+            return texture;
         }
         finally
         {
-            if (access is not null)
+            if (!textureOwnershipTransferred && texturePtr != nint.Zero)
             {
-                Marshal.ReleaseComObject(access);
+                Marshal.Release(texturePtr);
             }
 
             if (accessAbi != nint.Zero)

@@ -16,12 +16,13 @@ public enum MediaTrackType
 }
 
 /// <summary>
-/// Holds a compressed video or audio packet backed by a pooled byte array from <see cref="ArrayPool{T}.Shared"/>.
-/// Supports deterministic, thread-safe single-return cleanup and zero-copy retention for replay snapshots.
+/// Holds a compressed video or audio packet backed by exact-size unmanaged memory (or a legacy pooled byte array).
+/// Supports deterministic, thread-safe single-free cleanup and zero-copy retention for replay snapshots
+/// without inflating or fragmenting the .NET Large Object Heap (LOH).
 /// </summary>
-public sealed class EncodedPacket : IDisposable
+public sealed unsafe class EncodedPacket : IDisposable
 {
-    private readonly PooledBuffer _backing;
+    private readonly PacketBacking _backing;
     private int _disposed;
 
     public EncodedPacket(
@@ -31,6 +32,18 @@ public sealed class EncodedPacket : IDisposable
         long timestamp100Ns,
         long duration100Ns,
         bool isKeyframe)
+        : this(trackType, buffer, length, timestamp100Ns, duration100Ns, isKeyframe, returnToArrayPool: true)
+    {
+    }
+
+    internal EncodedPacket(
+        MediaTrackType trackType,
+        byte[] buffer,
+        int length,
+        long timestamp100Ns,
+        long duration100Ns,
+        bool isKeyframe,
+        bool returnToArrayPool)
     {
         ArgumentNullException.ThrowIfNull(buffer);
         if (length < 0 || length > buffer.Length)
@@ -43,12 +56,12 @@ public sealed class EncodedPacket : IDisposable
         Timestamp100Ns = timestamp100Ns;
         Duration100Ns = duration100Ns;
         IsKeyframe = isKeyframe;
-        _backing = new PooledBuffer(buffer);
+        _backing = new PacketBacking(buffer, returnToArrayPool);
     }
 
     private EncodedPacket(
         MediaTrackType trackType,
-        PooledBuffer backing,
+        PacketBacking backing,
         int length,
         long timestamp100Ns,
         long duration100Ns,
@@ -62,6 +75,33 @@ public sealed class EncodedPacket : IDisposable
         IsKeyframe = isKeyframe;
     }
 
+    /// <summary>
+    /// Copies <paramref name="length"/> bytes directly from an unmanaged Media Foundation buffer pointer
+    /// into an exact-size unmanaged allocation freed deterministically on <see cref="Dispose"/>.
+    /// Avoids power-of-2 <see cref="ArrayPool{T}.Shared"/> over-allocation and LOH retention.
+    /// </summary>
+    public static EncodedPacket CreateFromNativeMemory(
+        MediaTrackType trackType,
+        nint sourcePtr,
+        int length,
+        long timestamp100Ns,
+        long duration100Ns,
+        bool isKeyframe)
+    {
+        if (length < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(length), "Długość pakietu nie może być ujemna.");
+        }
+
+        if (length > 0 && sourcePtr == nint.Zero)
+        {
+            throw new ArgumentException("Wskaźnik źródłowy bufora natywnego jest pusty.", nameof(sourcePtr));
+        }
+
+        PacketBacking backing = PacketBacking.AllocateNativeCopy(sourcePtr, length);
+        return new EncodedPacket(trackType, backing, length, timestamp100Ns, duration100Ns, isKeyframe);
+    }
+
     public MediaTrackType TrackType { get; }
 
     public byte[] Buffer
@@ -69,7 +109,7 @@ public sealed class EncodedPacket : IDisposable
         get
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-            return _backing.Array;
+            return _backing.GetOrMaterializeManagedBuffer(Length);
         }
     }
 
@@ -81,10 +121,17 @@ public sealed class EncodedPacket : IDisposable
 
     public bool IsKeyframe { get; }
 
-    public ReadOnlySpan<byte> Data => Buffer.AsSpan(0, Length);
+    public ReadOnlySpan<byte> Data
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            return _backing.GetSpan(Length);
+        }
+    }
 
     /// <summary>
-    /// Creates an independently disposable packet handle sharing the underlying rented buffer via atomic ref-counting.
+    /// Creates an independently disposable packet handle sharing the underlying payload buffer via atomic ref-counting.
     /// </summary>
     internal EncodedPacket Retain()
     {
@@ -94,7 +141,7 @@ public sealed class EncodedPacket : IDisposable
     }
 
     /// <summary>
-    /// Releases this handle and returns the underlying rented buffer to <see cref="ArrayPool{T}.Shared"/>
+    /// Releases this handle and frees the underlying native buffer (or returns a legacy rented array)
     /// strictly once when the last owner disposes it.
     /// </summary>
     public void Dispose()
@@ -107,12 +154,88 @@ public sealed class EncodedPacket : IDisposable
         _backing.Release();
     }
 
-    private sealed class PooledBuffer(byte[] array)
+    private sealed class PacketBacking
     {
-        private byte[]? _array = array;
+        private nint _nativePtr;
+        private byte[]? _managedArray;
+        private readonly bool _returnToArrayPool;
+        private readonly bool _isEmpty;
         private int _refCount = 1;
 
-        public byte[] Array => _array ?? throw new ObjectDisposedException(nameof(EncodedPacket));
+        public PacketBacking(byte[] array, bool returnToArrayPool)
+        {
+            _managedArray = array;
+            _returnToArrayPool = returnToArrayPool;
+            GC.SuppressFinalize(this);
+        }
+
+        private PacketBacking(nint nativePtr, bool isEmpty)
+        {
+            _nativePtr = nativePtr;
+            _isEmpty = isEmpty;
+            if (isEmpty)
+            {
+                GC.SuppressFinalize(this);
+            }
+        }
+
+        public static PacketBacking AllocateNativeCopy(nint sourcePtr, int length)
+        {
+            if (length == 0)
+            {
+                return new PacketBacking(nint.Zero, isEmpty: true);
+            }
+
+            void* dest = NativeMemory.Alloc((nuint)length);
+            System.Buffer.MemoryCopy((void*)sourcePtr, dest, (nuint)length, (nuint)length);
+            return new PacketBacking((nint)dest, isEmpty: false);
+        }
+
+        public ReadOnlySpan<byte> GetSpan(int length)
+        {
+            if (length == 0 && _isEmpty)
+            {
+                return ReadOnlySpan<byte>.Empty;
+            }
+
+            nint nativePtr = Volatile.Read(ref _nativePtr);
+            if (nativePtr != nint.Zero)
+            {
+                return new ReadOnlySpan<byte>((void*)nativePtr, length);
+            }
+
+            byte[]? managed = Volatile.Read(ref _managedArray);
+            if (managed is not null)
+            {
+                return managed.AsSpan(0, length);
+            }
+
+            throw new ObjectDisposedException(nameof(EncodedPacket));
+        }
+
+        public byte[] GetOrMaterializeManagedBuffer(int length)
+        {
+            byte[]? managed = Volatile.Read(ref _managedArray);
+            if (managed is not null)
+            {
+                return managed;
+            }
+
+            if (length == 0 && _isEmpty)
+            {
+                return System.Array.Empty<byte>();
+            }
+
+            nint nativePtr = Volatile.Read(ref _nativePtr);
+            if (nativePtr == nint.Zero)
+            {
+                throw new ObjectDisposedException(nameof(EncodedPacket));
+            }
+
+            byte[] copy = GC.AllocateUninitializedArray<byte>(length);
+            new ReadOnlySpan<byte>((void*)nativePtr, length).CopyTo(copy);
+            return copy;
+        }
 
         public void AddRef()
         {
@@ -135,12 +258,29 @@ public sealed class EncodedPacket : IDisposable
         {
             if (Interlocked.Decrement(ref _refCount) == 0)
             {
-                byte[]? toReturn = Interlocked.Exchange(ref _array, null);
-                if (toReturn is not null)
-                {
-                    ArrayPool<byte>.Shared.Return(toReturn);
-                }
+                FreeResources();
+                GC.SuppressFinalize(this);
             }
+        }
+
+        private void FreeResources()
+        {
+            nint ptr = Interlocked.Exchange(ref _nativePtr, nint.Zero);
+            if (ptr != nint.Zero)
+            {
+                NativeMemory.Free((void*)ptr);
+            }
+
+            byte[]? toReturn = Interlocked.Exchange(ref _managedArray, null);
+            if (toReturn is not null && _returnToArrayPool)
+            {
+                ArrayPool<byte>.Shared.Return(toReturn);
+            }
+        }
+
+        ~PacketBacking()
+        {
+            FreeResources();
         }
     }
 }

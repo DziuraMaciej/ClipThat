@@ -254,6 +254,7 @@ public sealed class WgcFrameCapture : IDisposable
                 Result enumAdapterResult = factory.EnumAdapters1(adapterIndex, out IDXGIAdapter1? adapter);
                 if (enumAdapterResult.Failure || adapter is null)
                 {
+                    adapter?.Dispose();
                     break;
                 }
 
@@ -268,6 +269,7 @@ public sealed class WgcFrameCapture : IDisposable
                         Result enumOutputResult = adapter.EnumOutputs(outputIndex, out IDXGIOutput? output);
                         if (enumOutputResult.Failure || output is null)
                         {
+                            output?.Dispose();
                             break;
                         }
 
@@ -592,7 +594,8 @@ public sealed class WgcFrameCapture : IDisposable
                 return;
             }
 
-            using ID3D11Texture2D capturedBgraTexture = CaptureInterop.GetTextureFromSurface(frame.Surface);
+            using IDirect3DSurface frameSurface = frame.Surface;
+            using ID3D11Texture2D capturedBgraTexture = CaptureInterop.GetTextureFromSurface(frameSurface);
             if (Interlocked.Increment(ref _capturedFrameCount) == 1)
             {
                 EngineLogger.Info(

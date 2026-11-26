@@ -457,10 +457,11 @@ public sealed class GpuVideoProcessor : IDisposable
 
     private ID3D11Texture2D EnsureFallbackBgraTexture(uint width, uint height, Format format)
     {
+        Format effectiveFormat = format == Format.Unknown ? Format.B8G8R8A8_UNorm : format;
         if (_fallbackBgraInputTexture is not null)
         {
             Texture2DDescription existing = _fallbackBgraInputTexture.Description;
-            if (existing.Width == width && existing.Height == height && existing.Format == format)
+            if (existing.Width == width && existing.Height == height && existing.Format == effectiveFormat)
             {
                 return _fallbackBgraInputTexture;
             }
@@ -475,7 +476,7 @@ public sealed class GpuVideoProcessor : IDisposable
             Height = height,
             MipLevels = 1,
             ArraySize = 1,
-            Format = format == Format.Unknown ? Format.B8G8R8A8_UNorm : format,
+            Format = effectiveFormat,
             SampleDescription = new SampleDescription(1, 0),
             Usage = ResourceUsage.Default,
             BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
@@ -498,68 +499,76 @@ public sealed class GpuVideoProcessor : IDisposable
 
         ReleaseVideoProcessorResources();
 
-        var contentDesc = new VideoProcessorContentDescription
+        try
         {
-            InputFrameFormat = VideoFrameFormat.Progressive,
-            InputFrameRate = new Rational((uint)TargetFps, 1),
-            InputWidth = inputWidth,
-            InputHeight = inputHeight,
-            OutputFrameRate = new Rational((uint)TargetFps, 1),
-            OutputWidth = (uint)OutputWidth,
-            OutputHeight = (uint)OutputHeight,
-            Usage = VideoUsage.PlaybackNormal
-        };
-
-        _enumerator = _videoDevice!.CreateVideoProcessorEnumerator(contentDesc);
-        _videoProcessor = _videoDevice.CreateVideoProcessor(_enumerator, 0);
-
-        var sourceRect = new RawRect(0, 0, (int)inputWidth, (int)inputHeight);
-        var destRect = new RawRect(0, 0, OutputWidth, OutputHeight);
-
-        _videoContext!.VideoProcessorSetStreamFrameFormat(_videoProcessor, 0, VideoFrameFormat.Progressive);
-        _videoContext.VideoProcessorSetStreamAutoProcessingMode(_videoProcessor, 0, false);
-        _videoContext.VideoProcessorSetStreamSourceRect(_videoProcessor, 0, true, sourceRect);
-        _videoContext.VideoProcessorSetStreamDestRect(_videoProcessor, 0, true, destRect);
-        _videoContext.VideoProcessorSetOutputTargetRect(_videoProcessor, true, destRect);
-
-        // Configure explicit sRGB full-range -> BT.709 studio-range YCbCr conversion for crisp desktop colors.
-        _videoContext.VideoProcessorSetStreamColorSpace(_videoProcessor, 0, new VideoProcessorColorSpace
-        {
-            Usage = 0,         // Playback
-            RGB_Range = 0,     // Full range (0-255)
-            YCbCr_Matrix = 1,  // BT.709
-            YCbCr_xvYCC = 0,
-            Nominal_Range = 2  // 0-255
-        });
-
-        _videoContext.VideoProcessorSetOutputColorSpace(_videoProcessor, new VideoProcessorColorSpace
-        {
-            Usage = 0,         // Playback
-            RGB_Range = 0,
-            YCbCr_Matrix = 1,  // BT.709
-            YCbCr_xvYCC = 0,
-            Nominal_Range = 1  // Studio range (16-235) standard for H.264 NV12
-        });
-
-        var outputViewDesc = new VideoProcessorOutputViewDescription
-        {
-            ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
-            Texture2D = new Texture2DVideoProcessorOutputView
+            var contentDesc = new VideoProcessorContentDescription
             {
-                MipSlice = 0
+                InputFrameFormat = VideoFrameFormat.Progressive,
+                InputFrameRate = new Rational((uint)TargetFps, 1),
+                InputWidth = inputWidth,
+                InputHeight = inputHeight,
+                OutputFrameRate = new Rational((uint)TargetFps, 1),
+                OutputWidth = (uint)OutputWidth,
+                OutputHeight = (uint)OutputHeight,
+                Usage = VideoUsage.PlaybackNormal
+            };
+
+            _enumerator = _videoDevice!.CreateVideoProcessorEnumerator(contentDesc);
+            _videoProcessor = _videoDevice.CreateVideoProcessor(_enumerator, 0);
+
+            var sourceRect = new RawRect(0, 0, (int)inputWidth, (int)inputHeight);
+            var destRect = new RawRect(0, 0, OutputWidth, OutputHeight);
+
+            _videoContext!.VideoProcessorSetStreamFrameFormat(_videoProcessor, 0, VideoFrameFormat.Progressive);
+            _videoContext.VideoProcessorSetStreamAutoProcessingMode(_videoProcessor, 0, false);
+            _videoContext.VideoProcessorSetStreamSourceRect(_videoProcessor, 0, true, sourceRect);
+            _videoContext.VideoProcessorSetStreamDestRect(_videoProcessor, 0, true, destRect);
+            _videoContext.VideoProcessorSetOutputTargetRect(_videoProcessor, true, destRect);
+
+            // Configure explicit sRGB full-range -> BT.709 studio-range YCbCr conversion for crisp desktop colors.
+            _videoContext.VideoProcessorSetStreamColorSpace(_videoProcessor, 0, new VideoProcessorColorSpace
+            {
+                Usage = 0,         // Playback
+                RGB_Range = 0,     // Full range (0-255)
+                YCbCr_Matrix = 1,  // BT.709
+                YCbCr_xvYCC = 0,
+                Nominal_Range = 2  // 0-255
+            });
+
+            _videoContext.VideoProcessorSetOutputColorSpace(_videoProcessor, new VideoProcessorColorSpace
+            {
+                Usage = 0,         // Playback
+                RGB_Range = 0,
+                YCbCr_Matrix = 1,  // BT.709
+                YCbCr_xvYCC = 0,
+                Nominal_Range = 1  // Studio range (16-235) standard for H.264 NV12
+            });
+
+            var outputViewDesc = new VideoProcessorOutputViewDescription
+            {
+                ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
+                Texture2D = new Texture2DVideoProcessorOutputView
+                {
+                    MipSlice = 0
+                }
+            };
+
+            for (int i = 0; i < OutputSurfacePoolSize; i++)
+            {
+                _nv12OutputViews[i] = _videoDevice.CreateVideoProcessorOutputView(
+                    _nv12OutputTextures[i],
+                    _enumerator,
+                    outputViewDesc);
             }
-        };
 
-        for (int i = 0; i < OutputSurfacePoolSize; i++)
-        {
-            _nv12OutputViews[i] = _videoDevice.CreateVideoProcessorOutputView(
-                _nv12OutputTextures[i],
-                _enumerator,
-                outputViewDesc);
+            _configuredInputWidth = inputWidth;
+            _configuredInputHeight = inputHeight;
         }
-
-        _configuredInputWidth = inputWidth;
-        _configuredInputHeight = inputHeight;
+        catch
+        {
+            ReleaseVideoProcessorResources();
+            throw;
+        }
     }
 
     private void ReleaseVideoProcessorResources()

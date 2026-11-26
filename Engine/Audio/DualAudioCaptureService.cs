@@ -1,4 +1,3 @@
-using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ClipThat.Engine.Buffer;
@@ -1348,16 +1347,16 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             _totalPcmFramesFed = 0;
         }
 
-        private void PushEncodedPacket(byte[] rentedBuffer, int length, long timestamp100Ns, long duration100Ns)
+        private void PushEncodedPacket(EncodedPacket packet)
         {
             if (Volatile.Read(ref _stopped) != 0)
             {
-                ArrayPool<byte>.Shared.Return(rentedBuffer);
+                packet.Dispose();
                 return;
             }
 
-            Volatile.Write(ref _lastEncodedTimestamp100Ns, timestamp100Ns);
-            _ringBuffer.AddAudioPacket(_trackType, rentedBuffer, length, timestamp100Ns, duration100Ns);
+            Volatile.Write(ref _lastEncodedTimestamp100Ns, packet.Timestamp100Ns);
+            _ringBuffer.AddPacket(packet);
         }
 
         private static string TryReadDeviceId(MMDevice device)
@@ -1624,7 +1623,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         private const int MinimumOutputBufferBytes = 4096;
 
         private readonly MediaTrackType _trackType;
-        private readonly Action<byte[], int, long, long> _onEncodedPacket;
+        private readonly Action<EncodedPacket> _onEncodedPacket;
         private readonly Action<ReadOnlyMemory<byte>>? _onUserData;
 
         private readonly byte[] _pcmAccumulator = new byte[AacFrameByteCount];
@@ -1645,7 +1644,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         public AacMftEncoder(
             MediaTrackType trackType,
             long initialLastTimestamp100Ns,
-            Action<byte[], int, long, long> onEncodedPacket,
+            Action<EncodedPacket> onEncodedPacket,
             Action<ReadOnlyMemory<byte>>? onUserData)
         {
             _trackType = trackType;
@@ -1717,37 +1716,42 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 return;
             }
 
-            using IMFSample inputSample = MediaFactory.MFCreateSample();
-            inputSample.SampleTime = sampleTime100Ns;
-            inputSample.SampleDuration = sampleDuration100Ns;
-
-            using IMFMediaBuffer inputBuffer = MediaFactory.MFCreateMemoryBuffer(pcmFrameBytes.Length);
-            inputBuffer.Lock(out nint dstPtr, out int maxLength, out _);
-            try
+            // Dispose input IMFMediaBuffer right after AddBuffer and input IMFSample immediately after ProcessInput.
+            using (IMFSample inputSample = MediaFactory.MFCreateSample())
             {
-                if (maxLength < pcmFrameBytes.Length)
+                inputSample.SampleTime = sampleTime100Ns;
+                inputSample.SampleDuration = sampleDuration100Ns;
+
+                using (IMFMediaBuffer inputBuffer = MediaFactory.MFCreateMemoryBuffer(pcmFrameBytes.Length))
                 {
-                    throw new InvalidOperationException("Za mały bufor wejściowy kodera AAC.");
+                    inputBuffer.Lock(out nint dstPtr, out int maxLength, out _);
+                    try
+                    {
+                        if (maxLength < pcmFrameBytes.Length)
+                        {
+                            throw new InvalidOperationException("Za mały bufor wejściowy kodera AAC.");
+                        }
+
+                        Marshal.Copy(pcmFrameBytes, 0, dstPtr, pcmFrameBytes.Length);
+                    }
+                    finally
+                    {
+                        inputBuffer.Unlock();
+                    }
+
+                    inputBuffer.CurrentLength = pcmFrameBytes.Length;
+                    inputSample.AddBuffer(inputBuffer);
                 }
 
-                Marshal.Copy(pcmFrameBytes, 0, dstPtr, pcmFrameBytes.Length);
-            }
-            finally
-            {
-                inputBuffer.Unlock();
-            }
-
-            inputBuffer.CurrentLength = pcmFrameBytes.Length;
-            inputSample.AddBuffer(inputBuffer);
-
-            try
-            {
-                _transform.ProcessInput(_inputStreamId, inputSample, 0);
-            }
-            catch (SharpGenException ex) when (ex.ResultCode == ResultCode.Notaccepting)
-            {
-                DrainOutputs();
-                _transform.ProcessInput(_inputStreamId, inputSample, 0);
+                try
+                {
+                    _transform.ProcessInput(_inputStreamId, inputSample, 0);
+                }
+                catch (SharpGenException ex) when (ex.ResultCode == ResultCode.Notaccepting)
+                {
+                    DrainOutputs();
+                    _transform.ProcessInput(_inputStreamId, inputSample, 0);
+                }
             }
 
             DrainOutputs();
@@ -1768,17 +1772,23 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 };
 
                 IMFSample? callerAllocatedSample = null;
-                if (!_mftProvidesOutputSamples)
-                {
-                    callerAllocatedSample = MediaFactory.MFCreateSample();
-                    int bufferCapacity = Math.Max(_outputStreamInfo.Size, MinimumOutputBufferBytes);
-                    using IMFMediaBuffer memoryBuffer = MediaFactory.MFCreateMemoryBuffer(bufferCapacity);
-                    callerAllocatedSample.AddBuffer(memoryBuffer);
-                    outputBuffer.Sample = callerAllocatedSample;
-                }
+                nint callerSamplePtr = nint.Zero;
 
                 try
                 {
+                    if (!_mftProvidesOutputSamples)
+                    {
+                        callerAllocatedSample = MediaFactory.MFCreateSample();
+                        callerSamplePtr = callerAllocatedSample.NativePointer;
+                        int bufferCapacity = Math.Max(_outputStreamInfo.Size, MinimumOutputBufferBytes);
+                        using (IMFMediaBuffer memoryBuffer = MediaFactory.MFCreateMemoryBuffer(bufferCapacity))
+                        {
+                            callerAllocatedSample.AddBuffer(memoryBuffer);
+                        }
+
+                        outputBuffer.Sample = callerAllocatedSample;
+                    }
+
                     Result hr = _transform.ProcessOutput(
                         ProcessOutputFlags.None,
                         cOutputBufferCount: 1,
@@ -1816,61 +1826,123 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 }
                 finally
                 {
-                    outputBuffer.Events?.Dispose();
-                    if (outputBuffer.Sample is not null)
-                    {
-                        outputBuffer.Sample.Dispose();
-                    }
-                    else
-                    {
-                        callerAllocatedSample?.Dispose();
-                    }
+                    SafeDisposeComObject(outputBuffer.Events);
+                    outputBuffer.Events = null;
+
+                    IMFSample? returnedSample = outputBuffer.Sample;
+                    outputBuffer.Sample = null;
+
+                    DisposeProcessOutputSamples(callerAllocatedSample, callerSamplePtr, returnedSample);
                 }
             }
         }
 
         private void EmitEncodedSample(IMFSample sample)
         {
-            using IMFMediaBuffer contiguous = sample.ConvertToContiguousBuffer();
-
-            byte[]? rented = null;
-            int length;
-            contiguous.Lock(out nint dataPtr, out _, out length);
-            try
-            {
-                if (length <= 0 || dataPtr == nint.Zero)
-                {
-                    return;
-                }
-
-                rented = ArrayPool<byte>.Shared.Rent(length);
-                Marshal.Copy(dataPtr, rented, 0, length);
-            }
-            catch
-            {
-                if (rented is not null)
-                {
-                    ArrayPool<byte>.Shared.Return(rented);
-                }
-
-                throw;
-            }
-            finally
-            {
-                contiguous.Unlock();
-            }
-
             long duration100Ns = TryGetSampleDuration(sample);
             long timestamp100Ns = TryGetSampleTime(sample, duration100Ns);
 
+            EncodedPacket? packet = null;
+
+            // Dispose the contiguous IMFMediaBuffer immediately after copying bytes out.
+            using (IMFMediaBuffer contiguous = sample.ConvertToContiguousBuffer())
+            {
+                contiguous.Lock(out nint dataPtr, out _, out int length);
+                try
+                {
+                    if (length <= 0 || dataPtr == nint.Zero)
+                    {
+                        return;
+                    }
+
+                    packet = EncodedPacket.CreateFromNativeMemory(
+                        _trackType,
+                        dataPtr,
+                        length,
+                        timestamp100Ns,
+                        duration100Ns,
+                        isKeyframe: true);
+                }
+                finally
+                {
+                    contiguous.Unlock();
+                }
+            }
+
             try
             {
-                _onEncodedPacket(rented, length, timestamp100Ns, duration100Ns);
+                _onEncodedPacket(packet);
             }
             catch
             {
-                ArrayPool<byte>.Shared.Return(rented);
+                packet.Dispose();
                 throw;
+            }
+        }
+
+        private static void DisposeProcessOutputSamples(
+            IMFSample? callerAllocatedSample,
+            nint callerSamplePtr,
+            IMFSample? returnedSample)
+        {
+            if (returnedSample is not null)
+            {
+                if (callerAllocatedSample is not null)
+                {
+                    if (ReferenceEquals(returnedSample, callerAllocatedSample))
+                    {
+                        SafeDisposeComObject(callerAllocatedSample);
+                    }
+                    else if (callerSamplePtr != nint.Zero && returnedSample.NativePointer == callerSamplePtr)
+                    {
+                        // Vortice OutputDataBuffer.__MarshalFrom wraps the same native IMFSample* in a second
+                        // managed wrapper without AddRef(). Detach the alias and dispose the caller wrapper once.
+                        try
+                        {
+                            returnedSample.NativePointer = nint.Zero;
+                        }
+                        catch
+                        {
+                            // Best-effort pointer detachment.
+                        }
+                        finally
+                        {
+                            GC.SuppressFinalize(returnedSample);
+                        }
+
+                        SafeDisposeComObject(callerAllocatedSample);
+                    }
+                    else
+                    {
+                        SafeDisposeComObject(returnedSample);
+                        SafeDisposeComObject(callerAllocatedSample);
+                    }
+                }
+                else
+                {
+                    SafeDisposeComObject(returnedSample);
+                }
+            }
+            else if (callerAllocatedSample is not null)
+            {
+                SafeDisposeComObject(callerAllocatedSample);
+            }
+        }
+
+        private static void SafeDisposeComObject(IDisposable? disposable)
+        {
+            if (disposable is null)
+            {
+                return;
+            }
+
+            try
+            {
+                disposable.Dispose();
+            }
+            catch
+            {
+                // Ignore COM disposal errors during AAC encoding/teardown.
             }
         }
 
@@ -1946,13 +2018,38 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
                 if (activatesPtr != nint.Zero && count > 0)
                 {
-                    for (int i = 0; i < count; i++)
+                    int wrappedCount = 0;
+                    try
                     {
-                        nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                        if (itemPtr != nint.Zero)
+                        for (int i = 0; i < count; i++)
                         {
-                            candidates.Add(new IMFActivate(itemPtr));
+                            nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                            if (itemPtr != nint.Zero)
+                            {
+                                candidates.Add(new IMFActivate(itemPtr));
+                            }
+
+                            wrappedCount = i + 1;
                         }
+                    }
+                    catch
+                    {
+                        for (int i = 0; i < candidates.Count; i++)
+                        {
+                            SafeDisposeComObject(candidates[i]);
+                        }
+
+                        candidates.Clear();
+                        for (int i = wrappedCount; i < count; i++)
+                        {
+                            nint remainingPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                            if (remainingPtr != nint.Zero)
+                            {
+                                Marshal.Release(remainingPtr);
+                            }
+                        }
+
+                        throw;
                     }
                 }
             }
@@ -2429,16 +2526,16 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             }
         }
 
-        private void PushEncodedPacket(byte[] rentedBuffer, int length, long timestamp100Ns, long duration100Ns)
+        private void PushEncodedPacket(EncodedPacket packet)
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
-                ArrayPool<byte>.Shared.Return(rentedBuffer);
+                packet.Dispose();
                 return;
             }
 
-            Volatile.Write(ref _lastEncodedTimestamp100Ns, timestamp100Ns);
-            _ringBuffer.AddAudioPacket(MediaTrackType.CombinedMixAudio, rentedBuffer, length, timestamp100Ns, duration100Ns);
+            Volatile.Write(ref _lastEncodedTimestamp100Ns, packet.Timestamp100Ns);
+            _ringBuffer.AddPacket(packet);
         }
 
         public void Dispose()
