@@ -19,6 +19,19 @@ public sealed class Mp4ReplayMuxer
         (DualAudioCaptureService.AacFrameSampleCount * TimeSpan.TicksPerSecond) / DualAudioCaptureService.TargetSampleRate;
 
     /// <summary>
+    /// Deterministic MP4 track registration order:
+    /// Stream 0: H.264 Video,
+    /// Stream 1: System Audio (first audio track so standard players and Discord play system sound by default),
+    /// Stream 2: Microphone Audio (second audio track).
+    /// </summary>
+    private static readonly MediaTrackType[] DeterministicTrackOrder =
+    {
+        MediaTrackType.Video,
+        MediaTrackType.SystemAudio,
+        MediaTrackType.MicrophoneAudio
+    };
+
+    /// <summary>
     /// Standard Media Foundation <c>MF_MT_USER_DATA</c> payload for raw AAC-LC 48000 Hz Stereo:
     /// 12-byte <c>HEAACWAVEINFO</c> header fields + 2-byte ISO 14496-3 <c>AudioSpecificConfig</c> (<c>0x11, 0x90</c>).
     /// Used as fallback when the AAC encoder MFT did not expose a custom blob.
@@ -101,10 +114,17 @@ public sealed class Mp4ReplayMuxer
         }
 
         // Stable timestamp ordering ensures smooth MP4 interleaving across video and audio streams
-        // while preserving exact encoder packet order within each track.
+        // while preserving deterministic track priority (Video -> SystemAudio -> MicrophoneAudio)
+        // and exact encoder packet order within each track.
         orderedPackets.Sort(static (a, b) =>
         {
             int cmp = a.Packet.Timestamp100Ns.CompareTo(b.Packet.Timestamp100Ns);
+            if (cmp != 0)
+            {
+                return cmp;
+            }
+
+            cmp = GetTrackOrderPriority(a.Packet.TrackType).CompareTo(GetTrackOrderPriority(b.Packet.TrackType));
             return cmp != 0 ? cmp : a.OriginalIndex.CompareTo(b.OriginalIndex);
         });
 
@@ -138,35 +158,56 @@ public sealed class Mp4ReplayMuxer
 
             sinkWriter = MediaFactory.MFCreateSinkWriterFromURL(outputFilePath, null, sinkAttributes);
 
-            // Stream 0: Compressed H.264 video passthrough (zero re-encoding).
-            videoMediaType = CreateH264MediaType(width, height, fps, videoBitrateBps, videoSequenceHeader);
-            int videoStreamIndex = sinkWriter.AddStream(videoMediaType);
-            sinkWriter.SetInputMediaType(videoStreamIndex, videoMediaType, null);
-
-            // Stream 1: Compressed AAC system loopback audio passthrough (48000 Hz, Stereo, 128 kbps).
+            // Register streams in strict deterministic order:
+            // Stream 0: H.264 Video
+            // Stream 1: System Audio (MediaTrackType.SystemAudio — first audio track for players & Discord)
+            // Stream 2: Microphone Audio (MediaTrackType.MicrophoneAudio — secondary audio track)
+            int videoStreamIndex = -1;
             int systemAudioStreamIndex = -1;
-            if (hasSystemAudio)
-            {
-                byte[] sysUserData = snapshot.SystemAudioUserData is { Length: > 0 }
-                    ? snapshot.SystemAudioUserData
-                    : DefaultAac48kStereoUserData;
+            int microphoneAudioStreamIndex = -1;
 
-                systemAudioMediaType = CreateAacMediaType(sysUserData);
-                systemAudioStreamIndex = sinkWriter.AddStream(systemAudioMediaType);
-                sinkWriter.SetInputMediaType(systemAudioStreamIndex, systemAudioMediaType, null);
+            foreach (MediaTrackType trackType in DeterministicTrackOrder)
+            {
+                switch (trackType)
+                {
+                    case MediaTrackType.Video:
+                        videoMediaType = CreateH264MediaType(width, height, fps, videoBitrateBps, videoSequenceHeader);
+                        videoStreamIndex = sinkWriter.AddStream(videoMediaType);
+                        sinkWriter.SetInputMediaType(videoStreamIndex, videoMediaType, null);
+                        break;
+
+                    case MediaTrackType.SystemAudio when hasSystemAudio:
+                    {
+                        byte[] sysUserData = snapshot.SystemAudioUserData is { Length: > 0 }
+                            ? snapshot.SystemAudioUserData
+                            : DefaultAac48kStereoUserData;
+
+                        systemAudioMediaType = CreateAacMediaType(sysUserData);
+                        systemAudioStreamIndex = sinkWriter.AddStream(systemAudioMediaType);
+                        sinkWriter.SetInputMediaType(systemAudioStreamIndex, systemAudioMediaType, null);
+                        break;
+                    }
+
+                    case MediaTrackType.MicrophoneAudio when hasMicrophoneAudio:
+                    {
+                        byte[] micUserData = snapshot.MicrophoneAudioUserData is { Length: > 0 }
+                            ? snapshot.MicrophoneAudioUserData
+                            : DefaultAac48kStereoUserData;
+
+                        microphoneAudioMediaType = CreateAacMediaType(micUserData);
+                        microphoneAudioStreamIndex = sinkWriter.AddStream(microphoneAudioMediaType);
+                        sinkWriter.SetInputMediaType(microphoneAudioStreamIndex, microphoneAudioMediaType, null);
+                        break;
+                    }
+                }
             }
 
-            // Stream 2 (optional): Compressed AAC microphone audio passthrough (48000 Hz, Stereo, 128 kbps).
-            int microphoneAudioStreamIndex = -1;
-            if (hasMicrophoneAudio)
+            if (videoStreamIndex != 0 ||
+                (hasSystemAudio && systemAudioStreamIndex != 1) ||
+                (hasSystemAudio && hasMicrophoneAudio && microphoneAudioStreamIndex != 2))
             {
-                byte[] micUserData = snapshot.MicrophoneAudioUserData is { Length: > 0 }
-                    ? snapshot.MicrophoneAudioUserData
-                    : DefaultAac48kStereoUserData;
-
-                microphoneAudioMediaType = CreateAacMediaType(micUserData);
-                microphoneAudioStreamIndex = sinkWriter.AddStream(microphoneAudioMediaType);
-                sinkWriter.SetInputMediaType(microphoneAudioStreamIndex, microphoneAudioMediaType, null);
+                throw new InvalidOperationException(
+                    $"Nieoczekiwana kolejność strumieni MP4 (Video={videoStreamIndex}, SystemAudio={systemAudioStreamIndex}, MicrophoneAudio={microphoneAudioStreamIndex}).");
             }
 
             sinkWriter.BeginWriting();
@@ -444,6 +485,14 @@ public sealed class Mp4ReplayMuxer
             Debug.WriteLine($"Błąd zwalniania obiektu COM muksera MP4: {ex.Message}");
         }
     }
+
+    private static int GetTrackOrderPriority(MediaTrackType trackType) => trackType switch
+    {
+        MediaTrackType.Video => 0,
+        MediaTrackType.SystemAudio => 1,
+        MediaTrackType.MicrophoneAudio => 2,
+        _ => 3
+    };
 
     private readonly record struct IndexedPacket(EncodedPacket Packet, int OriginalIndex);
 }

@@ -52,6 +52,23 @@ public sealed class AppSettings
         {
             OutputDirectory = DefaultOutputDirectory;
         }
+
+        SystemAudioDeviceId = string.IsNullOrWhiteSpace(SystemAudioDeviceId)
+            ? null
+            : SystemAudioDeviceId.Trim();
+
+        if (string.IsNullOrWhiteSpace(MicrophoneDeviceId))
+        {
+            MicrophoneDeviceId = null;
+        }
+        else if (string.Equals(MicrophoneDeviceId.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            MicrophoneDeviceId = "none";
+        }
+        else
+        {
+            MicrophoneDeviceId = MicrophoneDeviceId.Trim();
+        }
     }
 
     /// <summary>

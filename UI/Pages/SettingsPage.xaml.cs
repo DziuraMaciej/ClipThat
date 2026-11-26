@@ -9,28 +9,35 @@ using Microsoft.Win32;
 namespace ClipThat.UI.Pages;
 
 /// <summary>
-/// Settings page allowing users to configure monitor selection, buffer parameters, folder, and startup behavior.
+/// Settings page allowing users to configure monitor selection, audio devices, buffer parameters, folder, and startup behavior.
 /// </summary>
 public partial class SettingsPage : Page
 {
     private readonly SettingsService _settingsService;
     private readonly DisplayService _displayService;
+    private readonly AudioDeviceService _audioDeviceService;
     private readonly ResourceEstimatorService _resourceEstimatorService;
     private readonly StartupService _startupService;
     private readonly IReplayEngine _replayEngine;
 
     private AppSettings _workingSettings;
     private bool _isInitializing = true;
+    private bool _isRefreshingAudioDevices;
+    private bool _isUpdatingAudioSettings;
+    private bool _hasPendingAudioUpdate;
+    private bool _isDetached;
 
     public SettingsPage(
         SettingsService settingsService,
         DisplayService displayService,
+        AudioDeviceService audioDeviceService,
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
         IReplayEngine replayEngine)
     {
         _settingsService = settingsService;
         _displayService = displayService;
+        _audioDeviceService = audioDeviceService;
         _resourceEstimatorService = resourceEstimatorService;
         _startupService = startupService;
         _replayEngine = replayEngine;
@@ -42,6 +49,9 @@ public partial class SettingsPage : Page
         LoadSettingsIntoControls();
 
         _replayEngine.StatusChanged += OnEngineStatusChanged;
+        _audioDeviceService.DevicesChanged += OnAudioDevicesChanged;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+
         UpdateEngineControls(_replayEngine.IsRecording, null);
 
         _isInitializing = false;
@@ -49,17 +59,22 @@ public partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// Unsubscribes from long-lived engine events when the parent window closes so the page can be collected.
+    /// Unsubscribes from long-lived engine and system events when the parent window closes so the page can be collected.
     /// </summary>
     public void Detach()
     {
+        _isDetached = true;
         _replayEngine.StatusChanged -= OnEngineStatusChanged;
+        _audioDeviceService.DevicesChanged -= OnAudioDevicesChanged;
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
     }
 
     private void PopulateOptions()
     {
         IReadOnlyList<DisplayDeviceInfo> displays = _displayService.GetDisplays();
         MonitorComboBox.ItemsSource = displays;
+
+        RefreshAudioDeviceLists();
 
         ResolutionComboBox.ItemsSource = new[]
         {
@@ -88,6 +103,8 @@ public partial class SettingsPage : Page
                 ?? displays[0];
         }
 
+        RefreshAudioDeviceLists();
+
         DurationSlider.Value = _workingSettings.BufferDurationMinutes;
         DurationValueText.Text = $"{_workingSettings.BufferDurationMinutes} min";
         ResolutionComboBox.SelectedValue = _workingSettings.Resolution;
@@ -95,6 +112,123 @@ public partial class SettingsPage : Page
         OutputDirectoryTextBox.Text = _workingSettings.OutputDirectory;
         StartWithWindowsSwitch.IsChecked = _workingSettings.StartWithWindows || _startupService.IsEnabled();
         StartRecordingOnLaunchSwitch.IsChecked = _workingSettings.StartRecordingOnLaunch;
+    }
+
+    private void RefreshAudioDeviceLists()
+    {
+        if (_isDetached)
+        {
+            return;
+        }
+
+        _isRefreshingAudioDevices = true;
+        try
+        {
+            IReadOnlyList<AudioDeviceInfo> playbackDevices = _audioDeviceService.GetPlaybackDevices();
+            SystemAudioComboBox.ItemsSource = playbackDevices;
+            SystemAudioComboBox.SelectedItem = FindMatchingAudioDevice(playbackDevices, _workingSettings.SystemAudioDeviceId);
+
+            IReadOnlyList<AudioDeviceInfo> captureDevices = _audioDeviceService.GetCaptureDevices();
+            MicrophoneComboBox.ItemsSource = captureDevices;
+            MicrophoneComboBox.SelectedItem = FindMatchingAudioDevice(captureDevices, _workingSettings.MicrophoneDeviceId);
+        }
+        finally
+        {
+            _isRefreshingAudioDevices = false;
+        }
+    }
+
+    private static AudioDeviceInfo? FindMatchingAudioDevice(
+        IReadOnlyList<AudioDeviceInfo> devices,
+        string? configuredDeviceId)
+    {
+        if (devices.Count == 0)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(configuredDeviceId))
+        {
+            return devices.FirstOrDefault(d => d.IsDefaultOption) ?? devices[0];
+        }
+
+        if (AudioDeviceService.IsDisabledDeviceId(configuredDeviceId))
+        {
+            return devices.FirstOrDefault(d => d.IsDisabledOption) ?? devices[0];
+        }
+
+        return devices.FirstOrDefault(d =>
+                   !string.IsNullOrWhiteSpace(d.DeviceId) &&
+                   string.Equals(d.DeviceId, configuredDeviceId, StringComparison.OrdinalIgnoreCase))
+               ?? devices.FirstOrDefault(d => d.IsDefaultOption)
+               ?? devices[0];
+    }
+
+    private async void AudioDevice_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_isInitializing || _isRefreshingAudioDevices || _isDetached)
+        {
+            return;
+        }
+
+        await ApplyAudioDeviceSelectionAsync();
+    }
+
+    private async Task ApplyAudioDeviceSelectionAsync()
+    {
+        if (_isUpdatingAudioSettings)
+        {
+            _hasPendingAudioUpdate = true;
+            return;
+        }
+
+        _isUpdatingAudioSettings = true;
+        try
+        {
+            do
+            {
+                _hasPendingAudioUpdate = false;
+
+                string? selectedSystemAudioId = (SystemAudioComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
+                string? selectedMicrophoneId = (MicrophoneComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
+
+                bool changed =
+                    !string.Equals(_workingSettings.SystemAudioDeviceId, selectedSystemAudioId, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(_workingSettings.MicrophoneDeviceId, selectedMicrophoneId, StringComparison.OrdinalIgnoreCase);
+
+                if (!changed)
+                {
+                    continue;
+                }
+
+                AppSettings updated = _workingSettings.Clone();
+                updated.SystemAudioDeviceId = selectedSystemAudioId;
+                updated.MicrophoneDeviceId = selectedMicrophoneId;
+                updated.Normalize();
+
+                _settingsService.Save(updated);
+                _workingSettings = updated;
+
+                await _replayEngine.UpdateSettingsAsync(updated);
+
+                if (!_isDetached)
+                {
+                    SaveFeedbackText.Text = "Zaktualizowano ustawienia audio.";
+                }
+            }
+            while (_hasPendingAudioUpdate && !_isDetached);
+        }
+        catch (Exception ex)
+        {
+            if (!_isDetached)
+            {
+                SaveFeedbackText.Text = $"Błąd aktualizacji audio: {ex.Message}";
+            }
+        }
+        finally
+        {
+            _isUpdatingAudioSettings = false;
+        }
     }
 
     private void QualityInput_Changed(object sender, RoutedEventArgs e)
@@ -149,6 +283,8 @@ public partial class SettingsPage : Page
         {
             AppSettings updated = _workingSettings.Clone();
             updated.SelectedMonitorDeviceName = (MonitorComboBox.SelectedItem as DisplayDeviceInfo)?.DeviceName;
+            updated.SystemAudioDeviceId = (SystemAudioComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
+            updated.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
             updated.BufferDurationMinutes = (int)Math.Round(DurationSlider.Value);
             updated.Resolution = ResolutionComboBox.SelectedValue is ResolutionPreset preset
                 ? preset
@@ -164,15 +300,24 @@ public partial class SettingsPage : Page
             await _replayEngine.UpdateSettingsAsync(updated);
 
             _workingSettings = updated;
-            SaveFeedbackText.Text = "Zapisano ustawienia.";
+            if (!_isDetached)
+            {
+                SaveFeedbackText.Text = "Zapisano ustawienia.";
+            }
         }
         catch (Exception ex)
         {
-            SaveFeedbackText.Text = $"Błąd zapisu: {ex.Message}";
+            if (!_isDetached)
+            {
+                SaveFeedbackText.Text = $"Błąd zapisu: {ex.Message}";
+            }
         }
         finally
         {
-            SaveSettingsButton.IsEnabled = true;
+            if (!_isDetached)
+            {
+                SaveSettingsButton.IsEnabled = true;
+            }
         }
     }
 
@@ -185,11 +330,17 @@ public partial class SettingsPage : Page
         }
         catch (Exception ex)
         {
-            SaveFeedbackText.Text = $"Błąd zapisu powtórki: {ex.Message}";
+            if (!_isDetached)
+            {
+                SaveFeedbackText.Text = $"Błąd zapisu powtórki: {ex.Message}";
+            }
         }
         finally
         {
-            SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
+            if (!_isDetached)
+            {
+                SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
+            }
         }
     }
 
@@ -209,19 +360,56 @@ public partial class SettingsPage : Page
         }
         catch (Exception ex)
         {
-            SaveFeedbackText.Text = $"Błąd zmiany stanu nagrywania: {ex.Message}";
-            UpdateEngineControls(_replayEngine.IsRecording, null);
+            if (!_isDetached)
+            {
+                SaveFeedbackText.Text = $"Błąd zmiany stanu nagrywania: {ex.Message}";
+                UpdateEngineControls(_replayEngine.IsRecording, null);
+            }
         }
         finally
         {
-            ToggleRecordingButton.IsEnabled = true;
-            SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
+            if (!_isDetached)
+            {
+                ToggleRecordingButton.IsEnabled = true;
+                SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
+            }
         }
+    }
+
+    private void OnAudioDevicesChanged()
+    {
+        if (_isDetached)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(RefreshAudioDeviceLists);
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (_isDetached || e.Mode != PowerModes.Resume)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(RefreshAudioDeviceLists);
     }
 
     private void OnEngineStatusChanged(string status)
     {
-        Dispatcher.InvokeAsync(() => UpdateEngineControls(_replayEngine.IsRecording, status));
+        if (_isDetached)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (!_isDetached)
+            {
+                UpdateEngineControls(_replayEngine.IsRecording, status);
+            }
+        });
     }
 
     private void UpdateEngineControls(bool isRecording, string? status)

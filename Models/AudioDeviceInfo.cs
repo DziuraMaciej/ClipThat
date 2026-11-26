@@ -16,9 +16,14 @@ public sealed class AudioDeviceInfo
     public string FriendlyName { get; init; } = string.Empty;
 
     /// <summary>
-    /// Indicates whether this entry represents the dynamic "Domyślne urządzenie systemowe" sentinel option.
+    /// Indicates whether this entry represents the dynamic system default sentinel option.
     /// </summary>
     public bool IsDefaultOption { get; init; }
+
+    /// <summary>
+    /// Indicates whether this entry represents the explicit disabled sentinel option (e.g. microphone off).
+    /// </summary>
+    public bool IsDisabledOption { get; init; }
 
     /// <summary>
     /// Indicates whether this concrete endpoint is currently Windows' active default multimedia endpoint.
@@ -27,7 +32,7 @@ public sealed class AudioDeviceInfo
 
     public override string ToString()
     {
-        if (IsDefaultOption)
+        if (IsDefaultOption || IsDisabledOption)
         {
             return FriendlyName;
         }

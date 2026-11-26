@@ -19,6 +19,7 @@ public partial class App : Application
 
     private readonly SettingsService _settingsService = new();
     private readonly DisplayService _displayService = new();
+    private readonly AudioDeviceService _audioDeviceService = new();
     private readonly ResourceEstimatorService _resourceEstimatorService = new();
     private readonly StartupService _startupService = new();
     private readonly IReplayEngine _replayEngine;
@@ -214,6 +215,7 @@ public partial class App : Application
         _mainWindow = new MainWindow(
             _settingsService,
             _displayService,
+            _audioDeviceService,
             _resourceEstimatorService,
             _startupService,
             _replayEngine);
@@ -384,6 +386,8 @@ public partial class App : Application
 
             _pausedTrayIcon?.Dispose();
             _pausedTrayIcon = null;
+
+            _audioDeviceService.Dispose();
 
             Shutdown();
         }

@@ -2,31 +2,56 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ClipThat.Models;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 
 namespace ClipThat.Services;
 
 /// <summary>
 /// Enumerates active Windows Core Audio (WASAPI) playback and microphone devices
-/// via <see cref="MMDeviceEnumerator"/> with graceful fallback when no capture devices exist.
+/// via <see cref="MMDeviceEnumerator"/> and raises change notifications when endpoints
+/// are plugged in, unplugged, or switched as default.
 /// </summary>
-public sealed class AudioDeviceService
+public sealed class AudioDeviceService : IDisposable
 {
-    public const string DefaultDeviceLabel = "Domyślne urządzenie systemowe";
+    public const string DisabledDeviceId = "none";
+    public const string DefaultRenderDeviceLabel = "Domyślne urządzenie systemowe (automatyczne)";
+    public const string DefaultCaptureDeviceLabel = "Domyślny mikrofon systemowy (automatyczny)";
+    public const string DisabledMicrophoneLabel = "Wyłączony";
+    public const string DefaultDeviceLabel = DefaultRenderDeviceLabel;
+
+    private readonly object _watcherLock = new();
+    private MMDeviceEnumerator? _notificationEnumerator;
+    private EndpointNotificationBridge? _notificationBridge;
+    private int _disposed;
+
+    public AudioDeviceService()
+    {
+        TryStartDeviceWatcher();
+    }
+
+    /// <summary>
+    /// Raised on a background thread whenever Windows audio endpoints are added, removed,
+    /// change active state, or when the default audio endpoint changes.
+    /// </summary>
+    public event Action? DevicesChanged;
+
+    public static bool IsDisabledDeviceId(string? deviceId)
+        => string.Equals(deviceId, DisabledDeviceId, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Lists active playback endpoints (<see cref="DataFlow.Render"/>) usable for WASAPI system audio loopback.
-    /// Always starts with the <see cref="DefaultDeviceLabel"/> (<see langword="null"/> ID) option.
+    /// Always starts with the automatic system default (<see langword="null"/> ID) option.
     /// </summary>
     public IReadOnlyList<AudioDeviceInfo> GetPlaybackDevices()
-        => EnumerateDevices(DataFlow.Render);
+        => EnumerateDevices(DataFlow.Render, includeDisabledOption: false);
 
     /// <summary>
     /// Lists active recording endpoints (<see cref="DataFlow.Capture"/>) usable as microphone sources.
-    /// Always starts with the <see cref="DefaultDeviceLabel"/> (<see langword="null"/> ID) option and handles
-    /// systems with no microphone gracefully without throwing.
+    /// Starts with the automatic system default (<see langword="null"/> ID) and explicit disabled (<c>"none"</c>)
+    /// options, and handles systems with no microphone gracefully without throwing.
     /// </summary>
     public IReadOnlyList<AudioDeviceInfo> GetCaptureDevices()
-        => EnumerateDevices(DataFlow.Capture);
+        => EnumerateDevices(DataFlow.Capture, includeDisabledOption: true);
 
     /// <summary>
     /// Returns <see langword="true"/> when at least one active microphone capture device is available.
@@ -34,17 +59,24 @@ public sealed class AudioDeviceService
     public bool HasActiveCaptureDevice()
     {
         IReadOnlyList<AudioDeviceInfo> devices = GetCaptureDevices();
-        return devices.Count > 1;
+        return devices.Any(d => !d.IsDefaultOption && !d.IsDisabledOption);
     }
 
     /// <summary>
     /// Resolves a concrete active <see cref="MMDevice"/> for the specified <paramref name="dataFlow"/> and optional
-    /// <paramref name="deviceId"/>, falling back to the system default multimedia endpoint if the ID is null/empty
-    /// or the previously configured device is disconnected. Caller owns and must dispose the returned device.
+    /// <paramref name="deviceId"/>. Returns <see langword="null"/> when capture is explicitly disabled (<c>"none"</c>).
+    /// Uses <see cref="MMDeviceEnumerator.GetDevice"/> when a specific ID is configured, or
+    /// <see cref="MMDeviceEnumerator.GetDefaultAudioEndpoint"/> (<see cref="Role.Multimedia"/>) when null/empty.
+    /// Caller owns and must dispose the returned device.
     /// </summary>
     public static MMDevice? ResolveDevice(MMDeviceEnumerator enumerator, DataFlow dataFlow, string? deviceId)
     {
         ArgumentNullException.ThrowIfNull(enumerator);
+
+        if (dataFlow == DataFlow.Capture && IsDisabledDeviceId(deviceId))
+        {
+            return null;
+        }
 
         if (!string.IsNullOrWhiteSpace(deviceId))
         {
@@ -100,18 +132,85 @@ public sealed class AudioDeviceService
         }
     }
 
-    private static IReadOnlyList<AudioDeviceInfo> EnumerateDevices(DataFlow dataFlow)
+    private void TryStartDeviceWatcher()
     {
+        lock (_watcherLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                _notificationEnumerator = new MMDeviceEnumerator();
+                _notificationBridge = new EndpointNotificationBridge(NotifyDevicesChanged);
+                _notificationEnumerator.RegisterEndpointNotificationCallback(_notificationBridge);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Nie udało się zarejestrować obserwatora urządzeń audio: {ex.Message}");
+                CleanupWatcherLocked();
+            }
+        }
+    }
+
+    private void NotifyDevicesChanged()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        Action? handler = DevicesChanged;
+        if (handler is null)
+        {
+            return;
+        }
+
+        // Dispatch off the Core Audio RPC callback thread to avoid re-entrant MMDevApi deadlocks.
+        ThreadPool.QueueUserWorkItem(static state =>
+        {
+            try
+            {
+                ((Action)state!).Invoke();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Błąd powiadomienia o zmianie urządzeń audio: {ex.Message}");
+            }
+        }, handler);
+    }
+
+    private static IReadOnlyList<AudioDeviceInfo> EnumerateDevices(DataFlow dataFlow, bool includeDisabledOption)
+    {
+        string defaultLabel = dataFlow == DataFlow.Capture
+            ? DefaultCaptureDeviceLabel
+            : DefaultRenderDeviceLabel;
+
         var results = new List<AudioDeviceInfo>
         {
             new()
             {
                 DeviceId = null,
-                FriendlyName = DefaultDeviceLabel,
+                FriendlyName = defaultLabel,
                 IsDefaultOption = true,
+                IsDisabledOption = false,
                 IsSystemDefault = false
             }
         };
+
+        if (includeDisabledOption)
+        {
+            results.Add(new AudioDeviceInfo
+            {
+                DeviceId = DisabledDeviceId,
+                FriendlyName = DisabledMicrophoneLabel,
+                IsDefaultOption = false,
+                IsDisabledOption = true,
+                IsSystemDefault = false
+            });
+        }
 
         try
         {
@@ -140,6 +239,7 @@ public sealed class AudioDeviceService
                         DeviceId = id,
                         FriendlyName = friendlyName,
                         IsDefaultOption = false,
+                        IsDisabledOption = false,
                         IsSystemDefault = !string.IsNullOrEmpty(defaultDeviceId) &&
                                           string.Equals(id, defaultDeviceId, StringComparison.OrdinalIgnoreCase)
                     });
@@ -163,11 +263,6 @@ public sealed class AudioDeviceService
     {
         try
         {
-            if (!enumerator.HasDefaultAudioEndpoint(dataFlow, role))
-            {
-                return null;
-            }
-
             MMDevice device = enumerator.GetDefaultAudioEndpoint(dataFlow, role);
             if (device.State == DeviceState.Active)
             {
@@ -180,6 +275,66 @@ public sealed class AudioDeviceService
         catch (COMException)
         {
             return null;
+        }
+    }
+
+    private void CleanupWatcherLocked()
+    {
+        if (_notificationEnumerator is not null && _notificationBridge is not null)
+        {
+            try
+            {
+                _notificationEnumerator.UnregisterEndpointNotificationCallback(_notificationBridge);
+            }
+            catch
+            {
+                // Ignore COM unregister errors during teardown.
+            }
+        }
+
+        _notificationBridge = null;
+
+        if (_notificationEnumerator is not null)
+        {
+            try
+            {
+                _notificationEnumerator.Dispose();
+            }
+            catch
+            {
+                // Ignore COM enumerator disposal errors.
+            }
+
+            _notificationEnumerator = null;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        lock (_watcherLock)
+        {
+            CleanupWatcherLocked();
+        }
+    }
+
+    private sealed class EndpointNotificationBridge(Action onChanged) : IMMNotificationClient
+    {
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState) => onChanged();
+
+        public void OnDeviceAdded(string pwstrDeviceId) => onChanged();
+
+        public void OnDeviceRemoved(string deviceId) => onChanged();
+
+        public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) => onChanged();
+
+        public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key)
+        {
+            // Ignore frequent mixer/volume property updates.
         }
     }
 }

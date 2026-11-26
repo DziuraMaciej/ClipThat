@@ -78,7 +78,7 @@ public sealed class ReplayEngine : IReplayEngine
             _activeSession = StartCapturePipelineLocked(normalized);
             _isRecording = true;
 
-            statusMessage = BuildActiveStatusMessage(normalized, _activeSession.Encoder);
+            statusMessage = BuildActiveStatusMessage(normalized, _activeSession.Encoder, _activeSession.AudioCapture);
         }
         catch (Exception ex)
         {
@@ -178,7 +178,7 @@ public sealed class ReplayEngine : IReplayEngine
                 _isRecording = true;
             }
 
-            statusMessage = BuildActiveStatusMessage(updated, _activeSession.Encoder);
+            statusMessage = BuildActiveStatusMessage(updated, _activeSession.Encoder, _activeSession.AudioCapture);
         }
         catch (Exception ex)
         {
@@ -376,7 +376,8 @@ public sealed class ReplayEngine : IReplayEngine
                 sharedSessionClock,
                 _ringBuffer,
                 settings.SystemAudioDeviceId,
-                settings.MicrophoneDeviceId);
+                settings.MicrophoneDeviceId,
+                onStatusChanged: OnAudioStatusChanged);
 
             var pipeline = new CapturePipelineSession(
                 settings.Fps,
@@ -483,7 +484,7 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 _activeSession = StartCapturePipelineLocked(_currentSettings);
                 _isRecording = true;
-                finalStatus = BuildActiveStatusMessage(_currentSettings, _activeSession.Encoder);
+                finalStatus = BuildActiveStatusMessage(_currentSettings, _activeSession.Encoder, _activeSession.AudioCapture);
             }
             catch (Exception ex)
             {
@@ -510,11 +511,29 @@ public sealed class ReplayEngine : IReplayEngine
         session?.Dispose();
     }
 
-    private static string BuildActiveStatusMessage(AppSettings settings, HardwareH264Encoder encoder)
+    private void OnAudioStatusChanged(string message)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || !_isRecording || string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        StatusChanged?.Invoke(message);
+    }
+
+    private static string BuildActiveStatusMessage(
+        AppSettings settings,
+        HardwareH264Encoder encoder,
+        DualAudioCaptureService audioCapture)
     {
         string mode = encoder.IsHardwareAccelerated ? "GPU" : "CPU";
         string resolutionLabel = $"{settings.Resolution.ToString()[1..]}p";
-        return $"Nagrywanie aktywne ({mode} · {resolutionLabel} {settings.Fps} FPS)";
+        string baseStatus = $"Nagrywanie aktywne ({mode} · {resolutionLabel} {settings.Fps} FPS)";
+
+        string? audioError = audioCapture.GetInitializationErrorSummary();
+        return string.IsNullOrWhiteSpace(audioError)
+            ? baseStatus
+            : $"{baseStatus} · {audioError}";
     }
 
     public void Dispose()
@@ -604,6 +623,8 @@ public sealed class ReplayEngine : IReplayEngine
         }
 
         public HardwareH264Encoder Encoder => _encoder;
+
+        public DualAudioCaptureService AudioCapture => _audioCapture;
 
         public void Start()
         {

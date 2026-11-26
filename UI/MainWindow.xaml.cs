@@ -19,6 +19,7 @@ public partial class MainWindow : FluentWindow
     public MainWindow(
         SettingsService settingsService,
         DisplayService displayService,
+        AudioDeviceService audioDeviceService,
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
         IReplayEngine replayEngine)
@@ -30,6 +31,7 @@ public partial class MainWindow : FluentWindow
         _pageProvider = new WindowPageProvider(
             settingsService,
             displayService,
+            audioDeviceService,
             resourceEstimatorService,
             startupService,
             replayEngine);
@@ -53,6 +55,7 @@ public partial class MainWindow : FluentWindow
     private sealed class WindowPageProvider(
         SettingsService settingsService,
         DisplayService displayService,
+        AudioDeviceService audioDeviceService,
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
         IReplayEngine replayEngine) : INavigationViewPageProvider
@@ -67,6 +70,7 @@ public partial class MainWindow : FluentWindow
                 return _settingsPage ??= new SettingsPage(
                     settingsService,
                     displayService,
+                    audioDeviceService,
                     resourceEstimatorService,
                     startupService,
                     replayEngine);

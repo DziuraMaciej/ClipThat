@@ -4,22 +4,26 @@ using System.Runtime.InteropServices;
 using ClipThat.Engine.Buffer;
 using ClipThat.Services;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using SharpGen.Runtime;
 using Vortice.MediaFoundation;
 using AudioDataFlow = NAudio.CoreAudioApi.DataFlow;
+using IMMNotificationClient = NAudio.CoreAudioApi.Interfaces.IMMNotificationClient;
 using ResultCode = Vortice.MediaFoundation.ResultCode;
+using Role = NAudio.CoreAudioApi.Role;
 
 namespace ClipThat.Engine.Audio;
 
 /// <summary>
 /// Captures two independent WASAPI audio streams (System Loopback + Microphone) synchronized to the
-/// shared <see cref="Stopwatch"/> replay timeline, converts/resamples incoming audio to 48000 Hz 16-bit Stereo PCM,
-/// encodes both tracks to 128 kbps AAC in real time via Media Foundation <see cref="IMFTransform"/>,
-/// and pushes compressed AAC packets into <see cref="MediaRingBuffer"/>.
+/// shared <see cref="Stopwatch"/> replay timeline, converts/resamples incoming audio through a universal NAudio
+/// sample conversion chain to 48000 Hz 16-bit Stereo PCM, encodes both tracks to 128 kbps AAC in real time via
+/// Media Foundation <see cref="IMFTransform"/>, pushes compressed AAC packets into <see cref="MediaRingBuffer"/>,
+/// and automatically hot-swaps default playback/microphone endpoints via <see cref="IMMNotificationClient"/>.
 /// </summary>
-public sealed class DualAudioCaptureService : IDisposable
+public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 {
     public const int TargetSampleRate = 48000;
     public const int TargetBitsPerSample = 16;
@@ -32,15 +36,32 @@ public sealed class DualAudioCaptureService : IDisposable
     public const int AacFrameByteCount = AacFrameSampleCount * TargetBlockAlignment; // 4096 bytes
 
     private const int SilenceWatchdogPeriodMs = 20;
+    private const int LoopbackCaptureBufferMs = 20;
     private const int MicrophoneCaptureBufferMs = 20;
+    private const int HotSwapRetryDelayMs = 150;
 
     private readonly Stopwatch _sessionClock;
     private readonly MediaRingBuffer _ringBuffer;
     private readonly string? _systemAudioDeviceId;
     private readonly string? _microphoneDeviceId;
+    private readonly Action<string>? _onStatusChanged;
+    private readonly Action? _onDevicesChanged;
+
+    private readonly object _systemSwapLock = new();
+    private readonly object _microphoneSwapLock = new();
+    private readonly object _enumeratorLock = new();
+
+    private MMDeviceEnumerator? _notificationEnumerator;
+    private bool _notificationRegistered;
 
     private AudioTrackPipeline? _systemAudioTrack;
     private AudioTrackPipeline? _microphoneTrack;
+    private long _lastSystemEncodedTimestamp100Ns = -1;
+    private long _lastMicrophoneEncodedTimestamp100Ns = -1;
+    private string? _systemAudioError;
+    private string? _microphoneError;
+    private int _systemSwapVersion;
+    private int _microphoneSwapVersion;
     private int _started;
     private int _disposed;
 
@@ -48,25 +69,49 @@ public sealed class DualAudioCaptureService : IDisposable
         Stopwatch sessionClock,
         MediaRingBuffer ringBuffer,
         string? systemAudioDeviceId,
-        string? microphoneDeviceId)
+        string? microphoneDeviceId,
+        Action<string>? onStatusChanged = null,
+        Action? onDevicesChanged = null)
     {
         ArgumentNullException.ThrowIfNull(sessionClock);
         ArgumentNullException.ThrowIfNull(ringBuffer);
 
         _sessionClock = sessionClock;
         _ringBuffer = ringBuffer;
-        _systemAudioDeviceId = systemAudioDeviceId;
-        _microphoneDeviceId = microphoneDeviceId;
+        _systemAudioDeviceId = string.IsNullOrWhiteSpace(systemAudioDeviceId) ? null : systemAudioDeviceId.Trim();
+        _microphoneDeviceId = string.IsNullOrWhiteSpace(microphoneDeviceId) ? null : microphoneDeviceId.Trim();
+        _onStatusChanged = onStatusChanged;
+        _onDevicesChanged = onDevicesChanged;
     }
 
-    public bool IsSystemAudioActive => _systemAudioTrack is not null;
+    public bool IsSystemAudioActive => Volatile.Read(ref _systemAudioTrack) is not null;
 
-    public bool IsMicrophoneActive => _microphoneTrack is not null;
+    public bool IsMicrophoneActive => Volatile.Read(ref _microphoneTrack) is not null;
+
+    public string? SystemAudioError => Volatile.Read(ref _systemAudioError);
+
+    public string? MicrophoneError => Volatile.Read(ref _microphoneError);
 
     /// <summary>
-    /// Starts both WASAPI capture pipelines (system loopback and optional microphone).
-    /// Missing or unavailable microphones (or playback devices on headless machines) are skipped gracefully
-    /// without interrupting video recording.
+    /// Returns a combined Polish summary of any audio capture initialization errors,
+    /// or <see langword="null"/> when all configured audio pipelines started cleanly.
+    /// </summary>
+    public string? GetInitializationErrorSummary()
+    {
+        string? sysError = SystemAudioError;
+        string? micError = MicrophoneError;
+
+        if (!string.IsNullOrWhiteSpace(sysError) && !string.IsNullOrWhiteSpace(micError))
+        {
+            return $"{sysError}; {micError}";
+        }
+
+        return !string.IsNullOrWhiteSpace(sysError) ? sysError : micError;
+    }
+
+    /// <summary>
+    /// Starts both WASAPI capture pipelines (system loopback and optional microphone) and registers
+    /// <see cref="IMMNotificationClient"/> for seamless default device hot-swapping.
     /// </summary>
     public void Start()
     {
@@ -76,42 +121,407 @@ public sealed class DualAudioCaptureService : IDisposable
             return;
         }
 
+        RegisterDeviceNotifications();
+
         using var enumerator = new MMDeviceEnumerator();
 
-        _systemAudioTrack = TryStartSystemAudioTrack(enumerator);
-        _microphoneTrack = TryStartMicrophoneTrack(enumerator);
+        lock (_systemSwapLock)
+        {
+            if (Volatile.Read(ref _disposed) == 0)
+            {
+                _systemAudioTrack = TryStartSystemAudioTrack(
+                    enumerator,
+                    minimumTimestamp100Ns: -1L,
+                    out string? systemError);
+                Volatile.Write(ref _systemAudioError, systemError);
+            }
+        }
+
+        lock (_microphoneSwapLock)
+        {
+            if (Volatile.Read(ref _disposed) == 0)
+            {
+                _microphoneTrack = TryStartMicrophoneTrack(
+                    enumerator,
+                    minimumTimestamp100Ns: -1L,
+                    out string? micError);
+                Volatile.Write(ref _microphoneError, micError);
+            }
+        }
     }
 
-    private AudioTrackPipeline? TryStartSystemAudioTrack(MMDeviceEnumerator enumerator)
+    private void RegisterDeviceNotifications()
     {
+        lock (_enumeratorLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || _notificationRegistered)
+            {
+                return;
+            }
+
+            try
+            {
+                _notificationEnumerator = new MMDeviceEnumerator();
+                _notificationEnumerator.RegisterEndpointNotificationCallback(this);
+                _notificationRegistered = true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Nie udało się zarejestrować IMMNotificationClient: {ex.Message}");
+                _onStatusChanged?.Invoke($"Ostrzeżenie audio: nie udało się monitorować zmian urządzeń ({ex.Message})");
+                CleanupNotificationEnumeratorLocked();
+            }
+        }
+    }
+
+    void IMMNotificationClient.OnDefaultDeviceChanged(AudioDataFlow flow, Role role, string defaultDeviceId)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        NotifyDevicesChangedAsync();
+
+        if (role != Role.Multimedia)
+        {
+            return;
+        }
+
+        if (flow == AudioDataFlow.Render && string.IsNullOrWhiteSpace(_systemAudioDeviceId))
+        {
+            int targetVersion = Interlocked.Increment(ref _systemSwapVersion);
+            _ = Task.Run(() => HotSwapSystemAudioTrack(targetVersion, defaultDeviceId));
+        }
+        else if (flow == AudioDataFlow.Capture && string.IsNullOrWhiteSpace(_microphoneDeviceId))
+        {
+            int targetVersion = Interlocked.Increment(ref _microphoneSwapVersion);
+            _ = Task.Run(() => HotSwapMicrophoneTrack(targetVersion, defaultDeviceId));
+        }
+    }
+
+    void IMMNotificationClient.OnDeviceAdded(string pwstrDeviceId)
+    {
+        if (Volatile.Read(ref _disposed) == 0)
+        {
+            NotifyDevicesChangedAsync();
+        }
+    }
+
+    void IMMNotificationClient.OnDeviceRemoved(string deviceId)
+    {
+        if (Volatile.Read(ref _disposed) == 0)
+        {
+            NotifyDevicesChangedAsync();
+        }
+    }
+
+    void IMMNotificationClient.OnDeviceStateChanged(string deviceId, DeviceState newState)
+    {
+        if (Volatile.Read(ref _disposed) == 0)
+        {
+            NotifyDevicesChangedAsync();
+        }
+    }
+
+    void IMMNotificationClient.OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key)
+    {
+        // Frequent volume/mixer property changes do not alter endpoint topology or default routing.
+    }
+
+    private void NotifyDevicesChangedAsync()
+    {
+        Action? callback = _onDevicesChanged;
+        if (callback is null || Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        ThreadPool.QueueUserWorkItem(static state =>
+        {
+            try
+            {
+                ((Action)state!).Invoke();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Błąd powiadomienia UI o zmianie urządzeń audio: {ex.Message}");
+            }
+        }, callback);
+    }
+
+    private void HotSwapSystemAudioTrack(int targetVersion, string? notifiedDefaultDeviceId)
+    {
+        string? statusNotice = null;
+
+        lock (_systemSwapLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0 ||
+                Volatile.Read(ref _systemSwapVersion) != targetVersion)
+            {
+                return;
+            }
+
+            AudioTrackPipeline? current = _systemAudioTrack;
+            if (current is not null &&
+                !string.IsNullOrWhiteSpace(notifiedDefaultDeviceId) &&
+                string.Equals(current.DeviceId, notifiedDefaultDeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (current is not null)
+            {
+                long lastTs = current.LastEncodedTimestamp100Ns;
+                if (lastTs > _lastSystemEncodedTimestamp100Ns)
+                {
+                    _lastSystemEncodedTimestamp100Ns = lastTs;
+                }
+
+                _systemAudioTrack = null;
+                SafeDispose(current);
+            }
+
+            if (Volatile.Read(ref _disposed) != 0 ||
+                Volatile.Read(ref _systemSwapVersion) != targetVersion)
+            {
+                return;
+            }
+
+            long minNextTimestamp100Ns = _lastSystemEncodedTimestamp100Ns >= 0
+                ? _lastSystemEncodedTimestamp100Ns + 1
+                : -1L;
+
+            AudioTrackPipeline? replacement = StartSystemAudioWithRetry(minNextTimestamp100Ns, out string? error);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                SafeDispose(replacement);
+                return;
+            }
+
+            _systemAudioTrack = replacement;
+            Volatile.Write(ref _systemAudioError, error);
+
+            if (replacement is not null)
+            {
+                statusNotice = $"Przełączono dźwięk systemu: {replacement.DeviceFriendlyName}";
+            }
+            else if (!string.IsNullOrWhiteSpace(error))
+            {
+                statusNotice = error;
+            }
+        }
+
+        if (statusNotice is not null && Volatile.Read(ref _disposed) == 0)
+        {
+            _onStatusChanged?.Invoke(statusNotice);
+        }
+    }
+
+    private void HotSwapMicrophoneTrack(int targetVersion, string? notifiedDefaultDeviceId)
+    {
+        string? statusNotice = null;
+
+        lock (_microphoneSwapLock)
+        {
+            if (Volatile.Read(ref _disposed) != 0 ||
+                Volatile.Read(ref _microphoneSwapVersion) != targetVersion)
+            {
+                return;
+            }
+
+            AudioTrackPipeline? current = _microphoneTrack;
+            if (current is not null &&
+                !string.IsNullOrWhiteSpace(notifiedDefaultDeviceId) &&
+                string.Equals(current.DeviceId, notifiedDefaultDeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (current is not null)
+            {
+                long lastTs = current.LastEncodedTimestamp100Ns;
+                if (lastTs > _lastMicrophoneEncodedTimestamp100Ns)
+                {
+                    _lastMicrophoneEncodedTimestamp100Ns = lastTs;
+                }
+
+                _microphoneTrack = null;
+                SafeDispose(current);
+            }
+
+            if (Volatile.Read(ref _disposed) != 0 ||
+                Volatile.Read(ref _microphoneSwapVersion) != targetVersion)
+            {
+                return;
+            }
+
+            long minNextTimestamp100Ns = _lastMicrophoneEncodedTimestamp100Ns >= 0
+                ? _lastMicrophoneEncodedTimestamp100Ns + 1
+                : -1L;
+
+            AudioTrackPipeline? replacement = StartMicrophoneWithRetry(minNextTimestamp100Ns, out string? error);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                SafeDispose(replacement);
+                return;
+            }
+
+            _microphoneTrack = replacement;
+            Volatile.Write(ref _microphoneError, error);
+
+            if (replacement is not null)
+            {
+                statusNotice = $"Przełączono mikrofon: {replacement.DeviceFriendlyName}";
+            }
+            else if (!string.IsNullOrWhiteSpace(error))
+            {
+                statusNotice = error;
+            }
+        }
+
+        if (statusNotice is not null && Volatile.Read(ref _disposed) == 0)
+        {
+            _onStatusChanged?.Invoke(statusNotice);
+        }
+    }
+
+    private AudioTrackPipeline? StartSystemAudioWithRetry(long minimumTimestamp100Ns, out string? error)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                error = null;
+                return null;
+            }
+
+            using var enumerator = new MMDeviceEnumerator();
+            AudioTrackPipeline? pipeline = TryStartSystemAudioTrack(enumerator, minimumTimestamp100Ns, out error);
+            if (pipeline is not null || attempt == 1)
+            {
+                return pipeline;
+            }
+
+            Thread.Sleep(HotSwapRetryDelayMs);
+        }
+
+        error = null;
+        return null;
+    }
+
+    private AudioTrackPipeline? StartMicrophoneWithRetry(long minimumTimestamp100Ns, out string? error)
+    {
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                error = null;
+                return null;
+            }
+
+            using var enumerator = new MMDeviceEnumerator();
+            AudioTrackPipeline? pipeline = TryStartMicrophoneTrack(enumerator, minimumTimestamp100Ns, out error);
+            if (pipeline is not null || string.IsNullOrWhiteSpace(error) || attempt == 1)
+            {
+                return pipeline;
+            }
+
+            Thread.Sleep(HotSwapRetryDelayMs);
+        }
+
+        error = null;
+        return null;
+    }
+
+    private AudioTrackPipeline? TryStartSystemAudioTrack(
+        MMDeviceEnumerator enumerator,
+        long minimumTimestamp100Ns,
+        out string? error)
+    {
+        error = null;
         MMDevice? renderDevice = null;
-        WasapiLoopbackCapture? loopbackCapture = null;
+
+        try
+        {
+            renderDevice = ResolveRenderEndpoint(enumerator, _systemAudioDeviceId, out string? resolveWarning);
+            if (renderDevice is null)
+            {
+                error = resolveWarning ?? "Błąd dźwięku systemu: brak aktywnego urządzenia wyjściowego audio.";
+                Debug.WriteLine(error);
+                return null;
+            }
+
+            if (!string.IsNullOrWhiteSpace(resolveWarning))
+            {
+                Debug.WriteLine(resolveWarning);
+                error = resolveWarning;
+            }
+
+            try
+            {
+                MMDevice ownedDevice = renderDevice;
+                renderDevice = null;
+                return CreateAndStartLoopbackPipeline(
+                    ownedDevice,
+                    useLowLatencyBuffer: true,
+                    minimumTimestamp100Ns);
+            }
+            catch (COMException ex)
+            {
+                Debug.WriteLine($"Low-latency loopback nie powiódł się ({ex.Message}); ponawianie ze standardowym WasapiLoopbackCapture.");
+                // Re-resolve a fresh MMDevice handle for the fallback attempt because the failed pipeline disposed the previous handle.
+                MMDevice? fallbackDevice = ResolveRenderEndpoint(enumerator, _systemAudioDeviceId, out _);
+                if (fallbackDevice is null)
+                {
+                    error = $"Błąd dźwięku systemu (WASAPI Loopback): {ex.Message}";
+                    return null;
+                }
+
+                return CreateAndStartLoopbackPipeline(
+                    fallbackDevice,
+                    useLowLatencyBuffer: false,
+                    minimumTimestamp100Ns);
+            }
+        }
+        catch (Exception ex)
+        {
+            error = $"Błąd dźwięku systemu (WASAPI Loopback): {ex.Message}";
+            Debug.WriteLine(error);
+            SafeDispose(renderDevice);
+            return null;
+        }
+    }
+
+    private AudioTrackPipeline CreateAndStartLoopbackPipeline(
+        MMDevice renderDevice,
+        bool useLowLatencyBuffer,
+        long minimumTimestamp100Ns)
+    {
+        WasapiCapture? loopbackCapture = null;
         AudioTrackPipeline? pipeline = null;
 
         try
         {
-            renderDevice = AudioDeviceService.ResolveDevice(enumerator, AudioDataFlow.Render, _systemAudioDeviceId);
-            if (renderDevice is null)
-            {
-                Debug.WriteLine("Brak aktywnego urządzenia wyjściowego audio — przechwytywanie dźwięku systemu pominięte.");
-                return null;
-            }
+            loopbackCapture = useLowLatencyBuffer
+                ? new LowLatencyWasapiLoopbackCapture(renderDevice, LoopbackCaptureBufferMs)
+                : new WasapiLoopbackCapture(renderDevice);
 
-            loopbackCapture = new WasapiLoopbackCapture(renderDevice);
             pipeline = new AudioTrackPipeline(
                 MediaTrackType.SystemAudio,
                 renderDevice,
                 loopbackCapture,
                 _sessionClock,
                 _ringBuffer,
-                enableSilenceWatchdog: true);
+                enableSilenceWatchdog: true,
+                minimumTimestamp100Ns: minimumTimestamp100Ns,
+                onRuntimeError: HandleTrackRuntimeError);
 
             pipeline.Start();
             return pipeline;
         }
-        catch (Exception ex)
+        catch
         {
-            Debug.WriteLine($"Nie udało się uruchomić przechwytywania dźwięku systemu (WASAPI Loopback): {ex.Message}");
             if (pipeline is not null)
             {
                 pipeline.Dispose();
@@ -119,43 +529,105 @@ public sealed class DualAudioCaptureService : IDisposable
             else
             {
                 loopbackCapture?.Dispose();
-                renderDevice?.Dispose();
+                renderDevice.Dispose();
             }
 
+            throw;
+        }
+    }
+
+    private AudioTrackPipeline? TryStartMicrophoneTrack(
+        MMDeviceEnumerator enumerator,
+        long minimumTimestamp100Ns,
+        out string? error)
+    {
+        error = null;
+
+        if (AudioDeviceService.IsDisabledDeviceId(_microphoneDeviceId))
+        {
+            return null;
+        }
+
+        MMDevice? captureDevice = null;
+
+        try
+        {
+            captureDevice = ResolveCaptureEndpoint(enumerator, _microphoneDeviceId, out string? resolveError);
+            if (captureDevice is null)
+            {
+                error = resolveError;
+                if (!string.IsNullOrWhiteSpace(resolveError))
+                {
+                    Debug.WriteLine(resolveError);
+                }
+
+                return null;
+            }
+
+            try
+            {
+                MMDevice ownedDevice = captureDevice;
+                captureDevice = null;
+                return CreateAndStartMicrophonePipeline(
+                    ownedDevice,
+                    useEventSync: true,
+                    minimumTimestamp100Ns);
+            }
+            catch (COMException ex)
+            {
+                Debug.WriteLine($"WASAPI mikrofon event-sync nie powiódł się ({ex.Message}); ponawianie w trybie odpytywania.");
+                MMDevice? fallbackDevice = ResolveCaptureEndpoint(enumerator, _microphoneDeviceId, out _);
+                if (fallbackDevice is null)
+                {
+                    error = $"Błąd mikrofonu (WASAPI): {ex.Message}";
+                    return null;
+                }
+
+                return CreateAndStartMicrophonePipeline(
+                    fallbackDevice,
+                    useEventSync: false,
+                    minimumTimestamp100Ns);
+            }
+        }
+        catch (Exception ex)
+        {
+            error = $"Błąd mikrofonu (WASAPI): {ex.Message}";
+            Debug.WriteLine(error);
+            SafeDispose(captureDevice);
             return null;
         }
     }
 
-    private AudioTrackPipeline? TryStartMicrophoneTrack(MMDeviceEnumerator enumerator)
+    private AudioTrackPipeline CreateAndStartMicrophonePipeline(
+        MMDevice captureDevice,
+        bool useEventSync,
+        long minimumTimestamp100Ns)
     {
-        MMDevice? captureDevice = null;
         WasapiCapture? micCapture = null;
         AudioTrackPipeline? pipeline = null;
 
         try
         {
-            captureDevice = AudioDeviceService.ResolveDevice(enumerator, AudioDataFlow.Capture, _microphoneDeviceId);
-            if (captureDevice is null)
-            {
-                Debug.WriteLine("Brak aktywnego mikrofonu — przechwytywanie ścieżki mikrofonu pominięte.");
-                return null;
-            }
+            micCapture = new WasapiCapture(
+                captureDevice,
+                useEventSync: useEventSync,
+                audioBufferMillisecondsLength: MicrophoneCaptureBufferMs);
 
-            micCapture = new WasapiCapture(captureDevice, useEventSync: true, audioBufferMillisecondsLength: MicrophoneCaptureBufferMs);
             pipeline = new AudioTrackPipeline(
                 MediaTrackType.MicrophoneAudio,
                 captureDevice,
                 micCapture,
                 _sessionClock,
                 _ringBuffer,
-                enableSilenceWatchdog: false);
+                enableSilenceWatchdog: false,
+                minimumTimestamp100Ns: minimumTimestamp100Ns,
+                onRuntimeError: HandleTrackRuntimeError);
 
             pipeline.Start();
             return pipeline;
         }
-        catch (Exception ex)
+        catch
         {
-            Debug.WriteLine($"Nie udało się uruchomić przechwytywania mikrofonu (pominięto bezpiecznie): {ex.Message}");
             if (pipeline is not null)
             {
                 pipeline.Dispose();
@@ -163,10 +635,150 @@ public sealed class DualAudioCaptureService : IDisposable
             else
             {
                 micCapture?.Dispose();
-                captureDevice?.Dispose();
+                captureDevice.Dispose();
             }
 
-            return null;
+            throw;
+        }
+    }
+
+    private static MMDevice? ResolveRenderEndpoint(
+        MMDeviceEnumerator enumerator,
+        string? configuredDeviceId,
+        out string? warningOrError)
+    {
+        warningOrError = null;
+
+        if (!string.IsNullOrWhiteSpace(configuredDeviceId))
+        {
+            try
+            {
+                MMDevice specific = enumerator.GetDevice(configuredDeviceId);
+                if (specific.State == DeviceState.Active)
+                {
+                    return specific;
+                }
+
+                specific.Dispose();
+                warningOrError = "Wybrane urządzenie wyjściowe audio jest nieaktywne — próba użycia domyślnego.";
+            }
+            catch (Exception ex) when (ex is COMException or ArgumentException)
+            {
+                warningOrError = $"Wybrane urządzenie wyjściowe audio jest niedostępne ({ex.Message}) — próba użycia domyślnego.";
+            }
+        }
+
+        try
+        {
+            MMDevice defaultRender = enumerator.GetDefaultAudioEndpoint(AudioDataFlow.Render, Role.Multimedia);
+            if (defaultRender.State == DeviceState.Active)
+            {
+                return defaultRender;
+            }
+
+            defaultRender.Dispose();
+        }
+        catch (COMException ex)
+        {
+            warningOrError = $"Brak domyślnego urządzenia wyjściowego audio (Multimedia): {ex.Message}";
+        }
+
+        MMDevice? fallback = AudioDeviceService.ResolveDevice(enumerator, AudioDataFlow.Render, deviceId: null);
+        if (fallback is not null)
+        {
+            return fallback;
+        }
+
+        warningOrError ??= "Błąd dźwięku systemu: nie znaleziono aktywnego urządzenia wyjściowego audio.";
+        return null;
+    }
+
+    private static MMDevice? ResolveCaptureEndpoint(
+        MMDeviceEnumerator enumerator,
+        string? configuredDeviceId,
+        out string? error)
+    {
+        error = null;
+
+        if (!string.IsNullOrWhiteSpace(configuredDeviceId))
+        {
+            try
+            {
+                MMDevice specific = enumerator.GetDevice(configuredDeviceId);
+                if (specific.State == DeviceState.Active)
+                {
+                    return specific;
+                }
+
+                specific.Dispose();
+                error = "Błąd mikrofonu: wybrane urządzenie mikrofonu jest nieaktywne.";
+                return null;
+            }
+            catch (Exception ex) when (ex is COMException or ArgumentException)
+            {
+                error = $"Błąd mikrofonu: wybrane urządzenie jest niedostępne ({ex.Message}).";
+                return null;
+            }
+        }
+
+        try
+        {
+            MMDevice defaultMic = enumerator.GetDefaultAudioEndpoint(AudioDataFlow.Capture, Role.Multimedia);
+            if (defaultMic.State == DeviceState.Active)
+            {
+                return defaultMic;
+            }
+
+            defaultMic.Dispose();
+        }
+        catch (COMException)
+        {
+            // No default multimedia microphone endpoint; fall through to check other roles/active endpoints.
+        }
+
+        return AudioDeviceService.ResolveDevice(enumerator, AudioDataFlow.Capture, deviceId: null);
+    }
+
+    private void HandleTrackRuntimeError(MediaTrackType trackType, Exception exception)
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        string label = trackType == MediaTrackType.SystemAudio ? "dźwięku systemu" : "mikrofonu";
+        string message = $"Błąd przechwytywania {label}: {exception.Message}";
+        Debug.WriteLine(message);
+        _onStatusChanged?.Invoke(message);
+    }
+
+    private void CleanupNotificationEnumeratorLocked()
+    {
+        if (_notificationRegistered && _notificationEnumerator is not null)
+        {
+            _notificationRegistered = false;
+            try
+            {
+                _notificationEnumerator.UnregisterEndpointNotificationCallback(this);
+            }
+            catch
+            {
+                // Ignore COM unregister failures during teardown.
+            }
+        }
+
+        if (_notificationEnumerator is not null)
+        {
+            try
+            {
+                _notificationEnumerator.Dispose();
+            }
+            catch
+            {
+                // Ignore COM disposal failures during teardown.
+            }
+
+            _notificationEnumerator = null;
         }
     }
 
@@ -177,8 +789,27 @@ public sealed class DualAudioCaptureService : IDisposable
             return;
         }
 
-        AudioTrackPipeline? sys = Interlocked.Exchange(ref _systemAudioTrack, null);
-        AudioTrackPipeline? mic = Interlocked.Exchange(ref _microphoneTrack, null);
+        Interlocked.Increment(ref _systemSwapVersion);
+        Interlocked.Increment(ref _microphoneSwapVersion);
+
+        lock (_enumeratorLock)
+        {
+            CleanupNotificationEnumeratorLocked();
+        }
+
+        AudioTrackPipeline? sys;
+        lock (_systemSwapLock)
+        {
+            sys = _systemAudioTrack;
+            _systemAudioTrack = null;
+        }
+
+        AudioTrackPipeline? mic;
+        lock (_microphoneSwapLock)
+        {
+            mic = _microphoneTrack;
+            _microphoneTrack = null;
+        }
 
         SafeDispose(sys);
         SafeDispose(mic);
@@ -202,17 +833,34 @@ public sealed class DualAudioCaptureService : IDisposable
     }
 
     /// <summary>
-    /// Encapsulates one independent WASAPI capture -> PCM resampler/converter -> real-time AAC MFT encoder track
-    /// synchronized to the shared session <see cref="Stopwatch"/>.
+    /// Shared-mode WASAPI loopback capture configured with a 20 ms buffer (10 ms polling cadence)
+    /// instead of NAudio's default 100 ms buffer (50 ms polling sleep), ensuring real loopback packets
+    /// arrive promptly and never collide with the 25 ms silence-injection threshold.
+    /// </summary>
+    private sealed class LowLatencyWasapiLoopbackCapture : WasapiCapture
+    {
+        public LowLatencyWasapiLoopbackCapture(MMDevice captureDevice, int audioBufferMillisecondsLength)
+            : base(captureDevice, useEventSync: false, audioBufferMillisecondsLength: audioBufferMillisecondsLength)
+        {
+        }
+
+        protected override AudioClientStreamFlags GetAudioClientStreamFlags()
+            => AudioClientStreamFlags.Loopback;
+    }
+
+    /// <summary>
+    /// Encapsulates one independent WASAPI capture -> universal NAudio PCM converter/resampler ->
+    /// real-time AAC MFT encoder track synchronized to the shared session <see cref="Stopwatch"/>.
     /// </summary>
     private sealed class AudioTrackPipeline : IDisposable
     {
-        private const long SilenceTriggerDelay100Ns = 35 * TimeSpan.TicksPerMillisecond;
-        private const long SilenceLeadMargin100Ns = 15 * TimeSpan.TicksPerMillisecond;
-        private const long MinSilenceInjection100Ns = 10 * TimeSpan.TicksPerMillisecond;
+        // Only inject zero-filled 20 ms PCM frames when > 25 ms has elapsed without real loopback data.
+        private const long SilenceTriggerDelay100Ns = 25 * TimeSpan.TicksPerMillisecond;
+        private const long SilenceLeadMargin100Ns = 20 * TimeSpan.TicksPerMillisecond;
+        private const long SilenceChunkDuration100Ns = 20 * TimeSpan.TicksPerMillisecond;
         private const long GapBridgeThreshold100Ns = 45 * TimeSpan.TicksPerMillisecond;
         private const long MaxSyncGapToFill100Ns = 2 * TimeSpan.TicksPerSecond;
-        private const long OverrunDriftLimit100Ns = 90 * TimeSpan.TicksPerMillisecond;
+        private const long OverrunDriftLimit100Ns = 250 * TimeSpan.TicksPerMillisecond;
         private const int MaxSilenceFramesPerTick = 4800; // 100 ms max per watchdog tick
         private const int SilenceChunkFrames = 960;       // 20 ms at 48 kHz
 
@@ -224,6 +872,8 @@ public sealed class DualAudioCaptureService : IDisposable
         private readonly Stopwatch _sessionClock;
         private readonly MediaRingBuffer _ringBuffer;
         private readonly bool _enableSilenceWatchdog;
+        private readonly long _minimumTimestamp100Ns;
+        private readonly Action<MediaTrackType, Exception>? _onRuntimeError;
         private readonly object _syncLock = new();
 
         private readonly AudioPcmConverter _pcmConverter;
@@ -234,6 +884,7 @@ public sealed class DualAudioCaptureService : IDisposable
         private long _trackOrigin100Ns;
         private long _totalPcmFramesFed;
         private long _lastRealAudioClock100Ns;
+        private long _lastEncodedTimestamp100Ns = -1;
         private int _stopped;
         private int _disposed;
 
@@ -243,7 +894,9 @@ public sealed class DualAudioCaptureService : IDisposable
             WasapiCapture capture,
             Stopwatch sessionClock,
             MediaRingBuffer ringBuffer,
-            bool enableSilenceWatchdog)
+            bool enableSilenceWatchdog,
+            long minimumTimestamp100Ns,
+            Action<MediaTrackType, Exception>? onRuntimeError)
         {
             _trackType = trackType;
             _device = device;
@@ -251,20 +904,35 @@ public sealed class DualAudioCaptureService : IDisposable
             _sessionClock = sessionClock;
             _ringBuffer = ringBuffer;
             _enableSilenceWatchdog = enableSilenceWatchdog;
+            _minimumTimestamp100Ns = minimumTimestamp100Ns;
+            _onRuntimeError = onRuntimeError;
+
+            DeviceId = TryReadDeviceId(device);
+            DeviceFriendlyName = TryReadFriendlyName(device, DeviceId);
 
             _pcmConverter = new AudioPcmConverter(capture.WaveFormat);
             _aacEncoder = new AacMftEncoder(
                 trackType,
+                initialLastTimestamp100Ns: minimumTimestamp100Ns > 0 ? minimumTimestamp100Ns - 1 : -1L,
                 onEncodedPacket: PushEncodedPacket,
                 onUserData: userData => _ringBuffer.SetAudioUserData(_trackType, userData.Span));
         }
+
+        public string DeviceId { get; }
+
+        public string DeviceFriendlyName { get; }
+
+        public long LastEncodedTimestamp100Ns => Volatile.Read(ref _lastEncodedTimestamp100Ns);
 
         public void Start()
         {
             lock (_syncLock)
             {
-                _trackOrigin100Ns = _sessionClock.Elapsed.Ticks;
-                _lastRealAudioClock100Ns = _trackOrigin100Ns;
+                long now100Ns = _sessionClock.Elapsed.Ticks;
+                _trackOrigin100Ns = _minimumTimestamp100Ns > 0
+                    ? Math.Max(now100Ns, _minimumTimestamp100Ns)
+                    : now100Ns;
+                _lastRealAudioClock100Ns = now100Ns;
                 _totalPcmFramesFed = 0;
             }
 
@@ -299,6 +967,10 @@ public sealed class DualAudioCaptureService : IDisposable
                 try
                 {
                     long now100Ns = _sessionClock.Elapsed.Ticks;
+
+                    // Record arrival of real loopback/mic audio immediately so the silence timer never competes.
+                    _lastRealAudioClock100Ns = now100Ns;
+
                     int pcmByteCount = _pcmConverter.ConvertToStereoPcm16At48k(
                         e.Buffer,
                         e.BytesRecorded,
@@ -338,14 +1010,12 @@ public sealed class DualAudioCaptureService : IDisposable
                         streamCursor100Ns = GetCurrentPcmCursor100NsLocked();
                     }
 
-                    // Guard against fast audio hardware crystal drift pushing audio ahead of video.
+                    // Guard against severe audio hardware clock drift pushing audio far ahead of video.
                     if (streamCursor100Ns - now100Ns > OverrunDriftLimit100Ns)
                     {
-                        _lastRealAudioClock100Ns = now100Ns;
                         return;
                     }
 
-                    _lastRealAudioClock100Ns = now100Ns;
                     FeedPcmFramesLocked(_pcmScratchBuffer.AsSpan(0, incomingFrames * TargetBlockAlignment), incomingFrames);
                 }
                 catch (Exception ex)
@@ -375,17 +1045,20 @@ public sealed class DualAudioCaptureService : IDisposable
                 }
 
                 long now100Ns = _sessionClock.Elapsed.Ticks;
-                if (now100Ns - _lastRealAudioClock100Ns < SilenceTriggerDelay100Ns)
+
+                // Strictly require > 25 ms without real loopback data before injecting silence.
+                if (now100Ns - _lastRealAudioClock100Ns <= SilenceTriggerDelay100Ns)
                 {
-                    // Real loopback data is actively arriving on schedule.
                     return;
                 }
 
+                // Keep the silence cursor behind real-time by one 20 ms margin so incoming real audio
+                // never collides with or gets overwritten by silence timestamps.
                 long targetCursor100Ns = now100Ns - SilenceLeadMargin100Ns;
                 long currentCursor100Ns = GetCurrentPcmCursor100NsLocked();
                 long deficit100Ns = targetCursor100Ns - currentCursor100Ns;
 
-                if (deficit100Ns < MinSilenceInjection100Ns)
+                if (deficit100Ns < SilenceChunkDuration100Ns)
                 {
                     return;
                 }
@@ -396,10 +1069,11 @@ public sealed class DualAudioCaptureService : IDisposable
                     return;
                 }
 
-                long framesToInject = Math.Min(Ticks100NsToFrames(deficit100Ns), MaxSilenceFramesPerTick);
-                if (framesToInject > 0)
+                long framesNeeded = Math.Min(Ticks100NsToFrames(deficit100Ns), MaxSilenceFramesPerTick);
+                long fullChunks = framesNeeded / SilenceChunkFrames;
+                for (long i = 0; i < fullChunks; i++)
                 {
-                    FeedSilentFramesLocked(framesToInject);
+                    FeedPcmFramesLocked(ZeroSilenceChunk, SilenceChunkFrames);
                 }
             }
             catch (Exception ex)
@@ -416,7 +1090,7 @@ public sealed class DualAudioCaptureService : IDisposable
         {
             if (e.Exception is not null && Volatile.Read(ref _stopped) == 0)
             {
-                Debug.WriteLine($"Przechwytywanie WASAPI ({_trackType}) zostało zatrzymane z błędem: {e.Exception.Message}");
+                _onRuntimeError?.Invoke(_trackType, e.Exception);
             }
         }
 
@@ -448,7 +1122,8 @@ public sealed class DualAudioCaptureService : IDisposable
         private void ReanchorTimelineLocked(long newCursor100Ns)
         {
             _aacEncoder.ResetPendingPcm();
-            _trackOrigin100Ns = Math.Max(0L, newCursor100Ns);
+            long minAllowed = Math.Max(0L, _lastEncodedTimestamp100Ns + 1);
+            _trackOrigin100Ns = Math.Max(minAllowed, newCursor100Ns);
             _totalPcmFramesFed = 0;
         }
 
@@ -460,6 +1135,7 @@ public sealed class DualAudioCaptureService : IDisposable
                 return;
             }
 
+            Volatile.Write(ref _lastEncodedTimestamp100Ns, timestamp100Ns);
             _ringBuffer.AddAudioPacket(_trackType, rentedBuffer, length, timestamp100Ns, duration100Ns);
         }
 
@@ -468,6 +1144,32 @@ public sealed class DualAudioCaptureService : IDisposable
 
         private static long Ticks100NsToFrames(long ticks100Ns)
             => (ticks100Ns * TargetSampleRate) / TimeSpan.TicksPerSecond;
+
+        private static string TryReadDeviceId(MMDevice device)
+        {
+            try
+            {
+                return device.ID ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static string TryReadFriendlyName(MMDevice device, string fallback)
+        {
+            try
+            {
+                return string.IsNullOrWhiteSpace(device.FriendlyName)
+                    ? fallback
+                    : device.FriendlyName.Trim();
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
 
         public void Dispose()
         {
@@ -535,229 +1237,126 @@ public sealed class DualAudioCaptureService : IDisposable
     }
 
     /// <summary>
-    /// Converts arbitrary WASAPI capture formats (IEEE Float / 16-24-32-bit PCM / Extensible,
-    /// mono / stereo / 5.1 / 7.1, any sample rate) into 48000 Hz, 16-bit, 2-channel Stereo PCM.
+    /// Universal NAudio sample conversion chain converting any WASAPI capture format
+    /// (IEEE Float / 8-16-24-32-bit PCM / <see cref="WaveFormatExtensible"/>, mono / stereo / multichannel,
+    /// any sample rate such as 44.1 / 48 / 96 kHz) cleanly into 48000 Hz, 16-bit, 2-channel Stereo PCM:
+    /// <list type="number">
+    /// <item>Bytes -&gt; <see cref="ISampleProvider"/> (<see cref="WaveToSampleProvider"/> / <see cref="Pcm16BitToSampleProvider"/> / PCM bit-depth providers)</item>
+    /// <item>Channel normalization to Stereo (<see cref="MonoToStereoSampleProvider"/> or <see cref="MultiplexingSampleProvider"/> mapping FL/FR 0 &amp; 1)</item>
+    /// <item>Resampling to 48000 Hz via <see cref="WdlResamplingSampleProvider"/> when sample rate != 48000</item>
+    /// <item>16-bit PCM output via <see cref="SampleToWaveProvider16"/></item>
+    /// </list>
     /// </summary>
     private sealed class AudioPcmConverter
     {
         private static readonly Guid KsDataFormatSubtypePcm = new("00000001-0000-0010-8000-00AA00389B71");
         private static readonly Guid KsDataFormatSubtypeIeeeFloat = new("00000003-0000-0010-8000-00AA00389B71");
-        private const float CenterDownmixGain = 0.70710678f;
 
-        private readonly bool _isFloat;
-        private readonly int _sourceChannels;
-        private readonly int _sourceBitsPerSample;
-        private readonly int _sourceBytesPerSample;
+        private const int MaxDrainIterations = 64;
+
         private readonly int _sourceBlockAlign;
-        private readonly bool _needsResampling;
-
-        private readonly BufferedWaveProvider? _resampleInputBuffer;
-        private readonly WdlResamplingSampleProvider? _resampler;
-
-        private float[] _stereoFloatScratch = new float[8192];
-        private byte[] _resampleInputBytes = new byte[32768];
-        private float[] _resampledFloatScratch = new float[8192];
+        private readonly BufferedWaveProvider _inputBuffer;
+        private readonly SampleToWaveProvider16 _pcm16Output;
+        private readonly byte[] _drainChunkBuffer = new byte[16 * 1024]; // Multiple of 4 (TargetBlockAlignment)
 
         public AudioPcmConverter(WaveFormat sourceFormat)
         {
-            _sourceChannels = Math.Max(1, sourceFormat.Channels);
-            _sourceBitsPerSample = sourceFormat.BitsPerSample;
-            _sourceBytesPerSample = Math.Max(1, _sourceBitsPerSample / 8);
-            _sourceBlockAlign = Math.Max(1, sourceFormat.BlockAlign);
-            _isFloat = IsIeeeFloatFormat(sourceFormat);
-            _needsResampling = sourceFormat.SampleRate != TargetSampleRate;
+            ArgumentNullException.ThrowIfNull(sourceFormat);
 
-            if (_needsResampling)
+            int channels = Math.Max(1, sourceFormat.Channels);
+            int sampleRate = Math.Max(8000, sourceFormat.SampleRate);
+            bool isFloat = IsIeeeFloatFormat(sourceFormat);
+
+            // Normalize WaveFormatExtensible into a standard WaveFormat with identical interleaved byte layout
+            // so NAudio sample providers never reject Extensible descriptors (e.g., 5.1/7.1 spatial headsets).
+            WaveFormat normalizedInputFormat = isFloat
+                ? WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, channels)
+                : new WaveFormat(sampleRate, sourceFormat.BitsPerSample, channels);
+
+            _sourceBlockAlign = Math.Max(1, normalizedInputFormat.BlockAlign);
+
+            _inputBuffer = new BufferedWaveProvider(normalizedInputFormat, TimeSpan.FromSeconds(2))
             {
-                WaveFormat stereoFloatFormat = WaveFormat.CreateIeeeFloatWaveFormat(sourceFormat.SampleRate, TargetChannels);
-                _resampleInputBuffer = new BufferedWaveProvider(stereoFloatFormat, TimeSpan.FromSeconds(2))
-                {
-                    DiscardOnBufferOverflow = true,
-                    ReadFully = false
-                };
+                DiscardOnBufferOverflow = true,
+                ReadFully = false
+            };
 
-                ISampleProvider sampleProvider = new WaveToSampleProvider(_resampleInputBuffer);
-                _resampler = new WdlResamplingSampleProvider(sampleProvider, TargetSampleRate);
+            // 1. Convert incoming bytes to ISampleProvider.
+            ISampleProvider sampleProvider = CreateSampleProvider(_inputBuffer, normalizedInputFormat);
+
+            // 2. Normalize channel count to 2 (Stereo).
+            if (sampleProvider.WaveFormat.Channels == 1)
+            {
+                sampleProvider = new MonoToStereoSampleProvider(sampleProvider);
             }
+            else if (sampleProvider.WaveFormat.Channels > TargetChannels)
+            {
+                var multiplexer = new MultiplexingSampleProvider(new[] { sampleProvider }, TargetChannels);
+                multiplexer.ConnectInputToOutput(0, 0); // Front-Left -> Left
+                multiplexer.ConnectInputToOutput(1, 1); // Front-Right -> Right
+                sampleProvider = multiplexer;
+            }
+
+            // 3. Resample to 48000 Hz whenever the endpoint's native mix rate differs.
+            if (sampleProvider.WaveFormat.SampleRate != TargetSampleRate)
+            {
+                sampleProvider = new WdlResamplingSampleProvider(sampleProvider, TargetSampleRate);
+            }
+
+            // 4. Convert back to 16-bit Stereo PCM for Media Foundation AAC encoding.
+            _pcm16Output = new SampleToWaveProvider16(sampleProvider);
         }
 
         public int ConvertToStereoPcm16At48k(byte[] inputBuffer, int bytesRecorded, ref byte[] outputPcm16Buffer)
         {
-            int inputFrames = bytesRecorded / _sourceBlockAlign;
-            if (inputFrames <= 0)
+            int alignedInputBytes = (bytesRecorded / _sourceBlockAlign) * _sourceBlockAlign;
+            if (alignedInputBytes <= 0)
             {
                 return 0;
             }
 
-            int stereoFloatCount = inputFrames * TargetChannels;
-            if (_stereoFloatScratch.Length < stereoFloatCount)
-            {
-                _stereoFloatScratch = new float[stereoFloatCount];
-            }
-
-            DecodeAndMixToStereoFloat(inputBuffer.AsSpan(0, inputFrames * _sourceBlockAlign), inputFrames, _stereoFloatScratch);
-
-            if (!_needsResampling)
-            {
-                int outputByteCount = inputFrames * TargetBlockAlignment;
-                EnsureCapacity(ref outputPcm16Buffer, outputByteCount);
-                ConvertStereoFloatToPcm16(_stereoFloatScratch.AsSpan(0, stereoFloatCount), outputPcm16Buffer.AsSpan(0, outputByteCount));
-                return outputByteCount;
-            }
-
-            int stereoFloatBytes = stereoFloatCount * sizeof(float);
-            EnsureCapacity(ref _resampleInputBytes, stereoFloatBytes);
-            MemoryMarshal.AsBytes(_stereoFloatScratch.AsSpan(0, stereoFloatCount)).CopyTo(_resampleInputBytes);
-            _resampleInputBuffer!.AddSamples(_resampleInputBytes, 0, stereoFloatBytes);
+            _inputBuffer.AddSamples(inputBuffer, 0, alignedInputBytes);
 
             int totalWrittenBytes = 0;
-            const int maxDrainIterations = 32;
-            for (int iter = 0; iter < maxDrainIterations; iter++)
+            for (int iter = 0; iter < MaxDrainIterations; iter++)
             {
-                int samplesRead = _resampler!.Read(_resampledFloatScratch, 0, _resampledFloatScratch.Length);
-                if (samplesRead <= 0)
+                int bytesRead = _pcm16Output.Read(_drainChunkBuffer, 0, _drainChunkBuffer.Length);
+                if (bytesRead <= 0)
                 {
                     break;
                 }
 
-                // Guarantee stereo frame alignment (multiple of 2 samples).
-                int alignedSamples = samplesRead & ~1;
-                if (alignedSamples <= 0)
+                // Guarantee stereo 16-bit frame alignment (multiple of 4 bytes).
+                int alignedBytes = bytesRead & ~3;
+                if (alignedBytes <= 0)
                 {
                     break;
                 }
 
-                int chunkBytes = alignedSamples * sizeof(short);
-                EnsureCapacity(ref outputPcm16Buffer, totalWrittenBytes + chunkBytes);
-                ConvertStereoFloatToPcm16(
-                    _resampledFloatScratch.AsSpan(0, alignedSamples),
-                    outputPcm16Buffer.AsSpan(totalWrittenBytes, chunkBytes));
-                totalWrittenBytes += chunkBytes;
+                EnsureCapacity(ref outputPcm16Buffer, totalWrittenBytes + alignedBytes);
+                System.Buffer.BlockCopy(_drainChunkBuffer, 0, outputPcm16Buffer, totalWrittenBytes, alignedBytes);
+                totalWrittenBytes += alignedBytes;
             }
 
             return totalWrittenBytes;
         }
 
-        private void DecodeAndMixToStereoFloat(ReadOnlySpan<byte> src, int frameCount, Span<float> dstStereo)
+        private static ISampleProvider CreateSampleProvider(IWaveProvider source, WaveFormat format)
         {
-            int channels = _sourceChannels;
-            int blockAlign = _sourceBlockAlign;
-            int bytesPerSample = _sourceBytesPerSample;
-
-            for (int frame = 0; frame < frameCount; frame++)
+            if (format.Encoding == WaveFormatEncoding.IeeeFloat)
             {
-                int frameOffset = frame * blockAlign;
-                float left;
-                float right;
-
-                if (channels == 1)
-                {
-                    float mono = ReadSampleAsFloat(src, frameOffset);
-                    left = mono;
-                    right = mono;
-                }
-                else if (channels == 2)
-                {
-                    left = ReadSampleAsFloat(src, frameOffset);
-                    right = ReadSampleAsFloat(src, frameOffset + bytesPerSample);
-                }
-                else if (channels == 6)
-                {
-                    // 5.1 layout: FL, FR, FC, LFE, BL, BR
-                    float fl = ReadSampleAsFloat(src, frameOffset);
-                    float fr = ReadSampleAsFloat(src, frameOffset + bytesPerSample);
-                    float fc = ReadSampleAsFloat(src, frameOffset + (2 * bytesPerSample));
-                    float bl = ReadSampleAsFloat(src, frameOffset + (4 * bytesPerSample));
-                    float br = ReadSampleAsFloat(src, frameOffset + (5 * bytesPerSample));
-
-                    left = fl + (CenterDownmixGain * (fc + bl));
-                    right = fr + (CenterDownmixGain * (fc + br));
-                }
-                else if (channels == 8)
-                {
-                    // 7.1 layout: FL, FR, FC, LFE, BL, BR, SL, SR
-                    float fl = ReadSampleAsFloat(src, frameOffset);
-                    float fr = ReadSampleAsFloat(src, frameOffset + bytesPerSample);
-                    float fc = ReadSampleAsFloat(src, frameOffset + (2 * bytesPerSample));
-                    float bl = ReadSampleAsFloat(src, frameOffset + (4 * bytesPerSample));
-                    float br = ReadSampleAsFloat(src, frameOffset + (5 * bytesPerSample));
-                    float sl = ReadSampleAsFloat(src, frameOffset + (6 * bytesPerSample));
-                    float sr = ReadSampleAsFloat(src, frameOffset + (7 * bytesPerSample));
-
-                    left = fl + (CenterDownmixGain * fc) + (0.5f * (bl + sl));
-                    right = fr + (CenterDownmixGain * fc) + (0.5f * (br + sr));
-                }
-                else
-                {
-                    left = ReadSampleAsFloat(src, frameOffset);
-                    right = ReadSampleAsFloat(src, frameOffset + bytesPerSample);
-                    for (int ch = 2; ch < channels; ch++)
-                    {
-                        float extra = ReadSampleAsFloat(src, frameOffset + (ch * bytesPerSample)) * 0.5f;
-                        if ((ch & 1) == 0)
-                        {
-                            left += extra;
-                        }
-                        else
-                        {
-                            right += extra;
-                        }
-                    }
-                }
-
-                dstStereo[frame * 2] = Math.Clamp(left, -1.0f, 1.0f);
-                dstStereo[(frame * 2) + 1] = Math.Clamp(right, -1.0f, 1.0f);
-            }
-        }
-
-        private float ReadSampleAsFloat(ReadOnlySpan<byte> buffer, int offset)
-        {
-            if (_isFloat && _sourceBitsPerSample == 32)
-            {
-                return MemoryMarshal.Read<float>(buffer.Slice(offset, 4));
+                return new WaveToSampleProvider(source);
             }
 
-            if (_sourceBitsPerSample == 16)
+            return format.BitsPerSample switch
             {
-                short s = MemoryMarshal.Read<short>(buffer.Slice(offset, 2));
-                return s / 32768.0f;
-            }
-
-            if (_sourceBitsPerSample == 24)
-            {
-                int s24 = (buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16));
-                if ((s24 & 0x800000) != 0)
-                {
-                    s24 |= unchecked((int)0xFF000000);
-                }
-
-                return s24 / 8388608.0f;
-            }
-
-            if (_sourceBitsPerSample == 32)
-            {
-                int s32 = MemoryMarshal.Read<int>(buffer.Slice(offset, 4));
-                return s32 / 2147483648.0f;
-            }
-
-            if (_sourceBitsPerSample == 8)
-            {
-                return (buffer[offset] - 128) / 128.0f;
-            }
-
-            return 0f;
-        }
-
-        private static void ConvertStereoFloatToPcm16(ReadOnlySpan<float> srcFloats, Span<byte> dstBytes)
-        {
-            Span<short> dstShorts = MemoryMarshal.Cast<byte, short>(dstBytes);
-            int count = Math.Min(srcFloats.Length, dstShorts.Length);
-
-            for (int i = 0; i < count; i++)
-            {
-                float clamped = Math.Clamp(srcFloats[i], -1.0f, 1.0f);
-                dstShorts[i] = (short)MathF.Round(clamped * 32767.0f);
-            }
+                16 => new Pcm16BitToSampleProvider(source),
+                24 => new Pcm24BitToSampleProvider(source),
+                32 => new Pcm32BitToSampleProvider(source),
+                8 => new Pcm8BitToSampleProvider(source),
+                _ => throw new NotSupportedException(
+                    $"Nieobsługiwany format audio WASAPI: {format.Encoding}, {format.BitsPerSample}-bit, {format.SampleRate} Hz, {format.Channels} ch.")
+            };
         }
 
         private static bool IsIeeeFloatFormat(WaveFormat format)
@@ -820,15 +1419,17 @@ public sealed class DualAudioCaptureService : IDisposable
         private int _outputStreamId;
         private OutputStreamInfo _outputStreamInfo;
         private bool _mftProvidesOutputSamples;
-        private long _lastOutputTimestamp100Ns = -1;
+        private long _lastOutputTimestamp100Ns;
         private int _disposed;
 
         public AacMftEncoder(
             MediaTrackType trackType,
+            long initialLastTimestamp100Ns,
             Action<byte[], int, long, long> onEncodedPacket,
             Action<ReadOnlyMemory<byte>>? onUserData)
         {
             _trackType = trackType;
+            _lastOutputTimestamp100Ns = initialLastTimestamp100Ns;
             _onEncodedPacket = onEncodedPacket;
             _onUserData = onUserData;
 
