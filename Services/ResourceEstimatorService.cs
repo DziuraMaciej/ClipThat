@@ -7,7 +7,7 @@ namespace ClipThat.Services;
 /// </summary>
 public sealed class ResourceEstimatorService
 {
-    public const double AudioBitrateMbps = 0.256; // Two 128 kbps AAC audio tracks
+    public const double AudioBitrateMbps = 0.384; // Three 128 kbps AAC audio tracks (Combined Mix + System + Microphone)
     public const double BaseRamOverheadMb = 30.0;
     public const double RamBufferMultiplier = 1.15;
 

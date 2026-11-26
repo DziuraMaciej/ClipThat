@@ -1,30 +1,46 @@
+using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Threading;
 using ClipThat.Engine;
 using ClipThat.Models;
 using ClipThat.Services;
+using ClipThat.UI.Controls;
 using Microsoft.Win32;
+using Wpf.Ui.Controls;
 
 namespace ClipThat.UI.Pages;
 
 /// <summary>
-/// Settings page allowing users to configure monitor selection, audio devices, buffer parameters, folder, and startup behavior.
+/// Complete Polish settings view with visual monitor arrangement, live RAM/disk estimator,
+/// audio device selectors, interactive hotkey recorder, output folder picker, and startup toggles.
 /// </summary>
 public partial class SettingsPage : Page
 {
+    private static readonly Brush RecordingDotBrush = CreateFrozenBrush(0xFF, 0x22, 0xC5, 0x5E);
+    private static readonly Brush PausedDotBrush = CreateFrozenBrush(0xFF, 0x71, 0x71, 0x7A);
+
     private readonly SettingsService _settingsService;
     private readonly DisplayService _displayService;
     private readonly AudioDeviceService _audioDeviceService;
     private readonly ResourceEstimatorService _resourceEstimatorService;
     private readonly StartupService _startupService;
+    private readonly GlobalHotkeyService _globalHotkeyService;
     private readonly IReplayEngine _replayEngine;
+
+    private readonly DispatcherTimer _sliderDebounceTimer;
+    private readonly DispatcherTimer _filenamePreviewTimer;
 
     private AppSettings _workingSettings;
     private bool _isInitializing = true;
     private bool _isRefreshingAudioDevices;
-    private bool _isUpdatingAudioSettings;
-    private bool _hasPendingAudioUpdate;
+    private bool _isSyncingStartupToggle;
+    private bool _isApplyingEngineUpdate;
+    private bool _hasPendingEngineUpdate;
+    private bool _hasPendingSliderSave;
     private bool _isDetached;
 
     public SettingsPage(
@@ -33,6 +49,7 @@ public partial class SettingsPage : Page
         AudioDeviceService audioDeviceService,
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
+        GlobalHotkeyService globalHotkeyService,
         IReplayEngine replayEngine)
     {
         _settingsService = settingsService;
@@ -40,78 +57,149 @@ public partial class SettingsPage : Page
         _audioDeviceService = audioDeviceService;
         _resourceEstimatorService = resourceEstimatorService;
         _startupService = startupService;
+        _globalHotkeyService = globalHotkeyService;
         _replayEngine = replayEngine;
         _workingSettings = _settingsService.Load();
 
+        _sliderDebounceTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(150)
+        };
+        _sliderDebounceTimer.Tick += SliderDebounceTimer_Tick;
+
+        _filenamePreviewTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(1)
+        };
+        _filenamePreviewTimer.Tick += FilenamePreviewTimer_Tick;
+
         InitializeComponent();
 
-        PopulateOptions();
         LoadSettingsIntoControls();
 
+        MonitorLayout.MonitorSelected += MonitorLayout_MonitorSelected;
+        SaveHotkeyBox.HotkeyCommitted += SaveHotkeyBox_HotkeyCommitted;
         _replayEngine.StatusChanged += OnEngineStatusChanged;
         _audioDeviceService.DevicesChanged += OnAudioDevicesChanged;
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        Loaded += SettingsPage_Loaded;
+        Unloaded += SettingsPage_Unloaded;
 
         UpdateEngineControls(_replayEngine.IsRecording, null);
+        UpdateFilenamePreview();
+        UpdateResourceEstimate();
 
         _isInitializing = false;
-        UpdateResourceEstimate();
     }
 
     /// <summary>
-    /// Unsubscribes from long-lived engine and system events when the parent window closes so the page can be collected.
+    /// Unsubscribes from long-lived engine, control, and system events when the parent window closes.
     /// </summary>
     public void Detach()
     {
+        if (_isDetached)
+        {
+            return;
+        }
+
         _isDetached = true;
+
+        _filenamePreviewTimer.Stop();
+        _filenamePreviewTimer.Tick -= FilenamePreviewTimer_Tick;
+
+        _sliderDebounceTimer.Stop();
+        _sliderDebounceTimer.Tick -= SliderDebounceTimer_Tick;
+
+        if (_hasPendingSliderSave)
+        {
+            _hasPendingSliderSave = false;
+            try
+            {
+                _settingsService.Save(_workingSettings);
+            }
+            catch
+            {
+                // Ignore best-effort flush errors on window close.
+            }
+        }
+
+        MonitorLayout.MonitorSelected -= MonitorLayout_MonitorSelected;
+        MonitorLayout.Cleanup();
+
+        SaveHotkeyBox.HotkeyCommitted -= SaveHotkeyBox_HotkeyCommitted;
+        SaveHotkeyBox.Cleanup();
+
         _replayEngine.StatusChanged -= OnEngineStatusChanged;
         _audioDeviceService.DevicesChanged -= OnAudioDevicesChanged;
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+        Loaded -= SettingsPage_Loaded;
+        Unloaded -= SettingsPage_Unloaded;
     }
 
-    private void PopulateOptions()
+    private void SettingsPage_Loaded(object sender, RoutedEventArgs e)
     {
-        IReadOnlyList<DisplayDeviceInfo> displays = _displayService.GetDisplays();
-        MonitorComboBox.ItemsSource = displays;
-
-        RefreshAudioDeviceLists();
-
-        ResolutionComboBox.ItemsSource = new[]
+        if (_isDetached)
         {
-            new ResolutionOption("240p", ResolutionPreset.P240),
-            new ResolutionOption("360p", ResolutionPreset.P360),
-            new ResolutionOption("480p", ResolutionPreset.P480),
-            new ResolutionOption("720p (HD)", ResolutionPreset.P720),
-            new ResolutionOption("1080p (Full HD)", ResolutionPreset.P1080)
-        };
+            return;
+        }
 
-        FpsComboBox.ItemsSource = new[]
-        {
-            new FpsOption("30 FPS", 30),
-            new FpsOption("60 FPS", 60)
-        };
+        UpdateFilenamePreview();
+        _filenamePreviewTimer.Start();
+    }
+
+    private void SettingsPage_Unloaded(object sender, RoutedEventArgs e)
+    {
+        _filenamePreviewTimer.Stop();
     }
 
     private void LoadSettingsIntoControls()
     {
-        if (MonitorComboBox.ItemsSource is IReadOnlyList<DisplayDeviceInfo> displays && displays.Count > 0)
+        MonitorLayout.Initialize(_displayService, _workingSettings.SelectedMonitorDeviceName);
+        if (!string.IsNullOrWhiteSpace(MonitorLayout.SelectedMonitorDeviceName) &&
+            string.IsNullOrWhiteSpace(_workingSettings.SelectedMonitorDeviceName))
         {
-            DisplayDeviceInfo? selected = _displayService.GetDisplayByDeviceName(_workingSettings.SelectedMonitorDeviceName);
-            MonitorComboBox.SelectedItem = displays.FirstOrDefault(d =>
-                selected is not null &&
-                string.Equals(d.DeviceName, selected.DeviceName, StringComparison.OrdinalIgnoreCase))
-                ?? displays[0];
+            _workingSettings.SelectedMonitorDeviceName = MonitorLayout.SelectedMonitorDeviceName;
         }
 
         RefreshAudioDeviceLists();
 
         DurationSlider.Value = _workingSettings.BufferDurationMinutes;
         DurationValueText.Text = $"{_workingSettings.BufferDurationMinutes} min";
-        ResolutionComboBox.SelectedValue = _workingSettings.Resolution;
-        FpsComboBox.SelectedValue = _workingSettings.Fps;
+
+        SelectResolutionRadio(_workingSettings.Resolution);
+        SelectFpsRadio(_workingSettings.Fps);
+
         OutputDirectoryTextBox.Text = _workingSettings.OutputDirectory;
-        StartWithWindowsSwitch.IsChecked = _workingSettings.StartWithWindows || _startupService.IsEnabled();
+        SaveHotkeyBox.Initialize(_globalHotkeyService, _workingSettings.HotkeyModifiers, _workingSettings.HotkeyVirtualKey);
+
+        bool startupEnabled = _workingSettings.StartWithWindows || _startupService.IsEnabled();
+        StartWithWindowsSwitch.IsChecked = startupEnabled;
         StartRecordingOnLaunchSwitch.IsChecked = _workingSettings.StartRecordingOnLaunch;
+    }
+
+    private void SelectResolutionRadio(ResolutionPreset resolution)
+    {
+        RadioButton target = resolution switch
+        {
+            ResolutionPreset.P240 => Res240Radio,
+            ResolutionPreset.P360 => Res360Radio,
+            ResolutionPreset.P480 => Res480Radio,
+            ResolutionPreset.P720 => Res720Radio,
+            _ => Res1080Radio
+        };
+        target.IsChecked = true;
+    }
+
+    private void SelectFpsRadio(int fps)
+    {
+        if (fps == 30)
+        {
+            Fps30Radio.IsChecked = true;
+        }
+        else
+        {
+            Fps60Radio.IsChecked = true;
+        }
     }
 
     private void RefreshAudioDeviceLists()
@@ -164,6 +252,82 @@ public partial class SettingsPage : Page
                ?? devices[0];
     }
 
+    private async void MonitorLayout_MonitorSelected(object? sender, DisplayDeviceInfo display)
+    {
+        if (_isInitializing || _isDetached)
+        {
+            return;
+        }
+
+        _workingSettings.SelectedMonitorDeviceName = display.DeviceName;
+        await SaveAndApplySettingsAsync();
+    }
+
+    private void DurationSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+    {
+        if (_isInitializing || _isDetached)
+        {
+            return;
+        }
+
+        int durationMinutes = Math.Clamp((int)Math.Round(e.NewValue), 1, 10);
+        DurationValueText.Text = $"{durationMinutes} min";
+        _workingSettings.BufferDurationMinutes = durationMinutes;
+        _hasPendingSliderSave = true;
+
+        UpdateResourceEstimate();
+
+        _sliderDebounceTimer.Stop();
+        _sliderDebounceTimer.Start();
+    }
+
+    private async void SliderDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        _sliderDebounceTimer.Stop();
+        if (_isDetached)
+        {
+            return;
+        }
+
+        _hasPendingSliderSave = false;
+        await SaveAndApplySettingsAsync();
+    }
+
+    private async void ResolutionRadio_Checked(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isDetached || sender is not RadioButton { Tag: ResolutionPreset preset })
+        {
+            return;
+        }
+
+        if (_workingSettings.Resolution == preset)
+        {
+            return;
+        }
+
+        _workingSettings.Resolution = preset;
+        UpdateResourceEstimate();
+        await SaveAndApplySettingsAsync();
+    }
+
+    private async void FpsRadio_Checked(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isDetached || sender is not RadioButton radio)
+        {
+            return;
+        }
+
+        int fps = string.Equals(radio.Tag?.ToString(), "30", StringComparison.Ordinal) ? 30 : 60;
+        if (_workingSettings.Fps == fps)
+        {
+            return;
+        }
+
+        _workingSettings.Fps = fps;
+        UpdateResourceEstimate();
+        await SaveAndApplySettingsAsync();
+    }
+
     private async void AudioDevice_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_isInitializing || _isRefreshingAudioDevices || _isDetached)
@@ -171,96 +335,24 @@ public partial class SettingsPage : Page
             return;
         }
 
-        await ApplyAudioDeviceSelectionAsync();
-    }
+        string? selectedSystemAudioId = (SystemAudioComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
+        string? selectedMicrophoneId = (MicrophoneComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
 
-    private async Task ApplyAudioDeviceSelectionAsync()
-    {
-        if (_isUpdatingAudioSettings)
-        {
-            _hasPendingAudioUpdate = true;
-            return;
-        }
+        bool changed =
+            !string.Equals(_workingSettings.SystemAudioDeviceId, selectedSystemAudioId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(_workingSettings.MicrophoneDeviceId, selectedMicrophoneId, StringComparison.OrdinalIgnoreCase);
 
-        _isUpdatingAudioSettings = true;
-        try
-        {
-            do
-            {
-                _hasPendingAudioUpdate = false;
-
-                string? selectedSystemAudioId = (SystemAudioComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
-                string? selectedMicrophoneId = (MicrophoneComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
-
-                bool changed =
-                    !string.Equals(_workingSettings.SystemAudioDeviceId, selectedSystemAudioId, StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(_workingSettings.MicrophoneDeviceId, selectedMicrophoneId, StringComparison.OrdinalIgnoreCase);
-
-                if (!changed)
-                {
-                    continue;
-                }
-
-                AppSettings updated = _workingSettings.Clone();
-                updated.SystemAudioDeviceId = selectedSystemAudioId;
-                updated.MicrophoneDeviceId = selectedMicrophoneId;
-                updated.Normalize();
-
-                _settingsService.Save(updated);
-                _workingSettings = updated;
-
-                await _replayEngine.UpdateSettingsAsync(updated);
-
-                if (!_isDetached)
-                {
-                    SaveFeedbackText.Text = "Zaktualizowano ustawienia audio.";
-                }
-            }
-            while (_hasPendingAudioUpdate && !_isDetached);
-        }
-        catch (Exception ex)
-        {
-            if (!_isDetached)
-            {
-                SaveFeedbackText.Text = $"Błąd aktualizacji audio: {ex.Message}";
-            }
-        }
-        finally
-        {
-            _isUpdatingAudioSettings = false;
-        }
-    }
-
-    private void QualityInput_Changed(object sender, RoutedEventArgs e)
-    {
-        if (_isInitializing)
+        if (!changed)
         {
             return;
         }
 
-        UpdateResourceEstimate();
+        _workingSettings.SystemAudioDeviceId = selectedSystemAudioId;
+        _workingSettings.MicrophoneDeviceId = selectedMicrophoneId;
+        await SaveAndApplySettingsAsync();
     }
 
-    private void UpdateResourceEstimate()
-    {
-        int durationMinutes = (int)Math.Round(DurationSlider.Value);
-        DurationValueText.Text = $"{durationMinutes} min";
-
-        ResolutionPreset resolution = ResolutionComboBox.SelectedValue is ResolutionPreset preset
-            ? preset
-            : ResolutionPreset.P1080;
-
-        int fps = FpsComboBox.SelectedValue is int selectedFps ? selectedFps : 60;
-
-        ResourceEstimate estimate = _resourceEstimatorService.Estimate(durationMinutes, resolution, fps);
-        CultureInfo polishCulture = CultureInfo.GetCultureInfo("pl-PL");
-
-        BitrateEstimateText.Text = string.Format(polishCulture, "{0:0.0} Mbps", estimate.VideoBitrateMbps);
-        RamEstimateText.Text = string.Format(polishCulture, "{0:0} MB", estimate.EstimatedRamUsageMb);
-        DiskEstimateText.Text = string.Format(polishCulture, "{0:0} MB", estimate.EstimatedDiskSizeMb);
-    }
-
-    private void BrowseOutputDirectoryButton_Click(object sender, RoutedEventArgs e)
+    private async void BrowseOutputDirectoryButton_Click(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFolderDialog
         {
@@ -271,54 +363,169 @@ public partial class SettingsPage : Page
         if (dialog.ShowDialog() == true && !string.IsNullOrWhiteSpace(dialog.FolderName))
         {
             OutputDirectoryTextBox.Text = dialog.FolderName;
+            _workingSettings.OutputDirectory = dialog.FolderName;
+            await SaveAndApplySettingsAsync();
         }
     }
 
-    private async void SaveSettingsButton_Click(object sender, RoutedEventArgs e)
+    private void OpenOutputFolderButton_Click(object sender, RoutedEventArgs e)
     {
-        SaveSettingsButton.IsEnabled = false;
-        SaveFeedbackText.Text = string.Empty;
+        string folderPath = string.IsNullOrWhiteSpace(_workingSettings.OutputDirectory)
+            ? AppSettings.DefaultOutputDirectory
+            : _workingSettings.OutputDirectory;
 
         try
         {
-            AppSettings updated = _workingSettings.Clone();
-            updated.SelectedMonitorDeviceName = (MonitorComboBox.SelectedItem as DisplayDeviceInfo)?.DeviceName;
-            updated.SystemAudioDeviceId = (SystemAudioComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
-            updated.MicrophoneDeviceId = (MicrophoneComboBox.SelectedItem as AudioDeviceInfo)?.DeviceId;
-            updated.BufferDurationMinutes = (int)Math.Round(DurationSlider.Value);
-            updated.Resolution = ResolutionComboBox.SelectedValue is ResolutionPreset preset
-                ? preset
-                : ResolutionPreset.P1080;
-            updated.Fps = FpsComboBox.SelectedValue is int fps ? fps : 60;
-            updated.OutputDirectory = OutputDirectoryTextBox.Text;
-            updated.StartWithWindows = StartWithWindowsSwitch.IsChecked == true;
-            updated.StartRecordingOnLaunch = StartRecordingOnLaunchSwitch.IsChecked == true;
-            updated.Normalize();
-
-            _settingsService.Save(updated);
-            _startupService.SetEnabled(updated.StartWithWindows);
-            await _replayEngine.UpdateSettingsAsync(updated);
-
-            _workingSettings = updated;
-            if (!_isDetached)
+            Directory.CreateDirectory(folderPath);
+            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{folderPath}\"")
             {
-                SaveFeedbackText.Text = "Zapisano ustawienia.";
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            EngineStatusDetailText.Text = $"Nie udało się otworzyć folderu: {ex.Message}";
+        }
+    }
+
+    private void SaveHotkeyBox_HotkeyCommitted(object? sender, HotkeyChangedEventArgs e)
+    {
+        if (_isInitializing || _isDetached)
+        {
+            return;
+        }
+
+        _workingSettings.HotkeyModifiers = e.Modifiers;
+        _workingSettings.HotkeyVirtualKey = e.VirtualKey;
+        SaveWorkingSettingsOnly();
+    }
+
+    private void StartupSwitch_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isSyncingStartupToggle || _isDetached)
+        {
+            return;
+        }
+
+        bool enabled = StartWithWindowsSwitch.IsChecked == true;
+        try
+        {
+            _startupService.SetEnabled(enabled);
+            _workingSettings.StartWithWindows = enabled;
+            SaveWorkingSettingsOnly();
+        }
+        catch (Exception ex)
+        {
+            _isSyncingStartupToggle = true;
+            try
+            {
+                StartWithWindowsSwitch.IsChecked = !enabled;
             }
+            finally
+            {
+                _isSyncingStartupToggle = false;
+            }
+
+            EngineStatusDetailText.Text = $"Błąd zmiany autostartu Windows: {ex.Message}";
+        }
+    }
+
+    private void StartRecordingOnLaunchSwitch_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_isInitializing || _isDetached)
+        {
+            return;
+        }
+
+        _workingSettings.StartRecordingOnLaunch = StartRecordingOnLaunchSwitch.IsChecked == true;
+        SaveWorkingSettingsOnly();
+    }
+
+    private void SaveWorkingSettingsOnly()
+    {
+        try
+        {
+            _workingSettings.Normalize();
+            _settingsService.Save(_workingSettings);
         }
         catch (Exception ex)
         {
             if (!_isDetached)
             {
-                SaveFeedbackText.Text = $"Błąd zapisu: {ex.Message}";
+                EngineStatusDetailText.Text = $"Błąd zapisu ustawień: {ex.Message}";
+            }
+        }
+    }
+
+    private Task SaveAndApplySettingsAsync()
+    {
+        SaveWorkingSettingsOnly();
+        return ApplyEngineSettingsAsync();
+    }
+
+    private async Task ApplyEngineSettingsAsync()
+    {
+        if (_isDetached)
+        {
+            return;
+        }
+
+        if (_isApplyingEngineUpdate)
+        {
+            _hasPendingEngineUpdate = true;
+            return;
+        }
+
+        _isApplyingEngineUpdate = true;
+        try
+        {
+            do
+            {
+                _hasPendingEngineUpdate = false;
+                AppSettings snapshot = _workingSettings.Clone();
+                snapshot.Normalize();
+                await _replayEngine.UpdateSettingsAsync(snapshot);
+            }
+            while (_hasPendingEngineUpdate && !_isDetached);
+        }
+        catch (Exception ex)
+        {
+            if (!_isDetached)
+            {
+                UpdateEngineControls(_replayEngine.IsRecording, $"Błąd stosowania ustawień: {ex.Message}");
             }
         }
         finally
         {
-            if (!_isDetached)
-            {
-                SaveSettingsButton.IsEnabled = true;
-            }
+            _isApplyingEngineUpdate = false;
         }
+    }
+
+    private void UpdateResourceEstimate()
+    {
+        int durationMinutes = Math.Clamp((int)Math.Round(DurationSlider.Value), 1, 10);
+        DurationValueText.Text = $"{durationMinutes} min";
+
+        ResolutionPreset resolution = _workingSettings.Resolution;
+        int fps = _workingSettings.Fps;
+
+        ResourceEstimate estimate = _resourceEstimatorService.Estimate(durationMinutes, resolution, fps);
+        CultureInfo polishCulture = CultureInfo.GetCultureInfo("pl-PL");
+
+        RamEstimateText.Text = string.Format(polishCulture, "~{0:0} MB", estimate.EstimatedRamUsageMb);
+        DiskEstimateText.Text = string.Format(polishCulture, "~{0:0} MB", estimate.EstimatedDiskSizeMb);
+        BitrateEstimateText.Text = string.Format(polishCulture, "{0:0.0} Mbps", estimate.VideoBitrateMbps);
+    }
+
+    private void FilenamePreviewTimer_Tick(object? sender, EventArgs e)
+    {
+        UpdateFilenamePreview();
+    }
+
+    private void UpdateFilenamePreview()
+    {
+        string exampleName = DateTime.Now.ToString("ssmmHHddMMyyyy", CultureInfo.InvariantCulture) + ".mp4";
+        FilenamePreviewText.Text = $"Format nazwy: sekmingodzdzienmiesrok.mp4 (np. {exampleName})";
     }
 
     private async void SaveReplayButton_Click(object sender, RoutedEventArgs e)
@@ -332,7 +539,7 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                SaveFeedbackText.Text = $"Błąd zapisu powtórki: {ex.Message}";
+                EngineStatusDetailText.Text = $"Błąd zapisu powtórki: {ex.Message}";
             }
         }
         finally
@@ -362,8 +569,7 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                SaveFeedbackText.Text = $"Błąd zmiany stanu nagrywania: {ex.Message}";
-                UpdateEngineControls(_replayEngine.IsRecording, null);
+                UpdateEngineControls(_replayEngine.IsRecording, $"Błąd zmiany stanu nagrywania: {ex.Message}");
             }
         }
         finally
@@ -414,14 +620,23 @@ public partial class SettingsPage : Page
 
     private void UpdateEngineControls(bool isRecording, string? status)
     {
-        EngineStatusText.Text = status ?? (isRecording
-            ? "Nagrywanie aktywne"
-            : "Nagrywanie wstrzymane");
-        ToggleRecordingButton.Content = isRecording ? "Wstrzymaj nagrywanie" : "Wznów nagrywanie";
+        StatusDot.Fill = isRecording ? RecordingDotBrush : PausedDotBrush;
+        EngineStatusTitleText.Text = isRecording ? "Nagrywanie w tle aktywne" : "Wstrzymano";
+        EngineStatusDetailText.Text = !string.IsNullOrWhiteSpace(status)
+            ? status
+            : (isRecording
+                ? "Bufor w pamięci RAM zapisuje wideo i dźwięk w tle."
+                : "Nagrywanie w tle jest wstrzymane.");
+
+        ToggleRecordingButton.Content = isRecording ? "Wstrzymaj" : "Wznów";
+        ToggleRecordingButton.Icon = new SymbolIcon(isRecording ? SymbolRegular.Pause24 : SymbolRegular.Play24);
         SaveReplayButton.IsEnabled = isRecording;
     }
 
-    private sealed record ResolutionOption(string Label, ResolutionPreset Value);
-
-    private sealed record FpsOption(string Label, int Value);
+    private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)
+    {
+        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
+        brush.Freeze();
+        return brush;
+    }
 }

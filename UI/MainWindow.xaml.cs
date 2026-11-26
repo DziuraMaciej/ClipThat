@@ -22,6 +22,7 @@ public partial class MainWindow : FluentWindow
         AudioDeviceService audioDeviceService,
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
+        GlobalHotkeyService globalHotkeyService,
         IReplayEngine replayEngine)
     {
         InitializeComponent();
@@ -34,6 +35,7 @@ public partial class MainWindow : FluentWindow
             audioDeviceService,
             resourceEstimatorService,
             startupService,
+            globalHotkeyService,
             replayEngine);
 
         RootNavigation.SetPageProviderService(_pageProvider);
@@ -58,6 +60,7 @@ public partial class MainWindow : FluentWindow
         AudioDeviceService audioDeviceService,
         ResourceEstimatorService resourceEstimatorService,
         StartupService startupService,
+        GlobalHotkeyService globalHotkeyService,
         IReplayEngine replayEngine) : INavigationViewPageProvider
     {
         private SettingsPage? _settingsPage;
@@ -73,6 +76,7 @@ public partial class MainWindow : FluentWindow
                     audioDeviceService,
                     resourceEstimatorService,
                     startupService,
+                    globalHotkeyService,
                     replayEngine);
             }
 

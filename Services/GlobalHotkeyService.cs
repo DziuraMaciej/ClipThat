@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Threading;
 
@@ -82,17 +83,62 @@ public sealed class GlobalHotkeyService : IDisposable
 
         if (virtualKey != 0)
         {
-            string keyLabel = virtualKey switch
-            {
-                >= 0x70u and <= 0x87u => $"F{virtualKey - 0x6Fu}",
-                >= 0x30u and <= 0x39u => ((char)virtualKey).ToString(),
-                >= 0x41u and <= 0x5Au => ((char)virtualKey).ToString(),
-                _ => $"VK_0x{virtualKey:X2}"
-            };
+            string keyLabel = FormatVirtualKey(virtualKey);
             parts.Add(keyLabel);
         }
 
         return parts.Count > 0 ? string.Join(" + ", parts) : "Brak";
+    }
+
+    private static string FormatVirtualKey(uint virtualKey)
+    {
+        return virtualKey switch
+        {
+            >= 0x70u and <= 0x87u => $"F{virtualKey - 0x6Fu}",
+            >= 0x30u and <= 0x39u => ((char)virtualKey).ToString(),
+            >= 0x41u and <= 0x5Au => ((char)virtualKey).ToString(),
+            >= 0x60u and <= 0x69u => $"Num {virtualKey - 0x60u}",
+            0x6Au => "Num *",
+            0x6Bu => "Num +",
+            0x6Du => "Num -",
+            0x6Eu => "Num .",
+            0x6Fu => "Num /",
+            0x20u => "Spacja",
+            0x08u => "Backspace",
+            0x09u => "Tab",
+            0x0Du => "Enter",
+            0x2Cu => "PrintScreen",
+            0x13u => "Pause",
+            0x91u => "ScrollLock",
+            0x2Du => "Insert",
+            0x2Eu => "Delete",
+            0x24u => "Home",
+            0x23u => "End",
+            0x21u => "PageUp",
+            0x22u => "PageDown",
+            0x25u => "←",
+            0x26u => "↑",
+            0x27u => "→",
+            0x28u => "↓",
+            0xBAu => ";",
+            0xBBu => "=",
+            0xBCu => ",",
+            0xBDu => "-",
+            0xBEu => ".",
+            0xBFu => "/",
+            0xC0u => "`",
+            0xDBu => "[",
+            0xDCu => "\\",
+            0xDDu => "]",
+            0xDEu => "'",
+            _ => FormatFallbackVirtualKey(virtualKey)
+        };
+    }
+
+    private static string FormatFallbackVirtualKey(uint virtualKey)
+    {
+        Key key = KeyInterop.KeyFromVirtualKey((int)virtualKey);
+        return key != Key.None ? key.ToString() : $"VK_0x{virtualKey:X2}";
     }
 
     private void CreateMessageWindow()

@@ -10,8 +10,9 @@ namespace ClipThat.Engine.Buffer;
 public enum MediaTrackType
 {
     Video = 0,
-    SystemAudio = 1,
-    MicrophoneAudio = 2
+    CombinedMixAudio = 1,
+    SystemAudio = 2,
+    MicrophoneAudio = 3
 }
 
 /// <summary>
@@ -157,12 +158,14 @@ public sealed class EncodedPacketSnapshot : IReadOnlyList<EncodedPacket>, IDispo
         List<EncodedPacket> packets,
         byte[]? videoSequenceHeader,
         byte[]? systemAudioUserData = null,
-        byte[]? microphoneAudioUserData = null)
+        byte[]? microphoneAudioUserData = null,
+        byte[]? combinedMixAudioUserData = null)
     {
         _packets = packets;
         VideoSequenceHeader = videoSequenceHeader;
         SystemAudioUserData = systemAudioUserData;
         MicrophoneAudioUserData = microphoneAudioUserData;
+        CombinedMixAudioUserData = combinedMixAudioUserData;
 
         long totalBytes = 0;
         for (int i = 0; i < packets.Count; i++)
@@ -178,6 +181,8 @@ public sealed class EncodedPacketSnapshot : IReadOnlyList<EncodedPacket>, IDispo
     public byte[]? SystemAudioUserData { get; }
 
     public byte[]? MicrophoneAudioUserData { get; }
+
+    public byte[]? CombinedMixAudioUserData { get; }
 
     public long TotalBytes { get; }
 
@@ -246,6 +251,7 @@ public sealed class MediaRingBuffer : IDisposable
     private long _bufferedBytes;
     private long _lastMemoryCheckTickMs;
     private byte[]? _videoSequenceHeader;
+    private byte[]? _combinedMixAudioUserData;
     private byte[]? _systemAudioUserData;
     private byte[]? _microphoneAudioUserData;
     private int _disposed;
@@ -353,7 +359,7 @@ public sealed class MediaRingBuffer : IDisposable
             return;
         }
 
-        if (trackType is not (MediaTrackType.SystemAudio or MediaTrackType.MicrophoneAudio))
+        if (trackType is not (MediaTrackType.CombinedMixAudio or MediaTrackType.SystemAudio or MediaTrackType.MicrophoneAudio))
         {
             return;
         }
@@ -367,13 +373,17 @@ public sealed class MediaRingBuffer : IDisposable
                 return;
             }
 
-            if (trackType == MediaTrackType.SystemAudio)
+            switch (trackType)
             {
-                _systemAudioUserData = copy;
-            }
-            else
-            {
-                _microphoneAudioUserData = copy;
+                case MediaTrackType.CombinedMixAudio:
+                    _combinedMixAudioUserData = copy;
+                    break;
+                case MediaTrackType.SystemAudio:
+                    _systemAudioUserData = copy;
+                    break;
+                case MediaTrackType.MicrophoneAudio:
+                    _microphoneAudioUserData = copy;
+                    break;
             }
         }
         finally
@@ -467,7 +477,7 @@ public sealed class MediaRingBuffer : IDisposable
     }
 
     /// <summary>
-    /// Extension point for Step 2B audio encoders to enqueue encoded system or microphone audio packets.
+    /// Enqueues encoded combined-mix, system, or microphone audio packets into the ring buffer.
     /// </summary>
     public void AddAudioPacket(
         MediaTrackType trackType,
@@ -476,10 +486,10 @@ public sealed class MediaRingBuffer : IDisposable
         long timestamp100Ns,
         long duration100Ns)
     {
-        if (trackType is not (MediaTrackType.SystemAudio or MediaTrackType.MicrophoneAudio))
+        if (trackType is not (MediaTrackType.CombinedMixAudio or MediaTrackType.SystemAudio or MediaTrackType.MicrophoneAudio))
         {
             ArrayPool<byte>.Shared.Return(rentedBuffer);
-            throw new ArgumentException("Oczekiwano ścieżki audio (SystemAudio lub MicrophoneAudio).", nameof(trackType));
+            throw new ArgumentException("Oczekiwano ścieżki audio (CombinedMixAudio, SystemAudio lub MicrophoneAudio).", nameof(trackType));
         }
 
         var packet = new EncodedPacket(
@@ -513,7 +523,8 @@ public sealed class MediaRingBuffer : IDisposable
                     new List<EncodedPacket>(),
                     _videoSequenceHeader?.ToArray(),
                     _systemAudioUserData?.ToArray(),
-                    _microphoneAudioUserData?.ToArray());
+                    _microphoneAudioUserData?.ToArray(),
+                    _combinedMixAudioUserData?.ToArray());
             }
 
             LinkedListNode<EncodedPacket>? firstKeyframeNode = FindFirstVideoKeyframeLocked();
@@ -523,7 +534,8 @@ public sealed class MediaRingBuffer : IDisposable
                     new List<EncodedPacket>(),
                     _videoSequenceHeader?.ToArray(),
                     _systemAudioUserData?.ToArray(),
-                    _microphoneAudioUserData?.ToArray());
+                    _microphoneAudioUserData?.ToArray(),
+                    _combinedMixAudioUserData?.ToArray());
             }
 
             long keyframeTimestamp = firstKeyframeNode.Value.Timestamp100Ns;
@@ -556,7 +568,8 @@ public sealed class MediaRingBuffer : IDisposable
                     retained,
                     _videoSequenceHeader?.ToArray(),
                     _systemAudioUserData?.ToArray(),
-                    _microphoneAudioUserData?.ToArray());
+                    _microphoneAudioUserData?.ToArray(),
+                    _combinedMixAudioUserData?.ToArray());
             }
             catch
             {
@@ -589,6 +602,7 @@ public sealed class MediaRingBuffer : IDisposable
         {
             ClearLocked();
             _videoSequenceHeader = null;
+            _combinedMixAudioUserData = null;
             _systemAudioUserData = null;
             _microphoneAudioUserData = null;
         }
@@ -610,6 +624,7 @@ public sealed class MediaRingBuffer : IDisposable
         {
             ClearLocked();
             _videoSequenceHeader = null;
+            _combinedMixAudioUserData = null;
             _systemAudioUserData = null;
             _microphoneAudioUserData = null;
         }

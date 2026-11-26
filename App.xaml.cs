@@ -212,12 +212,18 @@ public partial class App : Application
             return;
         }
 
+        if (_globalHotkeyService is null)
+        {
+            InitializeGlobalHotkey(_settingsService.Load());
+        }
+
         _mainWindow = new MainWindow(
             _settingsService,
             _displayService,
             _audioDeviceService,
             _resourceEstimatorService,
             _startupService,
+            _globalHotkeyService!,
             _replayEngine);
         _mainWindow.Closed += OnMainWindowClosed;
         _mainWindow.Show();

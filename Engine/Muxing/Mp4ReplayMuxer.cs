@@ -19,14 +19,17 @@ public sealed class Mp4ReplayMuxer
         (DualAudioCaptureService.AacFrameSampleCount * TimeSpan.TicksPerSecond) / DualAudioCaptureService.TargetSampleRate;
 
     /// <summary>
-    /// Deterministic MP4 track registration order:
+    /// Deterministic MP4 track registration order (OBS-style 3-track layout when microphone is active):
     /// Stream 0: H.264 Video,
-    /// Stream 1: System Audio (first audio track so standard players and Discord play system sound by default),
-    /// Stream 2: Microphone Audio (second audio track).
+    /// Stream 1: Combined Mix Audio (default audio track for Discord, browsers, Windows Media Player),
+    /// Stream 2: Isolated System Audio,
+    /// Stream 3: Isolated Microphone Audio.
+    /// When microphone capture is disabled or absent, System Audio is registered directly as Stream 1.
     /// </summary>
     private static readonly MediaTrackType[] DeterministicTrackOrder =
     {
         MediaTrackType.Video,
+        MediaTrackType.CombinedMixAudio,
         MediaTrackType.SystemAudio,
         MediaTrackType.MicrophoneAudio
     };
@@ -78,6 +81,7 @@ public sealed class Mp4ReplayMuxer
 
         long baseTimestamp100Ns = snapshot[firstKeyframeIndex].Timestamp100Ns;
         var orderedPackets = new List<IndexedPacket>(snapshot.Count - firstKeyframeIndex);
+        bool hasCombinedMixAudio = false;
         bool hasSystemAudio = false;
         bool hasMicrophoneAudio = false;
 
@@ -96,6 +100,10 @@ public sealed class Mp4ReplayMuxer
                     continue;
                 }
             }
+            else if (packet.TrackType == MediaTrackType.CombinedMixAudio)
+            {
+                hasCombinedMixAudio = true;
+            }
             else if (packet.TrackType == MediaTrackType.SystemAudio)
             {
                 hasSystemAudio = true;
@@ -113,8 +121,12 @@ public sealed class Mp4ReplayMuxer
             throw new InvalidOperationException("Brak pakietów wideo do zapisania w pliku MP4.");
         }
 
+        // Only include the 3-track layout (CombinedMix + System + Mic) when microphone packets are present;
+        // otherwise fall back to SystemAudio as Stream 1.
+        bool includeCombinedMix = hasMicrophoneAudio && hasCombinedMixAudio;
+
         // Stable timestamp ordering ensures smooth MP4 interleaving across video and audio streams
-        // while preserving deterministic track priority (Video -> SystemAudio -> MicrophoneAudio)
+        // while preserving deterministic track priority (Video -> CombinedMixAudio -> SystemAudio -> MicrophoneAudio)
         // and exact encoder packet order within each track.
         orderedPackets.Sort(static (a, b) =>
         {
@@ -143,6 +155,7 @@ public sealed class Mp4ReplayMuxer
         IMFAttributes? sinkAttributes = null;
         IMFSinkWriter? sinkWriter = null;
         IMFMediaType? videoMediaType = null;
+        IMFMediaType? combinedMixAudioMediaType = null;
         IMFMediaType? systemAudioMediaType = null;
         IMFMediaType? microphoneAudioMediaType = null;
 
@@ -160,9 +173,14 @@ public sealed class Mp4ReplayMuxer
 
             // Register streams in strict deterministic order:
             // Stream 0: H.264 Video
-            // Stream 1: System Audio (MediaTrackType.SystemAudio — first audio track for players & Discord)
-            // Stream 2: Microphone Audio (MediaTrackType.MicrophoneAudio — secondary audio track)
+            // When microphone packets are present:
+            //   Stream 1: Combined Mix Audio (default track for Discord, browsers, Media Player)
+            //   Stream 2: System Audio
+            //   Stream 3: Microphone Audio
+            // Otherwise:
+            //   Stream 1: System Audio
             int videoStreamIndex = -1;
+            int combinedMixAudioStreamIndex = -1;
             int systemAudioStreamIndex = -1;
             int microphoneAudioStreamIndex = -1;
 
@@ -175,6 +193,18 @@ public sealed class Mp4ReplayMuxer
                         videoStreamIndex = sinkWriter.AddStream(videoMediaType);
                         sinkWriter.SetInputMediaType(videoStreamIndex, videoMediaType, null);
                         break;
+
+                    case MediaTrackType.CombinedMixAudio when includeCombinedMix:
+                    {
+                        byte[] mixUserData = snapshot.CombinedMixAudioUserData is { Length: > 0 }
+                            ? snapshot.CombinedMixAudioUserData
+                            : DefaultAac48kStereoUserData;
+
+                        combinedMixAudioMediaType = CreateAacMediaType(mixUserData);
+                        combinedMixAudioStreamIndex = sinkWriter.AddStream(combinedMixAudioMediaType);
+                        sinkWriter.SetInputMediaType(combinedMixAudioStreamIndex, combinedMixAudioMediaType, null);
+                        break;
+                    }
 
                     case MediaTrackType.SystemAudio when hasSystemAudio:
                     {
@@ -203,16 +233,19 @@ public sealed class Mp4ReplayMuxer
             }
 
             if (videoStreamIndex != 0 ||
-                (hasSystemAudio && systemAudioStreamIndex != 1) ||
-                (hasSystemAudio && hasMicrophoneAudio && microphoneAudioStreamIndex != 2))
+                (includeCombinedMix && combinedMixAudioStreamIndex != 1) ||
+                (includeCombinedMix && hasSystemAudio && systemAudioStreamIndex != 2) ||
+                (includeCombinedMix && hasSystemAudio && hasMicrophoneAudio && microphoneAudioStreamIndex != 3) ||
+                (!includeCombinedMix && hasSystemAudio && systemAudioStreamIndex != 1))
             {
                 throw new InvalidOperationException(
-                    $"Nieoczekiwana kolejność strumieni MP4 (Video={videoStreamIndex}, SystemAudio={systemAudioStreamIndex}, MicrophoneAudio={microphoneAudioStreamIndex}).");
+                    $"Nieoczekiwana kolejność strumieni MP4 (Video={videoStreamIndex}, CombinedMix={combinedMixAudioStreamIndex}, SystemAudio={systemAudioStreamIndex}, MicrophoneAudio={microphoneAudioStreamIndex}).");
             }
 
             sinkWriter.BeginWriting();
 
             long lastVideoTimestamp = -1;
+            long lastCombinedMixAudioTimestamp = -1;
             long lastSystemAudioTimestamp = -1;
             long lastMicAudioTimestamp = -1;
 
@@ -229,6 +262,12 @@ public sealed class Mp4ReplayMuxer
                         targetStreamIndex = videoStreamIndex;
                         sampleTime100Ns = EnsureStrictlyMonotonic(sampleTime100Ns, ref lastVideoTimestamp);
                         sampleDuration100Ns = packet.Duration100Ns > 0 ? packet.Duration100Ns : defaultVideoDuration100Ns;
+                        break;
+
+                    case MediaTrackType.CombinedMixAudio when combinedMixAudioStreamIndex >= 0:
+                        targetStreamIndex = combinedMixAudioStreamIndex;
+                        sampleTime100Ns = EnsureStrictlyMonotonic(sampleTime100Ns, ref lastCombinedMixAudioTimestamp);
+                        sampleDuration100Ns = packet.Duration100Ns > 0 ? packet.Duration100Ns : DefaultAacDuration100Ns;
                         break;
 
                     case MediaTrackType.SystemAudio when systemAudioStreamIndex >= 0:
@@ -259,6 +298,7 @@ public sealed class Mp4ReplayMuxer
             SafeDispose(sinkWriter);
             SafeDispose(microphoneAudioMediaType);
             SafeDispose(systemAudioMediaType);
+            SafeDispose(combinedMixAudioMediaType);
             SafeDispose(videoMediaType);
             SafeDispose(sinkAttributes);
 
@@ -489,9 +529,10 @@ public sealed class Mp4ReplayMuxer
     private static int GetTrackOrderPriority(MediaTrackType trackType) => trackType switch
     {
         MediaTrackType.Video => 0,
-        MediaTrackType.SystemAudio => 1,
-        MediaTrackType.MicrophoneAudio => 2,
-        _ => 3
+        MediaTrackType.CombinedMixAudio => 1,
+        MediaTrackType.SystemAudio => 2,
+        MediaTrackType.MicrophoneAudio => 3,
+        _ => 4
     };
 
     private readonly record struct IndexedPacket(EncodedPacket Packet, int OriginalIndex);
