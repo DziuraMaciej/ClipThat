@@ -153,10 +153,16 @@ public sealed class EncodedPacketSnapshot : IReadOnlyList<EncodedPacket>, IDispo
     private readonly List<EncodedPacket> _packets;
     private int _disposed;
 
-    internal EncodedPacketSnapshot(List<EncodedPacket> packets, byte[]? videoSequenceHeader)
+    internal EncodedPacketSnapshot(
+        List<EncodedPacket> packets,
+        byte[]? videoSequenceHeader,
+        byte[]? systemAudioUserData = null,
+        byte[]? microphoneAudioUserData = null)
     {
         _packets = packets;
         VideoSequenceHeader = videoSequenceHeader;
+        SystemAudioUserData = systemAudioUserData;
+        MicrophoneAudioUserData = microphoneAudioUserData;
 
         long totalBytes = 0;
         for (int i = 0; i < packets.Count; i++)
@@ -168,6 +174,10 @@ public sealed class EncodedPacketSnapshot : IReadOnlyList<EncodedPacket>, IDispo
     }
 
     public byte[]? VideoSequenceHeader { get; }
+
+    public byte[]? SystemAudioUserData { get; }
+
+    public byte[]? MicrophoneAudioUserData { get; }
 
     public long TotalBytes { get; }
 
@@ -236,6 +246,8 @@ public sealed class MediaRingBuffer : IDisposable
     private long _bufferedBytes;
     private long _lastMemoryCheckTickMs;
     private byte[]? _videoSequenceHeader;
+    private byte[]? _systemAudioUserData;
+    private byte[]? _microphoneAudioUserData;
     private int _disposed;
 
     public MediaRingBuffer(int bufferDurationMinutes = 5)
@@ -323,6 +335,46 @@ public sealed class MediaRingBuffer : IDisposable
             }
 
             _videoSequenceHeader = copy;
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Stores the latest AAC <c>MF_MT_USER_DATA</c> (<c>HEAACWAVEINFO</c> + <c>AudioSpecificConfig</c>)
+    /// codec configuration blob for the given audio track so the MP4 muxer can write an exact <c>esds</c> box.
+    /// </summary>
+    public void SetAudioUserData(MediaTrackType trackType, ReadOnlySpan<byte> userData)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || userData.IsEmpty)
+        {
+            return;
+        }
+
+        if (trackType is not (MediaTrackType.SystemAudio or MediaTrackType.MicrophoneAudio))
+        {
+            return;
+        }
+
+        byte[] copy = userData.ToArray();
+        _lock.EnterWriteLock();
+        try
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            if (trackType == MediaTrackType.SystemAudio)
+            {
+                _systemAudioUserData = copy;
+            }
+            else
+            {
+                _microphoneAudioUserData = copy;
+            }
         }
         finally
         {
@@ -457,13 +509,21 @@ public sealed class MediaRingBuffer : IDisposable
         {
             if (Volatile.Read(ref _disposed) != 0 || _packets.Count == 0)
             {
-                return new EncodedPacketSnapshot(new List<EncodedPacket>(), _videoSequenceHeader?.ToArray());
+                return new EncodedPacketSnapshot(
+                    new List<EncodedPacket>(),
+                    _videoSequenceHeader?.ToArray(),
+                    _systemAudioUserData?.ToArray(),
+                    _microphoneAudioUserData?.ToArray());
             }
 
             LinkedListNode<EncodedPacket>? firstKeyframeNode = FindFirstVideoKeyframeLocked();
             if (firstKeyframeNode is null)
             {
-                return new EncodedPacketSnapshot(new List<EncodedPacket>(), _videoSequenceHeader?.ToArray());
+                return new EncodedPacketSnapshot(
+                    new List<EncodedPacket>(),
+                    _videoSequenceHeader?.ToArray(),
+                    _systemAudioUserData?.ToArray(),
+                    _microphoneAudioUserData?.ToArray());
             }
 
             long keyframeTimestamp = firstKeyframeNode.Value.Timestamp100Ns;
@@ -492,7 +552,11 @@ public sealed class MediaRingBuffer : IDisposable
                     current = current.Next;
                 }
 
-                return new EncodedPacketSnapshot(retained, _videoSequenceHeader?.ToArray());
+                return new EncodedPacketSnapshot(
+                    retained,
+                    _videoSequenceHeader?.ToArray(),
+                    _systemAudioUserData?.ToArray(),
+                    _microphoneAudioUserData?.ToArray());
             }
             catch
             {
@@ -525,6 +589,8 @@ public sealed class MediaRingBuffer : IDisposable
         {
             ClearLocked();
             _videoSequenceHeader = null;
+            _systemAudioUserData = null;
+            _microphoneAudioUserData = null;
         }
         finally
         {
@@ -544,6 +610,8 @@ public sealed class MediaRingBuffer : IDisposable
         {
             ClearLocked();
             _videoSequenceHeader = null;
+            _systemAudioUserData = null;
+            _microphoneAudioUserData = null;
         }
         finally
         {

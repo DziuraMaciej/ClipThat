@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.IO;
+using ClipThat.Engine.Audio;
 using ClipThat.Engine.Buffer;
 using ClipThat.Engine.Interop;
+using ClipThat.Engine.Muxing;
 using ClipThat.Engine.Video;
 using ClipThat.Models;
 using ClipThat.Services;
@@ -15,13 +17,15 @@ using Windows.Graphics.DirectX.Direct3D11;
 namespace ClipThat.Engine;
 
 /// <summary>
-/// Real user-mode GPU screen capture, hardware H.264 encoding, and RAM circular buffer replay engine.
+/// Real user-mode GPU screen capture, dual-track WASAPI AAC audio capture, hardware H.264 encoding,
+/// RAM circular buffer, and native Media Foundation MP4 replay muxing engine.
 /// </summary>
 public sealed class ReplayEngine : IReplayEngine
 {
     private const int FramePoolBufferCount = 2;
 
     private readonly ResourceEstimatorService _resourceEstimatorService;
+    private readonly Mp4ReplayMuxer _mp4Muxer = new();
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly MediaRingBuffer _ringBuffer = new();
 
@@ -155,6 +159,14 @@ public sealed class ReplayEngine : IReplayEngine
                 !string.Equals(
                     previous.SelectedMonitorDeviceName,
                     updated.SelectedMonitorDeviceName,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(
+                    previous.SystemAudioDeviceId,
+                    updated.SystemAudioDeviceId,
+                    StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(
+                    previous.MicrophoneDeviceId,
+                    updated.MicrophoneDeviceId,
                     StringComparison.OrdinalIgnoreCase);
 
             if (requiresPipelineRestart)
@@ -188,7 +200,8 @@ public sealed class ReplayEngine : IReplayEngine
 
     /// <summary>
     /// Captures a non-blocking snapshot of the ring buffer from the oldest valid IDR keyframe
-    /// and writes the elementary Annex-B H.264 stream to disk (MP4 muxing will be wired in Step 2C).
+    /// and remuxes compressed H.264 video + dual-track AAC audio into a native <c>.mp4</c> file on a background thread
+    /// without interrupting ongoing capture.
     /// </summary>
     public async Task<string?> SaveReplayAsync()
     {
@@ -199,6 +212,10 @@ public sealed class ReplayEngine : IReplayEngine
 
         string? outputDirectory;
         bool isRecordingSnapshot;
+        int targetWidth = 0;
+        int targetHeight = 0;
+        int targetFps = 60;
+        uint targetBitrateBps = 0;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -210,6 +227,21 @@ public sealed class ReplayEngine : IReplayEngine
 
             isRecordingSnapshot = _isRecording;
             outputDirectory = _currentSettings?.OutputDirectory;
+
+            if (_activeSession is not null)
+            {
+                targetWidth = _activeSession.Encoder.OutputWidth;
+                targetHeight = _activeSession.Encoder.OutputHeight;
+                targetFps = _activeSession.Encoder.TargetFps;
+                targetBitrateBps = _activeSession.Encoder.TargetBitrateBps;
+            }
+            else if (_currentSettings is not null)
+            {
+                (targetWidth, targetHeight) = GpuVideoProcessor.GetTargetDimensions(_currentSettings.Resolution);
+                targetFps = _currentSettings.Fps;
+                double bitrateMbps = _resourceEstimatorService.GetVideoBitrateMbps(_currentSettings.Resolution, targetFps);
+                targetBitrateBps = (uint)Math.Clamp((long)Math.Round(bitrateMbps * 1_000_000.0), 250_000L, 100_000_000L);
+            }
         }
         finally
         {
@@ -222,45 +254,30 @@ public sealed class ReplayEngine : IReplayEngine
             return null;
         }
 
-        using EncodedPacketSnapshot snapshot = _ringBuffer.SnapshotPackets();
+        EncodedPacketSnapshot snapshot = _ringBuffer.SnapshotPackets();
         if (snapshot.Count == 0)
         {
+            snapshot.Dispose();
             StatusChanged?.Invoke("Bufor powtórki nie zawiera jeszcze gotowej klatki kluczowej");
             return null;
         }
 
-        Directory.CreateDirectory(outputDirectory);
-        string fileName = $"ClipThat_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.h264";
-        string outputFilePath = Path.Combine(outputDirectory, fileName);
-
-        await using (var fileStream = new FileStream(
-            outputFilePath,
-            FileMode.Create,
-            FileAccess.Write,
-            FileShare.Read,
-            bufferSize: 64 * 1024,
-            useAsync: true))
+        string outputFilePath = await Task.Run(() =>
         {
-            if (snapshot.VideoSequenceHeader is { Length: > 0 } sequenceHeader)
+            using (snapshot)
             {
-                await fileStream.WriteAsync(sequenceHeader).ConfigureAwait(false);
+                return _mp4Muxer.MuxToMp4(
+                    snapshot,
+                    outputDirectory,
+                    targetWidth,
+                    targetHeight,
+                    targetFps,
+                    targetBitrateBps);
             }
+        }).ConfigureAwait(false);
 
-            for (int i = 0; i < snapshot.Count; i++)
-            {
-                EncodedPacket packet = snapshot[i];
-                if (packet.TrackType != MediaTrackType.Video || packet.Length <= 0)
-                {
-                    continue;
-                }
-
-                await fileStream.WriteAsync(packet.Buffer.AsMemory(0, packet.Length)).ConfigureAwait(false);
-            }
-
-            await fileStream.FlushAsync().ConfigureAwait(false);
-        }
-
-        StatusChanged?.Invoke($"Zapisano bufor H.264: {fileName}");
+        string fileName = Path.GetFileName(outputFilePath);
+        StatusChanged?.Invoke($"Zapisano powtórkę: {fileName}");
         ReplaySaved?.Invoke(outputFilePath);
         return outputFilePath;
     }
@@ -321,9 +338,12 @@ public sealed class ReplayEngine : IReplayEngine
         GraphicsCaptureItem? captureItem = null;
         Direct3D11CaptureFramePool? framePool = null;
         GraphicsCaptureSession? captureSession = null;
+        DualAudioCaptureService? audioCapture = null;
 
         try
         {
+            var sharedSessionClock = new Stopwatch();
+
             gpuProcessor = new GpuVideoProcessor(settings.Resolution, settings.Fps);
             direct3DDevice = CaptureInterop.CreateDirect3DDevice(gpuProcessor.Device);
 
@@ -352,14 +372,22 @@ public sealed class ReplayEngine : IReplayEngine
             captureSession = framePool.CreateCaptureSession(captureItem);
             ConfigureCaptureSessionOptions(captureSession);
 
+            audioCapture = new DualAudioCaptureService(
+                sharedSessionClock,
+                _ringBuffer,
+                settings.SystemAudioDeviceId,
+                settings.MicrophoneDeviceId);
+
             var pipeline = new CapturePipelineSession(
                 settings.Fps,
+                sharedSessionClock,
                 gpuProcessor,
                 direct3DDevice,
                 encoder,
                 captureItem,
                 framePool,
                 captureSession,
+                audioCapture,
                 initialSize,
                 OnSessionClosed,
                 OnActivePipelineFault);
@@ -369,6 +397,7 @@ public sealed class ReplayEngine : IReplayEngine
         }
         catch
         {
+            audioCapture?.Dispose();
             captureSession?.Dispose();
             framePool?.Dispose();
             encoder?.Dispose();
@@ -512,26 +541,31 @@ public sealed class ReplayEngine : IReplayEngine
     }
 
     /// <summary>
-    /// Encapsulates one live WGC + D3D11 + H.264 encoder session with deterministic teardown synchronization
-    /// so no <see cref="Direct3D11CaptureFramePool.FrameArrived"/> callback can ever access disposed GPU objects.
+    /// Encapsulates one live WGC + D3D11 + H.264 encoder + dual-track WASAPI AAC session on a single shared
+    /// <see cref="Stopwatch"/> epoch with deterministic teardown synchronization so no callback can ever
+    /// access disposed GPU or COM resources.
     /// </summary>
     private sealed class CapturePipelineSession : IDisposable
     {
+        private const long ClockReanchorThresholdTicks = 250 * TimeSpan.TicksPerMillisecond;
+
         private readonly long _frameIntervalTicks;
         private readonly long _pacingToleranceTicks;
+        private readonly Stopwatch _sessionClock;
         private readonly GpuVideoProcessor _gpuProcessor;
         private readonly IDirect3DDevice _direct3DDevice;
         private readonly HardwareH264Encoder _encoder;
         private readonly GraphicsCaptureItem _captureItem;
         private readonly Direct3D11CaptureFramePool _framePool;
         private readonly GraphicsCaptureSession _captureSession;
+        private readonly DualAudioCaptureService _audioCapture;
         private readonly Action<CapturePipelineSession> _onClosed;
         private readonly Action<Exception> _onFault;
         private readonly ManualResetEventSlim _frameIdleEvent = new(initialState: true);
-        private readonly Stopwatch _sessionClock = new();
 
         private SizeInt32 _lastContentSize;
         private bool _hasFirstFrame;
+        private long _firstFrameClockTicks;
         private long _firstFrameRelativeTicks;
         private long _nextTargetRelativeTicks;
         private long _lastSubmittedTimestamp100Ns = -1;
@@ -542,24 +576,28 @@ public sealed class ReplayEngine : IReplayEngine
 
         public CapturePipelineSession(
             int targetFps,
+            Stopwatch sessionClock,
             GpuVideoProcessor gpuProcessor,
             IDirect3DDevice direct3DDevice,
             HardwareH264Encoder encoder,
             GraphicsCaptureItem captureItem,
             Direct3D11CaptureFramePool framePool,
             GraphicsCaptureSession captureSession,
+            DualAudioCaptureService audioCapture,
             SizeInt32 initialSize,
             Action<CapturePipelineSession> onClosed,
             Action<Exception> onFault)
         {
             _frameIntervalTicks = TimeSpan.TicksPerSecond / targetFps;
             _pacingToleranceTicks = _frameIntervalTicks / 4;
+            _sessionClock = sessionClock;
             _gpuProcessor = gpuProcessor;
             _direct3DDevice = direct3DDevice;
             _encoder = encoder;
             _captureItem = captureItem;
             _framePool = framePool;
             _captureSession = captureSession;
+            _audioCapture = audioCapture;
             _lastContentSize = initialSize;
             _onClosed = onClosed;
             _onFault = onFault;
@@ -571,7 +609,10 @@ public sealed class ReplayEngine : IReplayEngine
         {
             _captureItem.Closed += OnCaptureItemClosed;
             _framePool.FrameArrived += OnFrameArrived;
+
+            // Start the shared timeline epoch once, then launch dual-track audio and video capture simultaneously.
             _sessionClock.Start();
+            _audioCapture.Start();
             _captureSession.StartCapture();
         }
 
@@ -671,17 +712,21 @@ public sealed class ReplayEngine : IReplayEngine
 
         /// <summary>
         /// Phase-accurate frame-rate pacer that cleanly drops excess frames when the monitor refresh rate
-        /// exceeds target 30/60 FPS (e.g. 144Hz/240Hz -> exact 60 FPS without beat-frequency drop).
+        /// exceeds target 30/60 FPS (e.g. 144Hz/240Hz -> exact 60 FPS without beat-frequency drop),
+        /// anchored to the shared <see cref="Stopwatch"/> session timeline so video and audio never drift.
         /// </summary>
         private bool ShouldAcceptFrame(long frameRelativeTicks, out long normalizedTimestamp100Ns)
         {
+            long sessionClockTicks = _sessionClock.Elapsed.Ticks;
+
             if (!_hasFirstFrame)
             {
                 _hasFirstFrame = true;
+                _firstFrameClockTicks = sessionClockTicks;
                 _firstFrameRelativeTicks = frameRelativeTicks;
                 _nextTargetRelativeTicks = frameRelativeTicks + _frameIntervalTicks;
-                _lastSubmittedTimestamp100Ns = 0;
-                normalizedTimestamp100Ns = 0;
+                _lastSubmittedTimestamp100Ns = sessionClockTicks;
+                normalizedTimestamp100Ns = sessionClockTicks;
                 return true;
             }
 
@@ -700,7 +745,15 @@ public sealed class ReplayEngine : IReplayEngine
 
             _nextTargetRelativeTicks = nextTarget;
 
-            long relativeTimestamp = frameRelativeTicks - _firstFrameRelativeTicks;
+            long relativeTimestamp = _firstFrameClockTicks + (frameRelativeTicks - _firstFrameRelativeTicks);
+            if (Math.Abs(relativeTimestamp - sessionClockTicks) > ClockReanchorThresholdTicks)
+            {
+                // System sleep or WGC timestamp discontinuity; smoothly re-anchor to the shared Stopwatch.
+                _firstFrameClockTicks = sessionClockTicks;
+                _firstFrameRelativeTicks = frameRelativeTicks;
+                relativeTimestamp = sessionClockTicks;
+            }
+
             if (relativeTimestamp <= _lastSubmittedTimestamp100Ns)
             {
                 relativeTimestamp = _lastSubmittedTimestamp100Ns + 1;
@@ -759,6 +812,9 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 // Ignore capture session teardown errors.
             }
+
+            // Stop dual audio capture immediately so no further audio packets are enqueued during teardown.
+            SafeDispose(_audioCapture);
 
             // Wait deterministically for any in-flight GPU frame callback before releasing D3D11/MFT resources.
             _frameIdleEvent.Wait(2000);

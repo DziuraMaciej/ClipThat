@@ -112,6 +112,14 @@ public sealed class HardwareH264Encoder : IDisposable
 
     public bool IsAsyncMft => _isAsync;
 
+    public int OutputWidth => _width;
+
+    public int OutputHeight => _height;
+
+    public int TargetFps => _fps;
+
+    public uint TargetBitrateBps => _targetBitrateBps;
+
     /// <summary>
     /// Encodes a single NV12 frame produced by <see cref="GpuVideoProcessor"/>.
     /// Returns <see langword="false"/> if the encoder is stopping or momentarily backlogged.

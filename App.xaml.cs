@@ -15,6 +15,8 @@ namespace ClipThat;
 /// </summary>
 public partial class App : Application
 {
+    private const long HotkeyDebounceMs = 1500;
+
     private readonly SettingsService _settingsService = new();
     private readonly DisplayService _displayService = new();
     private readonly ResourceEstimatorService _resourceEstimatorService = new();
@@ -27,12 +29,15 @@ public partial class App : Application
     }
 
     private MainWindow? _mainWindow;
+    private GlobalHotkeyService? _globalHotkeyService;
     private WinForms.NotifyIcon? _notifyIcon;
     private WinForms.ContextMenuStrip? _trayMenu;
     private WinForms.ToolStripMenuItem? _saveReplayMenuItem;
     private WinForms.ToolStripMenuItem? _toggleRecordingMenuItem;
     private Drawing.Icon? _recordingTrayIcon;
     private Drawing.Icon? _pausedTrayIcon;
+    private long _lastHotkeyTriggerTickMs;
+    private int _hotkeySaveInProgress;
     private bool _isShuttingDown;
 
     protected override async void OnStartup(StartupEventArgs e)
@@ -47,6 +52,7 @@ public partial class App : Application
             _replayEngine.ReplaySaved += OnEngineReplaySaved;
 
             InitializeTrayIcon();
+            InitializeGlobalHotkey(settings);
 
             bool startMinimized = e.Args.Any(arg =>
                 string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
@@ -122,6 +128,69 @@ public partial class App : Application
             Visible = true
         };
         _notifyIcon.DoubleClick += (_, _) => Dispatcher.Invoke(ShowMainWindow);
+    }
+
+    private void InitializeGlobalHotkey(AppSettings settings)
+    {
+        _globalHotkeyService = new GlobalHotkeyService(Dispatcher);
+        _globalHotkeyService.HotkeyPressed += OnGlobalHotkeyPressed;
+
+        bool registered = _globalHotkeyService.UpdateHotkey(settings.HotkeyModifiers, settings.HotkeyVirtualKey);
+        if (!registered)
+        {
+            string hotkeyLabel = GlobalHotkeyService.FormatHotkey(settings.HotkeyModifiers, settings.HotkeyVirtualKey);
+            _notifyIcon?.ShowBalloonTip(
+                4000,
+                "ClipThat",
+                $"Nie udało się zarejestrować skrótu globalnego {hotkeyLabel} — może być używany przez inną aplikację.",
+                WinForms.ToolTipIcon.Warning);
+        }
+    }
+
+    private void OnGlobalHotkeyPressed(object? sender, EventArgs e)
+    {
+        if (_isShuttingDown || !_replayEngine.IsRecording)
+        {
+            return;
+        }
+
+        long nowTickMs = Environment.TickCount64;
+        long previousTickMs = Volatile.Read(ref _lastHotkeyTriggerTickMs);
+        if (previousTickMs != 0 && nowTickMs - previousTickMs < HotkeyDebounceMs)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _hotkeySaveInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
+        Volatile.Write(ref _lastHotkeyTriggerTickMs, nowTickMs);
+        _ = SaveReplayFromHotkeyAsync();
+    }
+
+    private async Task SaveReplayFromHotkeyAsync()
+    {
+        try
+        {
+            await _replayEngine.SaveReplayAsync();
+        }
+        catch (Exception ex)
+        {
+            await Dispatcher.InvokeAsync(() =>
+            {
+                _notifyIcon?.ShowBalloonTip(
+                    3000,
+                    "ClipThat",
+                    $"Nie udało się zapisać powtórki: {ex.Message}",
+                    WinForms.ToolTipIcon.Error);
+            });
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _hotkeySaveInProgress, 0);
+        }
     }
 
     private void ShowMainWindow()
@@ -263,6 +332,13 @@ public partial class App : Application
 
         try
         {
+            if (_globalHotkeyService is not null)
+            {
+                _globalHotkeyService.HotkeyPressed -= OnGlobalHotkeyPressed;
+                _globalHotkeyService.Dispose();
+                _globalHotkeyService = null;
+            }
+
             if (_mainWindow is not null)
             {
                 _mainWindow.Closed -= OnMainWindowClosed;
