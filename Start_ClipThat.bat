@@ -17,4 +17,4 @@ if %errorlevel% neq 0 (
     exit /b 0
 )
 
-start "" /B dotnet run -c Release --no-launch-profile
+start "" /B dotnet run -c Release -m:1 --no-launch-profile

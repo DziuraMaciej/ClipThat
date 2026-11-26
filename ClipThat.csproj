@@ -45,18 +45,10 @@
     </PropertyGroup>
   </Target>
 
-  <Target Name="SignIntermediateOutputs" AfterTargets="CoreCompile" DependsOnTargets="ResolveSignTool" Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
-    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;@(IntermediateAssembly)&quot;"
-          Condition="'$(SignToolPath)' != '' and Exists('$(SignToolPath)') and Exists('@(IntermediateAssembly)')"
-          IgnoreExitCode="true" />
-  </Target>
-
-  <Target Name="SignOutputs" AfterTargets="Build" DependsOnTargets="ResolveSignTool" Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
-    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;$(TargetPath)&quot;"
-          Condition="'$(SignToolPath)' != '' and Exists('$(SignToolPath)') and Exists('$(TargetPath)')"
-          IgnoreExitCode="true" />
-    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;$(TargetDir)$(TargetName).exe&quot;"
-          Condition="'$(SignToolPath)' != '' and Exists('$(SignToolPath)') and Exists('$(TargetDir)$(TargetName).exe')"
-          IgnoreExitCode="true" />
+  <Target Name="SignOutputs" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
+    <PropertyGroup>
+      <SignToolPath>$([System.IO.Directory]::GetFiles('C:\Program Files (x86)\Windows Kits\10\bin', 'signtool.exe', System.IO.SearchOption.AllDirectories)[0])</SignToolPath>
+    </PropertyGroup>
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;$(TargetPath)&quot; &quot;$(TargetDir)$(TargetName).exe&quot;" IgnoreExitCode="true" />
   </Target>
 </Project>
