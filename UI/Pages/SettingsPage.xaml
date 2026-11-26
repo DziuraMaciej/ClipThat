@@ -100,11 +100,12 @@
                                        VerticalAlignment="Center" />
                         </StackPanel>
                         <TextBlock x:Name="EngineStatusDetailText"
-                                   Text="Gotowy do uruchomienia nagrywania w tle."
+                                   Text=""
                                    Foreground="#A8A8A8"
                                    FontSize="12.5"
                                    Margin="18,4,0,0"
-                                   TextWrapping="Wrap" />
+                                   TextWrapping="Wrap"
+                                   Visibility="Collapsed" />
                     </StackPanel>
 
                     <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -115,7 +116,7 @@
                                    Margin="0,0,8,0"
                                    Click="ToggleRecordingButton_Click" />
                         <ui:Button x:Name="SaveReplayButton"
-                                   Content="Zapisz powtórkę teraz"
+                                   Content="Zapisz powtórkę"
                                    Appearance="Primary"
                                    Icon="{ui:SymbolIcon Save24}"
                                    Click="SaveReplayButton_Click">
@@ -243,56 +244,49 @@
                             BorderThickness="1"
                             CornerRadius="8"
                             Padding="14,12">
-                        <StackPanel>
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
 
-                                <StackPanel Grid.Column="0" Margin="0,0,8,0">
-                                    <TextBlock Text="Szacowane zużycie RAM:"
-                                               FontSize="12"
-                                               Foreground="#A8A8A8" />
-                                    <TextBlock x:Name="RamEstimateText"
-                                               Text="~720 MB"
-                                               FontWeight="SemiBold"
-                                               FontSize="15"
-                                               Foreground="#F3F3F3"
-                                               Margin="0,2,0,0" />
-                                </StackPanel>
+                            <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                                <TextBlock Text="Szacowane zużycie RAM:"
+                                           FontSize="12"
+                                           Foreground="#A8A8A8" />
+                                <TextBlock x:Name="RamEstimateText"
+                                           Text="~720 MB"
+                                           FontWeight="SemiBold"
+                                           FontSize="15"
+                                           Foreground="#F3F3F3"
+                                           Margin="0,2,0,0" />
+                            </StackPanel>
 
-                                <StackPanel Grid.Column="1" Margin="0,0,8,0">
-                                    <TextBlock Text="Szacowany rozmiar klipu na dysku:"
-                                               FontSize="12"
-                                               Foreground="#A8A8A8" />
-                                    <TextBlock x:Name="DiskEstimateText"
-                                               Text="~600 MB"
-                                               FontWeight="SemiBold"
-                                               FontSize="15"
-                                               Foreground="#F3F3F3"
-                                               Margin="0,2,0,0" />
-                                </StackPanel>
+                            <StackPanel Grid.Column="1" Margin="0,0,8,0">
+                                <TextBlock Text="Szacowany rozmiar klipu na dysku:"
+                                           FontSize="12"
+                                           Foreground="#A8A8A8" />
+                                <TextBlock x:Name="DiskEstimateText"
+                                           Text="~600 MB"
+                                           FontWeight="SemiBold"
+                                           FontSize="15"
+                                           Foreground="#F3F3F3"
+                                           Margin="0,2,0,0" />
+                            </StackPanel>
 
-                                <StackPanel Grid.Column="2">
-                                    <TextBlock Text="Docelowy bitrate wideo:"
-                                               FontSize="12"
-                                               Foreground="#A8A8A8" />
-                                    <TextBlock x:Name="BitrateEstimateText"
-                                               Text="16,0 Mbps"
-                                               FontWeight="SemiBold"
-                                               FontSize="15"
-                                               Foreground="#F3F3F3"
-                                               Margin="0,2,0,0" />
-                                </StackPanel>
-                            </Grid>
-
-                            <TextBlock Text="Bufor działa w 100% w pamięci RAM (0 MB/s zapisu na dysk w tle)."
-                                       FontSize="12"
-                                       Foreground="#A8A8A8"
-                                       Margin="0,10,0,0" />
-                        </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="Docelowy bitrate wideo:"
+                                           FontSize="12"
+                                           Foreground="#A8A8A8" />
+                                <TextBlock x:Name="BitrateEstimateText"
+                                           Text="16,0 Mbps"
+                                           FontWeight="SemiBold"
+                                           FontSize="15"
+                                           Foreground="#F3F3F3"
+                                           Margin="0,2,0,0" />
+                            </StackPanel>
+                        </Grid>
                     </Border>
                 </StackPanel>
             </ui:Card>
@@ -308,11 +302,6 @@
                                FontWeight="SemiBold"
                                FontSize="15"
                                Foreground="#F3F3F3"
-                               Margin="0,0,0,4" />
-                    <TextBlock Text="Gdy mikrofon jest aktywny, plik MP4 zawiera 3 ścieżki: domyślny miks oraz osobne ścieżki systemu i mikrofonu."
-                               Foreground="#A8A8A8"
-                               FontSize="12"
-                               TextWrapping="Wrap"
                                Margin="0,0,0,12" />
 
                     <StackPanel Margin="0,0,0,12">

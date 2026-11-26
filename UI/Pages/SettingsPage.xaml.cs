@@ -384,7 +384,7 @@ public partial class SettingsPage : Page
         }
         catch (Exception ex)
         {
-            EngineStatusDetailText.Text = $"Nie udało się otworzyć folderu: {ex.Message}";
+            ShowStatusError($"Nie udało się otworzyć folderu: {ex.Message}");
         }
     }
 
@@ -426,7 +426,7 @@ public partial class SettingsPage : Page
                 _isSyncingStartupToggle = false;
             }
 
-            EngineStatusDetailText.Text = $"Błąd zmiany autostartu Windows: {ex.Message}";
+            ShowStatusError($"Błąd zmiany autostartu Windows: {ex.Message}");
         }
     }
 
@@ -452,7 +452,7 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                EngineStatusDetailText.Text = $"Błąd zapisu ustawień: {ex.Message}";
+                ShowStatusError($"Błąd zapisu ustawień: {ex.Message}");
             }
         }
     }
@@ -539,7 +539,7 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                EngineStatusDetailText.Text = $"Błąd zapisu powtórki: {ex.Message}";
+                ShowStatusError($"Błąd zapisu powtórki: {ex.Message}");
             }
         }
         finally
@@ -609,28 +609,52 @@ public partial class SettingsPage : Page
             return;
         }
 
+        string? errorDetail = IsErrorStatusMessage(status) ? status : null;
         Dispatcher.InvokeAsync(() =>
         {
             if (!_isDetached)
             {
-                UpdateEngineControls(_replayEngine.IsRecording, status);
+                UpdateEngineControls(_replayEngine.IsRecording, errorDetail);
             }
         });
     }
 
-    private void UpdateEngineControls(bool isRecording, string? status)
+    private void UpdateEngineControls(bool isRecording, string? errorMessage)
     {
         StatusDot.Fill = isRecording ? RecordingDotBrush : PausedDotBrush;
         EngineStatusTitleText.Text = isRecording ? "Nagrywanie w tle aktywne" : "Wstrzymano";
-        EngineStatusDetailText.Text = !string.IsNullOrWhiteSpace(status)
-            ? status
-            : (isRecording
-                ? "Bufor w pamięci RAM zapisuje wideo i dźwięk w tle."
-                : "Nagrywanie w tle jest wstrzymane.");
+
+        if (!string.IsNullOrWhiteSpace(errorMessage))
+        {
+            ShowStatusError(errorMessage);
+        }
+        else
+        {
+            EngineStatusDetailText.Text = string.Empty;
+            EngineStatusDetailText.Visibility = Visibility.Collapsed;
+        }
 
         ToggleRecordingButton.Content = isRecording ? "Wstrzymaj" : "Wznów";
         ToggleRecordingButton.Icon = new SymbolIcon(isRecording ? SymbolRegular.Pause24 : SymbolRegular.Play24);
         SaveReplayButton.IsEnabled = isRecording;
+    }
+
+    private void ShowStatusError(string message)
+    {
+        EngineStatusDetailText.Text = message;
+        EngineStatusDetailText.Visibility = Visibility.Visible;
+    }
+
+    private static bool IsErrorStatusMessage(string? status)
+    {
+        if (string.IsNullOrWhiteSpace(status))
+        {
+            return false;
+        }
+
+        return status.StartsWith("Błąd", StringComparison.OrdinalIgnoreCase) ||
+               status.StartsWith("Nie udało", StringComparison.OrdinalIgnoreCase) ||
+               status.StartsWith("Przechwytywanie wstrzymane", StringComparison.OrdinalIgnoreCase);
     }
 
     private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)

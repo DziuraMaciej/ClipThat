@@ -328,7 +328,7 @@
             </Grid>
         </Border>
 
-        <!-- Right Column: Podgląd i szybki montaż (workspace canvas) -->
+        <!-- Right Column: Podgląd i montaż (workspace canvas) -->
         <ScrollViewer x:Name="EditorScrollViewer"
                       Grid.Column="1"
                       Background="{DynamicResource AppWorkspaceBrush}"
@@ -347,7 +347,7 @@
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0" VerticalAlignment="Center">
-                        <TextBlock Text="Podgląd i szybki montaż"
+                        <TextBlock Text="Podgląd i montaż"
                                    FontSize="22"
                                    FontWeight="SemiBold"
                                    Foreground="#F3F3F3" />
@@ -692,7 +692,7 @@
                                          Grid.Row="0"
                                          GroupName="ClipExportModeGroup"
                                          Style="{StaticResource ExportModeRadioStyle}"
-                                         Content="Zmiksuj do jednej ścieżki (pod Discorda)"
+                                         Content="Zmiksuj do jednej ścieżki audio"
                                          IsChecked="True" />
 
                             <RadioButton x:Name="KeepSeparateTracksRadio"
@@ -708,28 +708,63 @@
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
 
-                            <ui:Button x:Name="ExportButton"
-                                       Grid.Column="0"
-                                       Content="Eksportuj przycięty klip"
-                                       Appearance="Primary"
-                                       Icon="{ui:SymbolIcon Save24}"
-                                       HorizontalAlignment="Stretch"
-                                       IsEnabled="False"
-                                       Click="ExportButton_Click">
-                                <ui:Button.Resources>
-                                    <Style TargetType="TextBlock">
-                                        <Setter Property="Foreground" Value="{DynamicResource AccentButtonForeground}" />
-                                    </Style>
-                                </ui:Button.Resources>
-                            </ui:Button>
+                            <Grid Grid.Column="0"
+                                  Margin="0,0,10,0"
+                                  VerticalAlignment="Center">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
 
-                            <ui:Button x:Name="CancelExportButton"
-                                       Grid.Column="1"
-                                       Content="Anuluj"
-                                       Appearance="Secondary"
-                                       Margin="8,0,0,0"
-                                       Visibility="Collapsed"
-                                       Click="CancelExportButton_Click" />
+                                <ui:TextBox x:Name="ExportFileNameTextBox"
+                                            Grid.Column="0"
+                                            PlaceholderText="Nazwa pliku wyjściowego..."
+                                            VerticalAlignment="Center"
+                                            IsEnabled="False" />
+
+                                <Border Grid.Column="1"
+                                        Background="#262626"
+                                        BorderBrush="#363636"
+                                        BorderThickness="1"
+                                        CornerRadius="4"
+                                        Padding="9,0"
+                                        Margin="6,0,0,0"
+                                        VerticalAlignment="Stretch"
+                                        IsHitTestVisible="False">
+                                    <TextBlock Text=".mp4"
+                                               FontSize="12.5"
+                                               Foreground="#A8A8A8"
+                                               VerticalAlignment="Center" />
+                                </Border>
+                            </Grid>
+
+                            <StackPanel Grid.Column="1"
+                                        Orientation="Horizontal"
+                                        VerticalAlignment="Center">
+                                <ui:Button x:Name="ExportButton"
+                                           Content="Eksportuj przycięty klip"
+                                           Appearance="Primary"
+                                           Icon="{ui:SymbolIcon Save24}"
+                                           Padding="18,8"
+                                           VerticalAlignment="Center"
+                                           IsEnabled="False"
+                                           Click="ExportButton_Click">
+                                    <ui:Button.Resources>
+                                        <Style TargetType="TextBlock">
+                                            <Setter Property="Foreground" Value="{DynamicResource AccentButtonForeground}" />
+                                        </Style>
+                                    </ui:Button.Resources>
+                                </ui:Button>
+
+                                <ui:Button x:Name="CancelExportButton"
+                                           Content="Anuluj"
+                                           Appearance="Secondary"
+                                           Padding="14,8"
+                                           Margin="8,0,0,0"
+                                           VerticalAlignment="Center"
+                                           Visibility="Collapsed"
+                                           Click="CancelExportButton_Click" />
+                            </StackPanel>
                         </Grid>
 
                         <ProgressBar x:Name="ExportProgressBar"

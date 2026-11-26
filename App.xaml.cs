@@ -63,6 +63,18 @@ public partial class App : Application
 
             AppSettings settings = _settingsService.Load();
 
+            if (settings.StartWithWindows)
+            {
+                try
+                {
+                    _startupService.EnsureStartupPathUpToDate();
+                }
+                catch (Exception ex)
+                {
+                    LogUiException("EnsureStartupPathUpToDate", ex);
+                }
+            }
+
             _replayEngine.StatusChanged += OnEngineStatusChanged;
             _replayEngine.ReplaySaved += OnEngineReplaySaved;
 
@@ -111,7 +123,7 @@ public partial class App : Application
         _recordingTrayIcon = CreateTrayIcon(isRecording: true);
         _pausedTrayIcon = CreateTrayIcon(isRecording: false);
 
-        _saveReplayMenuItem = new WinForms.ToolStripMenuItem("Zapisz powtórkę teraz");
+        _saveReplayMenuItem = new WinForms.ToolStripMenuItem("Zapisz powtórkę");
         _saveReplayMenuItem.Click += async (_, _) => await SaveReplayFromTrayAsync();
 
         _toggleRecordingMenuItem = new WinForms.ToolStripMenuItem("Wznów nagrywanie");
@@ -138,7 +150,7 @@ public partial class App : Application
         _notifyIcon = new WinForms.NotifyIcon
         {
             Icon = _pausedTrayIcon,
-            Text = "ClipThat — Wstrzymano",
+            Text = "ClipThat ON",
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
@@ -256,7 +268,7 @@ public partial class App : Application
                 try
                 {
                     _mainWindow.Closed -= OnMainWindowClosed;
-                    _mainWindow.Close();
+                    _mainWindow.ForceClose();
                 }
                 catch
                 {
@@ -373,8 +385,8 @@ public partial class App : Application
         {
             _notifyIcon.Icon = isRecording ? _recordingTrayIcon : _pausedTrayIcon;
             _notifyIcon.Text = isRecording
-                ? "ClipThat — Nagrywanie aktywne"
-                : "ClipThat — Wstrzymano";
+                ? "ClipThat ON"
+                : "ClipThat OFF";
         }
     }
 
@@ -506,7 +518,7 @@ public partial class App : Application
             if (_mainWindow is not null)
             {
                 _mainWindow.Closed -= OnMainWindowClosed;
-                _mainWindow.Close();
+                _mainWindow.ForceClose();
                 _mainWindow = null;
             }
 

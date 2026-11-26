@@ -27,6 +27,8 @@ public sealed class ClipExportOptions
 {
     public required string InputFilePath { get; init; }
 
+    public string? OutputFileName { get; init; }
+
     public TimeSpan StartTime { get; init; }
 
     public TimeSpan EndTime { get; init; }
@@ -73,6 +75,12 @@ public sealed partial class ClipEditorService
 
     private static readonly HttpClient SharedHttpClient = CreateHttpClient();
     private static readonly SemaphoreSlim FfmpegDownloadGate = new(1, 1);
+    private static readonly HashSet<string> ReservedWindowsDeviceNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    };
 
     /// <summary>
     /// Directory storing temporary PCM WAV files extracted for live dual-track preview playback.
@@ -555,11 +563,16 @@ public sealed partial class ClipEditorService
     }
 
     /// <summary>
-    /// Exports a trimmed and volume-adjusted copy of the input MP4 using <c>-c:v copy</c> without video re-encoding,
-    /// saving the result as <c>{originalNameWithoutExt}_edit.mp4</c> in the same folder.
+    /// Exports a trimmed and volume-adjusted copy of the input MP4 using <c>-c:v copy</c> without video re-encoding
+    /// (falling back automatically to frame-accurate H.264 re-encoding if sparse keyframes cause the stream-copied
+    /// output duration to exceed the requested <paramref name="startTime"/>..<paramref name="endTime"/> range),
+    /// saving the result as <c>{sanitizedName}.mp4</c> in the same folder (falling back to
+    /// <c>{originalNameWithoutExt}_edited.mp4</c> when no custom output name is provided).
     /// </summary>
-    public async Task<ClipExportResult> ExportClipAsync(
+    public async Task<ClipExportResult> ExportTrimmedClipAsync(
         ClipExportOptions options,
+        TimeSpan startTime,
+        TimeSpan endTime,
         IProgress<ClipExportProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
@@ -570,13 +583,14 @@ public sealed partial class ClipEditorService
             throw new FileNotFoundException("Wybrany plik nagrania nie istnieje.", options.InputFilePath);
         }
 
-        TimeSpan startTime = options.StartTime < TimeSpan.Zero ? TimeSpan.Zero : options.StartTime;
-        TimeSpan endTime = options.EndTime;
-        if (endTime <= startTime)
+        TimeSpan normalizedStart = startTime < TimeSpan.Zero ? TimeSpan.Zero : startTime;
+        TimeSpan normalizedEnd = endTime;
+        if (normalizedEnd <= normalizedStart)
         {
             throw new ArgumentException("Czas zakończenia musi być większy niż czas rozpoczęcia.");
         }
 
+        TimeSpan duration = normalizedEnd - normalizedStart;
         double systemVolume = Math.Clamp(options.SystemVolume, 0.0, 2.0);
         double microphoneVolume = Math.Clamp(options.MicrophoneVolume, 0.0, 2.0);
 
@@ -587,11 +601,16 @@ public sealed partial class ClipEditorService
             0,
             IsIndeterminate: true));
 
-        (TimeSpan _, int audioTrackCount) = await ReadMediaMetadataAsync(
+        (TimeSpan sourceDuration, int audioTrackCount) = await ReadMediaMetadataAsync(
             options.InputFilePath,
             cancellationToken).ConfigureAwait(false);
 
-        string outputPath = BuildEditOutputPath(options.InputFilePath);
+        TimeSpan expectedExportDuration = sourceDuration > normalizedStart
+            ? TimeSpan.FromTicks(Math.Min(duration.Ticks, (sourceDuration - normalizedStart).Ticks))
+            : duration;
+
+        string sanitizedBaseName = SanitizeOutputBaseName(options.OutputFileName, options.InputFilePath);
+        string outputPath = BuildEditOutputPath(options.InputFilePath, sanitizedBaseName);
         string tempOutputPath = outputPath + ".tmp";
         TryDeleteFile(tempOutputPath);
 
@@ -603,83 +622,74 @@ public sealed partial class ClipEditorService
             ffmpegPath,
             options.InputFilePath,
             tempOutputPath,
-            startTime,
-            endTime,
+            normalizedStart,
+            duration,
             systemVolume,
             microphoneVolume,
             options.ExportMode,
-            audioTrackCount);
+            audioTrackCount,
+            reencodeVideo: false);
 
-        TimeSpan expectedDuration = endTime - startTime;
         progress?.Report(new ClipExportProgress(
             "Eksportowanie przyciętego klipu...",
             0,
             IsIndeterminate: false));
 
-        var recentErrorLines = new Queue<string>(16);
-
         try
         {
-            using var process = new Process { StartInfo = startInfo };
-            if (!process.Start())
-            {
-                throw new InvalidOperationException("Nie udało się uruchomić procesu ffmpeg.exe.");
-            }
-
-            using CancellationTokenRegistration cancelRegistration = cancellationToken.Register(() =>
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                }
-                catch
-                {
-                    // Process may have already exited.
-                }
-            });
-
-            string? line;
-            while ((line = await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
-            {
-                if (!string.IsNullOrWhiteSpace(line))
-                {
-                    if (recentErrorLines.Count >= 16)
-                    {
-                        recentErrorLines.Dequeue();
-                    }
-
-                    recentErrorLines.Enqueue(line.Trim());
-
-                    if (TryParseFfmpegTime(line, out TimeSpan processedTime) && expectedDuration.TotalSeconds > 0.05)
-                    {
-                        double percent = Math.Clamp(
-                            (processedTime.TotalSeconds / expectedDuration.TotalSeconds) * 100.0,
-                            0.0,
-                            99.0);
-                        progress?.Report(new ClipExportProgress(
-                            $"Eksportowanie przyciętego klipu ({(int)percent}%)...",
-                            percent,
-                            IsIndeterminate: false));
-                    }
-                }
-            }
-
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-
-            if (process.ExitCode != 0)
-            {
-                string detail = recentErrorLines.Count > 0
-                    ? recentErrorLines.Last()
-                    : $"Kod wyjścia: {process.ExitCode}";
-                throw new InvalidOperationException($"FFmpeg zakończył się błędem: {detail}");
-            }
+            await RunFfmpegExportProcessAsync(
+                startInfo,
+                expectedExportDuration,
+                "Eksportowanie przyciętego klipu",
+                progress,
+                cancellationToken).ConfigureAwait(false);
 
             if (!File.Exists(tempOutputPath))
             {
                 throw new InvalidOperationException("FFmpeg nie utworzył pliku wyjściowego.");
+            }
+
+            // Verify exported clip duration against EndValue - StartValue. If stream copy snapped far back
+            // to an earlier keyframe (e.g., sparse GOP / single IDR at 00:00), fall back to frame-accurate export.
+            (TimeSpan exportedDuration, _) = await ReadMediaMetadataAsync(
+                tempOutputPath,
+                cancellationToken).ConfigureAwait(false);
+
+            double maxAllowedDriftSeconds = Math.Min(1.0, Math.Max(0.5, expectedExportDuration.TotalSeconds * 0.25));
+            bool durationMismatch = exportedDuration > TimeSpan.Zero &&
+                                    Math.Abs((exportedDuration - expectedExportDuration).TotalSeconds) > maxAllowedDriftSeconds;
+
+            if (durationMismatch)
+            {
+                TryDeleteFile(tempOutputPath);
+                progress?.Report(new ClipExportProgress(
+                    "Dopasowywanie dokładnego zakresu przycinania...",
+                    0,
+                    IsIndeterminate: false));
+
+                ProcessStartInfo accurateStartInfo = BuildFfmpegStartInfo(
+                    ffmpegPath,
+                    options.InputFilePath,
+                    tempOutputPath,
+                    normalizedStart,
+                    duration,
+                    systemVolume,
+                    microphoneVolume,
+                    options.ExportMode,
+                    audioTrackCount,
+                    reencodeVideo: true);
+
+                await RunFfmpegExportProcessAsync(
+                    accurateStartInfo,
+                    expectedExportDuration,
+                    "Dopasowywanie dokładnego zakresu przycinania",
+                    progress,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (!File.Exists(tempOutputPath))
+                {
+                    throw new InvalidOperationException("FFmpeg nie utworzył pliku wyjściowego.");
+                }
             }
 
             if (shouldPatchMultiTrackFlags)
@@ -688,7 +698,7 @@ public sealed partial class ClipEditorService
             }
 
             // Re-resolve a non-colliding final output path right before moving in case a file appeared during export.
-            string finalOutputPath = BuildEditOutputPath(options.InputFilePath);
+            string finalOutputPath = BuildEditOutputPath(options.InputFilePath, sanitizedBaseName);
             File.Move(tempOutputPath, finalOutputPath, overwrite: false);
 
             progress?.Report(new ClipExportProgress(
@@ -705,16 +715,106 @@ public sealed partial class ClipEditorService
         }
     }
 
+    /// <summary>
+    /// Overload reading <see cref="ClipExportOptions.StartTime"/> and <see cref="ClipExportOptions.EndTime"/>
+    /// from <paramref name="options"/>.
+    /// </summary>
+    public Task<ClipExportResult> ExportTrimmedClipAsync(
+        ClipExportOptions options,
+        IProgress<ClipExportProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return ExportTrimmedClipAsync(options, options.StartTime, options.EndTime, progress, cancellationToken);
+    }
+
+    /// <summary>
+    /// Compatibility alias for <see cref="ExportTrimmedClipAsync(ClipExportOptions, TimeSpan, TimeSpan, IProgress{ClipExportProgress}?, CancellationToken)"/>.
+    /// </summary>
+    public Task<ClipExportResult> ExportClipAsync(
+        ClipExportOptions options,
+        IProgress<ClipExportProgress>? progress = null,
+        CancellationToken cancellationToken = default) =>
+        ExportTrimmedClipAsync(options, progress, cancellationToken);
+
+    private static async Task RunFfmpegExportProcessAsync(
+        ProcessStartInfo startInfo,
+        TimeSpan expectedDuration,
+        string progressLabel,
+        IProgress<ClipExportProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        var recentErrorLines = new Queue<string>(16);
+
+        using var process = new Process { StartInfo = startInfo };
+        if (!process.Start())
+        {
+            throw new InvalidOperationException("Nie udało się uruchomić procesu ffmpeg.exe.");
+        }
+
+        using CancellationTokenRegistration cancelRegistration = cancellationToken.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+                // Process may have already exited.
+            }
+        });
+
+        string? line;
+        while ((line = await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                if (recentErrorLines.Count >= 16)
+                {
+                    recentErrorLines.Dequeue();
+                }
+
+                recentErrorLines.Enqueue(line.Trim());
+
+                if (TryParseFfmpegTime(line, out TimeSpan processedTime) && expectedDuration.TotalSeconds > 0.05)
+                {
+                    double percent = Math.Clamp(
+                        (processedTime.TotalSeconds / expectedDuration.TotalSeconds) * 100.0,
+                        0.0,
+                        99.0);
+                    progress?.Report(new ClipExportProgress(
+                        $"{progressLabel} ({(int)percent}%)...",
+                        percent,
+                        IsIndeterminate: false));
+                }
+            }
+        }
+
+        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+        if (process.ExitCode != 0)
+        {
+            string detail = recentErrorLines.Count > 0
+                ? recentErrorLines.Last()
+                : $"Kod wyjścia: {process.ExitCode}";
+            throw new InvalidOperationException($"FFmpeg zakończył się błędem: {detail}");
+        }
+    }
+
     private static ProcessStartInfo BuildFfmpegStartInfo(
         string ffmpegPath,
         string inputFilePath,
         string tempOutputPath,
         TimeSpan startTime,
-        TimeSpan endTime,
+        TimeSpan duration,
         double systemVolume,
         double microphoneVolume,
         ClipExportMode exportMode,
-        int audioTrackCount)
+        int audioTrackCount,
+        bool reencodeVideo)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -726,18 +826,19 @@ public sealed partial class ClipEditorService
         };
 
         string startArg = FormatFfmpegTimestamp(startTime);
-        string endArg = FormatFfmpegTimestamp(endTime);
+        string durationArg = FormatFfmpegTimestamp(duration);
         string sysVol = systemVolume.ToString("0.###", CultureInfo.InvariantCulture);
         string micVol = microphoneVolume.ToString("0.###", CultureInfo.InvariantCulture);
 
         startInfo.ArgumentList.Add("-hide_banner");
         startInfo.ArgumentList.Add("-y");
+        // Place -ss before -i for fast input seeking and -t duration after -i so exported length equals EndValue - StartValue.
         startInfo.ArgumentList.Add("-ss");
         startInfo.ArgumentList.Add(startArg);
-        startInfo.ArgumentList.Add("-to");
-        startInfo.ArgumentList.Add(endArg);
         startInfo.ArgumentList.Add("-i");
         startInfo.ArgumentList.Add(inputFilePath);
+        startInfo.ArgumentList.Add("-t");
+        startInfo.ArgumentList.Add(durationArg);
 
         if (audioTrackCount >= 2)
         {
@@ -751,8 +852,7 @@ public sealed partial class ClipEditorService
                 startInfo.ArgumentList.Add("0:v:0");
                 startInfo.ArgumentList.Add("-map");
                 startInfo.ArgumentList.Add("[aout]");
-                startInfo.ArgumentList.Add("-c:v");
-                startInfo.ArgumentList.Add("copy");
+                AddVideoCodecArguments(startInfo, reencodeVideo);
                 startInfo.ArgumentList.Add("-c:a");
                 startInfo.ArgumentList.Add("aac");
                 startInfo.ArgumentList.Add("-b:a");
@@ -774,8 +874,7 @@ public sealed partial class ClipEditorService
                 startInfo.ArgumentList.Add("[mic_out]");
                 startInfo.ArgumentList.Add("-map");
                 startInfo.ArgumentList.Add("[aout]");
-                startInfo.ArgumentList.Add("-c:v");
-                startInfo.ArgumentList.Add("copy");
+                AddVideoCodecArguments(startInfo, reencodeVideo);
                 startInfo.ArgumentList.Add("-c:a");
                 startInfo.ArgumentList.Add("aac");
                 startInfo.ArgumentList.Add("-b:a");
@@ -790,8 +889,7 @@ public sealed partial class ClipEditorService
             startInfo.ArgumentList.Add("0:v:0");
             startInfo.ArgumentList.Add("-map");
             startInfo.ArgumentList.Add("[aout]");
-            startInfo.ArgumentList.Add("-c:v");
-            startInfo.ArgumentList.Add("copy");
+            AddVideoCodecArguments(startInfo, reencodeVideo);
             startInfo.ArgumentList.Add("-c:a");
             startInfo.ArgumentList.Add("aac");
             startInfo.ArgumentList.Add("-b:a");
@@ -801,8 +899,7 @@ public sealed partial class ClipEditorService
         {
             startInfo.ArgumentList.Add("-map");
             startInfo.ArgumentList.Add("0:v:0");
-            startInfo.ArgumentList.Add("-c:v");
-            startInfo.ArgumentList.Add("copy");
+            AddVideoCodecArguments(startInfo, reencodeVideo);
             startInfo.ArgumentList.Add("-an");
         }
 
@@ -815,6 +912,25 @@ public sealed partial class ClipEditorService
         startInfo.ArgumentList.Add(tempOutputPath);
 
         return startInfo;
+    }
+
+    private static void AddVideoCodecArguments(ProcessStartInfo startInfo, bool reencodeVideo)
+    {
+        if (!reencodeVideo)
+        {
+            startInfo.ArgumentList.Add("-c:v");
+            startInfo.ArgumentList.Add("copy");
+            return;
+        }
+
+        startInfo.ArgumentList.Add("-c:v");
+        startInfo.ArgumentList.Add("libx264");
+        startInfo.ArgumentList.Add("-preset");
+        startInfo.ArgumentList.Add("veryfast");
+        startInfo.ArgumentList.Add("-crf");
+        startInfo.ArgumentList.Add("18");
+        startInfo.ArgumentList.Add("-pix_fmt");
+        startInfo.ArgumentList.Add("yuv420p");
     }
 
     private async Task<(TimeSpan Duration, int AudioTrackCount)> ReadMediaMetadataAsync(
@@ -1065,12 +1181,67 @@ public sealed partial class ClipEditorService
         }
     }
 
-    private static string BuildEditOutputPath(string inputFilePath)
+    /// <summary>
+    /// Strips a trailing <c>.mp4</c> extension (if entered), removes any invalid Windows filename characters,
+    /// and falls back to <c>{originalName}_edited</c> when the resulting name is empty or reserved.
+    /// </summary>
+    public static string SanitizeOutputBaseName(string? customOutputFileName, string inputFilePath)
+    {
+        string originalName = Path.GetFileNameWithoutExtension(inputFilePath);
+        string fallbackBaseName = string.IsNullOrWhiteSpace(originalName)
+            ? "clip_edited"
+            : $"{originalName}_edited";
+
+        if (string.IsNullOrWhiteSpace(customOutputFileName))
+        {
+            return fallbackBaseName;
+        }
+
+        char[] invalidChars = Path.GetInvalidFileNameChars();
+        string cleaned = StripMp4Extension(customOutputFileName);
+
+        Span<char> buffer = cleaned.Length <= 256 ? stackalloc char[cleaned.Length] : new char[cleaned.Length];
+        int written = 0;
+        foreach (char ch in cleaned)
+        {
+            if (Array.IndexOf(invalidChars, ch) < 0)
+            {
+                buffer[written++] = ch;
+            }
+        }
+
+        cleaned = StripMp4Extension(new string(buffer[..written]));
+        if (string.IsNullOrWhiteSpace(cleaned))
+        {
+            return fallbackBaseName;
+        }
+
+        int firstDotIndex = cleaned.IndexOf('.');
+        string deviceProbe = firstDotIndex >= 0 ? cleaned[..firstDotIndex] : cleaned;
+        if (ReservedWindowsDeviceNames.Contains(deviceProbe))
+        {
+            return fallbackBaseName;
+        }
+
+        return cleaned;
+    }
+
+    private static string StripMp4Extension(string value)
+    {
+        string result = value.Trim().TrimEnd('.', ' ');
+        while (result.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase))
+        {
+            result = result[..^4].Trim().TrimEnd('.', ' ');
+        }
+
+        return result;
+    }
+
+    private static string BuildEditOutputPath(string inputFilePath, string sanitizedBaseName)
     {
         string directory = Path.GetDirectoryName(inputFilePath) ?? AppSettings.DefaultOutputDirectory;
-        string baseName = Path.GetFileNameWithoutExtension(inputFilePath);
 
-        string candidate = Path.Combine(directory, $"{baseName}_edit.mp4");
+        string candidate = Path.Combine(directory, $"{sanitizedBaseName}.mp4");
         if (!File.Exists(candidate))
         {
             return candidate;
@@ -1078,14 +1249,14 @@ public sealed partial class ClipEditorService
 
         for (int index = 2; index < 10_000; index++)
         {
-            string numberedCandidate = Path.Combine(directory, $"{baseName}_edit_{index}.mp4");
+            string numberedCandidate = Path.Combine(directory, $"{sanitizedBaseName}_{index}.mp4");
             if (!File.Exists(numberedCandidate))
             {
                 return numberedCandidate;
             }
         }
 
-        return Path.Combine(directory, $"{baseName}_edit_{DateTime.Now:HHmmss}.mp4");
+        return Path.Combine(directory, $"{sanitizedBaseName}_{DateTime.Now:HHmmss}.mp4");
     }
 
     private static string FormatFfmpegTimestamp(TimeSpan value)

@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -12,7 +13,7 @@ namespace ClipThat.UI;
 
 /// <summary>
 /// Main FluentWindow hosting Polish navigation tabs for Settings and Clips Browser.
-/// Closing this window destroys its UI tree to keep background RAM usage minimal.
+/// Clicking the close button hides this window to the system tray without stopping background capture.
 /// </summary>
 public partial class MainWindow : FluentWindow
 {
@@ -31,6 +32,7 @@ public partial class MainWindow : FluentWindow
     private static readonly SolidColorBrush InactiveWorkspaceBrush = CreateFrozenBrush(0xFF, 0x2B, 0x2B, 0x2B);
 
     private readonly WindowPageProvider _pageProvider;
+    private bool _allowClose;
 
     public MainWindow(
         SettingsService settingsService,
@@ -142,6 +144,28 @@ public partial class MainWindow : FluentWindow
         var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
         brush.Freeze();
         return brush;
+    }
+
+    /// <summary>
+    /// Allows the window to close permanently during application shutdown or error recovery,
+    /// bypassing the hide-to-tray behavior in <see cref="OnClosing"/>.
+    /// </summary>
+    public void ForceClose()
+    {
+        _allowClose = true;
+        Close();
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (!_allowClose)
+        {
+            e.Cancel = true;
+            Hide();
+            return;
+        }
+
+        base.OnClosing(e);
     }
 
     protected override void OnClosed(EventArgs e)

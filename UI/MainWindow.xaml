@@ -29,8 +29,18 @@
 
         <ui:TitleBar Grid.Row="0"
                      Title="ClipThat"
+                     Height="36"
+                     Padding="16,0,16,0"
                      Background="{DynamicResource AppRailBrush}"
-                     CloseWindowByDoubleClickOnIcon="True" />
+                     CloseWindowByDoubleClickOnIcon="True">
+            <ui:TitleBar.Resources>
+                <Style TargetType="{x:Type ui:TitleBarButton}"
+                       BasedOn="{StaticResource {x:Type ui:TitleBarButton}}">
+                    <Setter Property="Height" Value="36" />
+                    <Setter Property="Width" Value="46" />
+                </Style>
+            </ui:TitleBar.Resources>
+        </ui:TitleBar>
 
         <ui:NavigationView x:Name="RootNavigation"
                            Grid.Row="1"
