@@ -17,4 +17,12 @@ if %errorlevel% neq 0 (
     exit /b 0
 )
 
-start "" /B dotnet run -c Release -m:1 --no-launch-profile
+dotnet build -c Release -m:1 --nologo -v q
+if %errorlevel% neq 0 (
+    echo Blad budowania aplikacji ClipThat.
+    pause
+    exit /b 1
+)
+
+start "" "bin\Release\net8.0-windows10.0.22621.0\ClipThat.exe"
+exit
