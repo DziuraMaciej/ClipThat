@@ -19,7 +19,12 @@ public partial class App : Application
     private readonly DisplayService _displayService = new();
     private readonly ResourceEstimatorService _resourceEstimatorService = new();
     private readonly StartupService _startupService = new();
-    private readonly IReplayEngine _replayEngine = new StubReplayEngine();
+    private readonly IReplayEngine _replayEngine;
+
+    public App()
+    {
+        _replayEngine = new ReplayEngine(_resourceEstimatorService);
+    }
 
     private MainWindow? _mainWindow;
     private WinForms.NotifyIcon? _notifyIcon;
@@ -48,7 +53,18 @@ public partial class App : Application
 
             if (startMinimized || settings.StartRecordingOnLaunch)
             {
-                await _replayEngine.StartAsync(settings);
+                try
+                {
+                    await _replayEngine.StartAsync(settings);
+                }
+                catch (Exception ex)
+                {
+                    _notifyIcon?.ShowBalloonTip(
+                        4000,
+                        "ClipThat",
+                        $"Nie udało się uruchomić nagrywania: {ex.Message}",
+                        WinForms.ToolTipIcon.Warning);
+                }
             }
 
             if (!startMinimized && !settings.StartRecordingOnLaunch)
@@ -257,8 +273,23 @@ public partial class App : Application
             _replayEngine.StatusChanged -= OnEngineStatusChanged;
             _replayEngine.ReplaySaved -= OnEngineReplaySaved;
 
-            await _replayEngine.StopAsync();
-            _replayEngine.Dispose();
+            try
+            {
+                await _replayEngine.StopAsync();
+            }
+            catch
+            {
+                // Ignore engine stop failures during application shutdown.
+            }
+
+            try
+            {
+                _replayEngine.Dispose();
+            }
+            catch
+            {
+                // Ignore engine disposal failures during application shutdown.
+            }
         }
         finally
         {

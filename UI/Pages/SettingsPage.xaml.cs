@@ -183,9 +183,13 @@ public partial class SettingsPage : Page
         {
             await _replayEngine.SaveReplayAsync();
         }
+        catch (Exception ex)
+        {
+            SaveFeedbackText.Text = $"Błąd zapisu powtórki: {ex.Message}";
+        }
         finally
         {
-            SaveReplayButton.IsEnabled = true;
+            SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
         }
     }
 
@@ -203,9 +207,15 @@ public partial class SettingsPage : Page
                 await _replayEngine.StartAsync(_settingsService.Load());
             }
         }
+        catch (Exception ex)
+        {
+            SaveFeedbackText.Text = $"Błąd zmiany stanu nagrywania: {ex.Message}";
+            UpdateEngineControls(_replayEngine.IsRecording, null);
+        }
         finally
         {
             ToggleRecordingButton.IsEnabled = true;
+            SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
         }
     }
 
@@ -217,7 +227,7 @@ public partial class SettingsPage : Page
     private void UpdateEngineControls(bool isRecording, string? status)
     {
         EngineStatusText.Text = status ?? (isRecording
-            ? "Nagrywanie aktywne (tryb testowy)"
+            ? "Nagrywanie aktywne"
             : "Nagrywanie wstrzymane");
         ToggleRecordingButton.Content = isRecording ? "Wstrzymaj nagrywanie" : "Wznów nagrywanie";
         SaveReplayButton.IsEnabled = isRecording;
