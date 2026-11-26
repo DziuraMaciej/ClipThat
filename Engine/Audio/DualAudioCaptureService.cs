@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ClipThat.Engine.Buffer;
+using ClipThat.Engine.Diagnostics;
 using ClipThat.Services;
 using NAudio.CoreAudioApi;
 using NAudio.CoreAudioApi.Interfaces;
@@ -117,8 +118,10 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
     }
 
     /// <summary>
-    /// Starts both WASAPI capture pipelines (system loopback and optional microphone) and registers
-    /// <see cref="IMMNotificationClient"/> for seamless default device hot-swapping.
+    /// Starts both WASAPI capture pipelines (system loopback and optional microphone) inside independent
+    /// <c>try/catch</c> blocks so missing microphones, virtual audio routers, or spatial audio formats
+    /// never prevent video recording from starting, and registers <see cref="IMMNotificationClient"/>
+    /// for seamless default device hot-swapping.
     /// </summary>
     public void Start()
     {
@@ -130,33 +133,74 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
         RegisterDeviceNotifications();
 
-        using var enumerator = new MMDeviceEnumerator();
-
-        lock (_systemSwapLock)
+        MMDeviceEnumerator? enumerator = null;
+        try
         {
-            if (Volatile.Read(ref _disposed) == 0)
+            enumerator = new MMDeviceEnumerator();
+        }
+        catch (Exception ex)
+        {
+            string audioSvcError = $"Ostrzeżenie audio: nie udało się zainicjować podsystemu WASAPI ({ex.Message}).";
+            EngineLogger.Warn("DualAudioCaptureService", audioSvcError, ex);
+            Volatile.Write(ref _systemAudioError, audioSvcError);
+            return;
+        }
+
+        using (enumerator)
+        {
+            // Independent try/catch for System Audio (WASAPI Loopback)
+            try
             {
-                _systemAudioTrack = TryStartSystemAudioTrack(
-                    enumerator,
-                    minimumTimestamp100Ns: -1L,
-                    out string? systemError);
-                Volatile.Write(ref _systemAudioError, systemError);
+                lock (_systemSwapLock)
+                {
+                    if (Volatile.Read(ref _disposed) == 0)
+                    {
+                        _systemAudioTrack = TryStartSystemAudioTrack(
+                            enumerator,
+                            minimumTimestamp100Ns: -1L,
+                            out string? systemError);
+                        Volatile.Write(ref _systemAudioError, systemError);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                string error = $"Błąd dźwięku systemu (WASAPI Loopback): {ex.Message}";
+                EngineLogger.Warn("DualAudioCaptureService", error, ex);
+                Volatile.Write(ref _systemAudioError, error);
+            }
+
+            // Independent try/catch for Microphone (WASAPI Capture)
+            try
+            {
+                lock (_microphoneSwapLock)
+                {
+                    if (Volatile.Read(ref _disposed) == 0)
+                    {
+                        _microphoneTrack = TryStartMicrophoneTrack(
+                            enumerator,
+                            minimumTimestamp100Ns: -1L,
+                            out string? micError);
+                        Volatile.Write(ref _microphoneError, micError);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                string error = $"Błąd mikrofonu (WASAPI): {ex.Message}";
+                EngineLogger.Warn("DualAudioCaptureService", error, ex);
+                Volatile.Write(ref _microphoneError, error);
             }
         }
 
-        lock (_microphoneSwapLock)
+        try
         {
-            if (Volatile.Read(ref _disposed) == 0)
-            {
-                _microphoneTrack = TryStartMicrophoneTrack(
-                    enumerator,
-                    minimumTimestamp100Ns: -1L,
-                    out string? micError);
-                Volatile.Write(ref _microphoneError, micError);
-            }
+            SyncCombinedMixPipelineState();
         }
-
-        SyncCombinedMixPipelineState();
+        catch (Exception ex)
+        {
+            EngineLogger.Warn("DualAudioCaptureService", $"Combined audio mix pipeline failed to start: {ex.Message}", ex);
+        }
     }
 
     private void RegisterDeviceNotifications()
@@ -458,11 +502,23 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 return null;
             }
 
-            using var enumerator = new MMDeviceEnumerator();
-            AudioTrackPipeline? pipeline = TryStartSystemAudioTrack(enumerator, minimumTimestamp100Ns, out error);
-            if (pipeline is not null || attempt == 1)
+            try
             {
-                return pipeline;
+                using var enumerator = new MMDeviceEnumerator();
+                AudioTrackPipeline? pipeline = TryStartSystemAudioTrack(enumerator, minimumTimestamp100Ns, out error);
+                if (pipeline is not null || attempt == 1)
+                {
+                    return pipeline;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = $"Błąd dźwięku systemu (WASAPI Loopback): {ex.Message}";
+                EngineLogger.Warn("DualAudioCaptureService", error, ex);
+                if (attempt == 1)
+                {
+                    return null;
+                }
             }
 
             Thread.Sleep(HotSwapRetryDelayMs);
@@ -482,11 +538,23 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 return null;
             }
 
-            using var enumerator = new MMDeviceEnumerator();
-            AudioTrackPipeline? pipeline = TryStartMicrophoneTrack(enumerator, minimumTimestamp100Ns, out error);
-            if (pipeline is not null || string.IsNullOrWhiteSpace(error) || attempt == 1)
+            try
             {
-                return pipeline;
+                using var enumerator = new MMDeviceEnumerator();
+                AudioTrackPipeline? pipeline = TryStartMicrophoneTrack(enumerator, minimumTimestamp100Ns, out error);
+                if (pipeline is not null || string.IsNullOrWhiteSpace(error) || attempt == 1)
+                {
+                    return pipeline;
+                }
+            }
+            catch (Exception ex)
+            {
+                error = $"Błąd mikrofonu (WASAPI): {ex.Message}";
+                EngineLogger.Warn("DualAudioCaptureService", error, ex);
+                if (attempt == 1)
+                {
+                    return null;
+                }
             }
 
             Thread.Sleep(HotSwapRetryDelayMs);
@@ -510,13 +578,13 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             if (renderDevice is null)
             {
                 error = resolveWarning ?? "Błąd dźwięku systemu: brak aktywnego urządzenia wyjściowego audio.";
-                Debug.WriteLine(error);
+                EngineLogger.Warn("DualAudioCaptureService", error);
                 return null;
             }
 
             if (!string.IsNullOrWhiteSpace(resolveWarning))
             {
-                Debug.WriteLine(resolveWarning);
+                EngineLogger.Warn("DualAudioCaptureService", resolveWarning);
                 error = resolveWarning;
             }
 
@@ -524,15 +592,22 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             {
                 MMDevice ownedDevice = renderDevice;
                 renderDevice = null;
-                return CreateAndStartLoopbackPipeline(
+                AudioTrackPipeline pipeline = CreateAndStartLoopbackPipeline(
                     ownedDevice,
                     useLowLatencyBuffer: true,
                     minimumTimestamp100Ns);
+                EngineLogger.Info(
+                    "DualAudioCaptureService",
+                    $"System audio loopback active (low-latency): \"{pipeline.DeviceFriendlyName}\" ({pipeline.SourceFormatDescription})");
+                return pipeline;
             }
-            catch (COMException ex)
+            catch (Exception ex)
             {
-                Debug.WriteLine($"Low-latency loopback nie powiódł się ({ex.Message}); ponawianie ze standardowym WasapiLoopbackCapture.");
-                // Re-resolve a fresh MMDevice handle for the fallback attempt because the failed pipeline disposed the previous handle.
+                EngineLogger.Warn(
+                    "DualAudioCaptureService",
+                    $"Low-latency WASAPI loopback failed ({ex.Message}); retrying with standard WasapiLoopbackCapture.");
+
+                // Re-resolve a fresh MMDevice handle because the failed pipeline disposed the previous handle.
                 MMDevice? fallbackDevice = ResolveRenderEndpoint(enumerator, _systemAudioDeviceId, out _);
                 if (fallbackDevice is null)
                 {
@@ -540,16 +615,49 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                     return null;
                 }
 
-                return CreateAndStartLoopbackPipeline(
-                    fallbackDevice,
-                    useLowLatencyBuffer: false,
-                    minimumTimestamp100Ns);
+                try
+                {
+                    AudioTrackPipeline pipeline = CreateAndStartLoopbackPipeline(
+                        fallbackDevice,
+                        useLowLatencyBuffer: false,
+                        minimumTimestamp100Ns);
+                    EngineLogger.Info(
+                        "DualAudioCaptureService",
+                        $"System audio loopback active (standard): \"{pipeline.DeviceFriendlyName}\" ({pipeline.SourceFormatDescription})");
+                    return pipeline;
+                }
+                catch (Exception standardEx)
+                {
+                    // If a specific virtual/spatial output failed, attempt one fallback to the default render endpoint.
+                    if (!string.IsNullOrWhiteSpace(_systemAudioDeviceId))
+                    {
+                        EngineLogger.Warn(
+                            "DualAudioCaptureService",
+                            $"Configured render endpoint failed ({standardEx.Message}); retrying system default render endpoint.");
+
+                        MMDevice? defaultRender = ResolveRenderEndpoint(enumerator, configuredDeviceId: null, out _);
+                        if (defaultRender is not null)
+                        {
+                            AudioTrackPipeline defaultPipeline = CreateAndStartLoopbackPipeline(
+                                defaultRender,
+                                useLowLatencyBuffer: false,
+                                minimumTimestamp100Ns);
+                            error = $"Wybrane urządzenie wyjściowe nieobsługiwane — użyto domyślnego ({defaultPipeline.DeviceFriendlyName}).";
+                            EngineLogger.Info(
+                                "DualAudioCaptureService",
+                                $"System audio loopback active (default fallback): \"{defaultPipeline.DeviceFriendlyName}\" ({defaultPipeline.SourceFormatDescription})");
+                            return defaultPipeline;
+                        }
+                    }
+
+                    throw;
+                }
             }
         }
         catch (Exception ex)
         {
             error = $"Błąd dźwięku systemu (WASAPI Loopback): {ex.Message}";
-            Debug.WriteLine(error);
+            EngineLogger.Warn("DualAudioCaptureService", error, ex);
             SafeDispose(renderDevice);
             return null;
         }
@@ -608,6 +716,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
         if (AudioDeviceService.IsDisabledDeviceId(_microphoneDeviceId))
         {
+            EngineLogger.Info("DualAudioCaptureService", "Microphone capture explicitly disabled by user setting.");
             return null;
         }
 
@@ -621,7 +730,11 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 error = resolveError;
                 if (!string.IsNullOrWhiteSpace(resolveError))
                 {
-                    Debug.WriteLine(resolveError);
+                    EngineLogger.Warn("DualAudioCaptureService", resolveError);
+                }
+                else
+                {
+                    EngineLogger.Info("DualAudioCaptureService", "No active microphone detected; continuing without microphone track.");
                 }
 
                 return null;
@@ -631,14 +744,22 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             {
                 MMDevice ownedDevice = captureDevice;
                 captureDevice = null;
-                return CreateAndStartMicrophonePipeline(
+                AudioTrackPipeline pipeline = CreateAndStartMicrophonePipeline(
                     ownedDevice,
                     useEventSync: true,
+                    bufferMilliseconds: MicrophoneCaptureBufferMs,
                     minimumTimestamp100Ns);
+                EngineLogger.Info(
+                    "DualAudioCaptureService",
+                    $"Microphone capture active (event-sync): \"{pipeline.DeviceFriendlyName}\" ({pipeline.SourceFormatDescription})");
+                return pipeline;
             }
-            catch (COMException ex)
+            catch (Exception ex)
             {
-                Debug.WriteLine($"WASAPI mikrofon event-sync nie powiódł się ({ex.Message}); ponawianie w trybie odpytywania.");
+                EngineLogger.Warn(
+                    "DualAudioCaptureService",
+                    $"WASAPI microphone event-sync failed ({ex.Message}); retrying in standard polling mode.");
+
                 MMDevice? fallbackDevice = ResolveCaptureEndpoint(enumerator, _microphoneDeviceId, out _);
                 if (fallbackDevice is null)
                 {
@@ -646,16 +767,21 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                     return null;
                 }
 
-                return CreateAndStartMicrophonePipeline(
+                AudioTrackPipeline pipeline = CreateAndStartMicrophonePipeline(
                     fallbackDevice,
                     useEventSync: false,
+                    bufferMilliseconds: null,
                     minimumTimestamp100Ns);
+                EngineLogger.Info(
+                    "DualAudioCaptureService",
+                    $"Microphone capture active (polling fallback): \"{pipeline.DeviceFriendlyName}\" ({pipeline.SourceFormatDescription})");
+                return pipeline;
             }
         }
         catch (Exception ex)
         {
             error = $"Błąd mikrofonu (WASAPI): {ex.Message}";
-            Debug.WriteLine(error);
+            EngineLogger.Warn("DualAudioCaptureService", error, ex);
             SafeDispose(captureDevice);
             return null;
         }
@@ -664,6 +790,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
     private AudioTrackPipeline CreateAndStartMicrophonePipeline(
         MMDevice captureDevice,
         bool useEventSync,
+        int? bufferMilliseconds,
         long minimumTimestamp100Ns)
     {
         WasapiCapture? micCapture = null;
@@ -671,10 +798,14 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
         try
         {
-            micCapture = new WasapiCapture(
-                captureDevice,
-                useEventSync: useEventSync,
-                audioBufferMillisecondsLength: MicrophoneCaptureBufferMs);
+            micCapture = bufferMilliseconds.HasValue
+                ? new WasapiCapture(
+                    captureDevice,
+                    useEventSync: useEventSync,
+                    audioBufferMillisecondsLength: bufferMilliseconds.Value)
+                : new WasapiCapture(
+                    captureDevice,
+                    useEventSync: useEventSync);
 
             pipeline = new AudioTrackPipeline(
                 MediaTrackType.MicrophoneAudio,
@@ -993,8 +1124,10 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
             DeviceId = TryReadDeviceId(device);
             DeviceFriendlyName = TryReadFriendlyName(device, DeviceId);
+            WaveFormat wf = capture.WaveFormat;
+            SourceFormatDescription = $"{wf.SampleRate} Hz, {wf.BitsPerSample}-bit, {wf.Channels} ch, {wf.Encoding}";
 
-            _pcmConverter = new AudioPcmConverter(capture.WaveFormat);
+            _pcmConverter = new AudioPcmConverter(wf);
             _aacEncoder = new AacMftEncoder(
                 trackType,
                 initialLastTimestamp100Ns: minimumTimestamp100Ns > 0 ? minimumTimestamp100Ns - 1 : -1L,
@@ -1005,6 +1138,8 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         public string DeviceId { get; }
 
         public string DeviceFriendlyName { get; }
+
+        public string SourceFormatDescription { get; }
 
         public long LastEncodedTimestamp100Ns => Volatile.Read(ref _lastEncodedTimestamp100Ns);
 
@@ -1441,6 +1576,11 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
         private static bool IsIeeeFloatFormat(WaveFormat format)
         {
+            if (format.BitsPerSample != 32)
+            {
+                return false;
+            }
+
             if (format.Encoding == WaveFormatEncoding.IeeeFloat)
             {
                 return true;
@@ -1459,7 +1599,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 }
             }
 
-            return format.BitsPerSample == 32 && format.Encoding != WaveFormatEncoding.Pcm;
+            return format.Encoding != WaveFormatEncoding.Pcm;
         }
 
         private static void EnsureCapacity(ref byte[] buffer, int requiredBytes)
@@ -1790,16 +1930,38 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             };
 
             uint flags = (uint)(EnumFlag.EnumFlagSyncmft | EnumFlag.EnumFlagLocalmft | EnumFlag.EnumFlagSortandfilter);
-            using IMFActivateCollection activates = MediaFactory.MFTEnumEx(
-                TransformCategoryGuids.AudioEncoder,
-                flags,
-                inputTypeInfo,
-                outputTypeInfo);
-
             var candidates = new List<IMFActivate>();
-            foreach (IMFActivate activate in activates)
+            nint activatesPtr = nint.Zero;
+            uint count = 0;
+
+            try
             {
-                candidates.Add(activate);
+                MediaFactory.MFTEnumEx(
+                    TransformCategoryGuids.AudioEncoder,
+                    flags,
+                    inputTypeInfo,
+                    outputTypeInfo,
+                    out activatesPtr,
+                    out count);
+
+                if (activatesPtr != nint.Zero && count > 0)
+                {
+                    for (int i = 0; i < count; i++)
+                    {
+                        nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
+                        if (itemPtr != nint.Zero)
+                        {
+                            candidates.Add(new IMFActivate(itemPtr));
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (activatesPtr != nint.Zero)
+                {
+                    Marshal.FreeCoTaskMem(activatesPtr);
+                }
             }
 
             int winningIndex = -1;

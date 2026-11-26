@@ -1,9 +1,12 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using ClipThat.Engine.Audio;
 using ClipThat.Engine.Buffer;
+using ClipThat.Engine.Diagnostics;
+using ClipThat.Services;
 using Vortice.MediaFoundation;
 
 namespace ClipThat.Engine.Muxing;
@@ -88,6 +91,9 @@ public sealed class Mp4ReplayMuxer
             throw new ArgumentOutOfRangeException(nameof(width), "Nieprawidłowe parametry wideo dla muksera MP4.");
         }
 
+        int evenWidth = Math.Max(2, width & ~1);
+        int evenHeight = Math.Max(2, height & ~1);
+
         int firstKeyframeIndex = FindFirstVideoKeyframeIndex(snapshot);
         if (firstKeyframeIndex < 0)
         {
@@ -163,6 +169,76 @@ public sealed class Mp4ReplayMuxer
             ? snapshot.VideoSequenceHeader
             : TryExtractAnnexBSpsPps(snapshot[firstKeyframeIndex].Data);
 
+        try
+        {
+            MuxWithMediaFoundation(
+                snapshot,
+                orderedPackets,
+                baseTimestamp100Ns,
+                outputFilePath,
+                evenWidth,
+                evenHeight,
+                fps,
+                videoBitrateBps,
+                videoSequenceHeader,
+                hasSystemAudio,
+                hasMicrophoneAudio,
+                includeCombinedMix);
+
+            EngineLogger.Info("Mp4ReplayMuxer", $"Saved replay via Media Foundation SinkWriter: \"{outputFilePath}\"");
+            return outputFilePath;
+        }
+        catch (Exception mfEx)
+        {
+            EngineLogger.Warn(
+                "Mp4ReplayMuxer",
+                $"Media Foundation SinkWriter mux failed ({mfEx.Message}); attempting portable embedded FFmpeg fallback.",
+                mfEx);
+
+            TryDeletePartialFile(outputFilePath);
+
+            try
+            {
+                MuxWithPortableFfmpeg(
+                    orderedPackets,
+                    outputFilePath,
+                    fps,
+                    videoSequenceHeader,
+                    hasSystemAudio,
+                    hasMicrophoneAudio,
+                    includeCombinedMix);
+
+                EngineLogger.Info("Mp4ReplayMuxer", $"Saved replay via portable FFmpeg fallback: \"{outputFilePath}\"");
+                return outputFilePath;
+            }
+            catch (Exception ffmpegEx)
+            {
+                EngineLogger.Error(
+                    "Mp4ReplayMuxer",
+                    $"Portable FFmpeg fallback mux also failed for \"{outputFilePath}\".",
+                    ffmpegEx);
+                TryDeletePartialFile(outputFilePath);
+                throw new InvalidOperationException(
+                    $"Nie udało się zapisać pliku MP4 (Media Foundation: {mfEx.Message}; FFmpeg: {ffmpegEx.Message})",
+                    ffmpegEx);
+            }
+        }
+    }
+
+    private static void MuxWithMediaFoundation(
+        EncodedPacketSnapshot snapshot,
+        List<IndexedPacket> orderedPackets,
+        long baseTimestamp100Ns,
+        string outputFilePath,
+        int width,
+        int height,
+        int fps,
+        uint videoBitrateBps,
+        byte[]? videoSequenceHeader,
+        bool hasSystemAudio,
+        bool hasMicrophoneAudio,
+        bool includeCombinedMix)
+    {
         long defaultVideoDuration100Ns = TimeSpan.TicksPerSecond / fps;
 
         bool mfStarted = false;
@@ -325,7 +401,6 @@ public sealed class Mp4ReplayMuxer
             sinkWriter = null;
 
             TryPatchAudioTrackSelectionFlags(outputFilePath);
-            return outputFilePath;
         }
         finally
         {
@@ -353,6 +428,188 @@ public sealed class Mp4ReplayMuxer
                 }
             }
         }
+    }
+
+    private static void MuxWithPortableFfmpeg(
+        List<IndexedPacket> orderedPackets,
+        string outputFilePath,
+        int fps,
+        byte[]? videoSequenceHeader,
+        bool hasSystemAudio,
+        bool hasMicrophoneAudio,
+        bool includeCombinedMix)
+    {
+        string? ffmpegPath = PortableFfmpegProvider.TryEnsureExtracted();
+        if (string.IsNullOrWhiteSpace(ffmpegPath) || !File.Exists(ffmpegPath))
+        {
+            throw new FileNotFoundException("Osadzony plik ffmpeg.exe nie jest dostępny do zapasowego zapisu MP4.");
+        }
+
+        string tempDir = Path.Combine(Path.GetTempPath(), "ClipThat", "Mux", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            string videoPath = Path.Combine(tempDir, "video.h264");
+            string? sysAudioPath = hasSystemAudio ? Path.Combine(tempDir, "sys.aac") : null;
+            string? micAudioPath = hasMicrophoneAudio ? Path.Combine(tempDir, "mic.aac") : null;
+            string? mixAudioPath = includeCombinedMix ? Path.Combine(tempDir, "mix.aac") : null;
+
+            bool wroteVideoHeader = false;
+            Span<byte> adtsHeader = stackalloc byte[7];
+
+            using (var videoStream = new FileStream(videoPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
+            using (FileStream? sysStream = sysAudioPath is not null ? new FileStream(sysAudioPath, FileMode.Create, FileAccess.Write, FileShare.None, 32768) : null)
+            using (FileStream? micStream = micAudioPath is not null ? new FileStream(micAudioPath, FileMode.Create, FileAccess.Write, FileShare.None, 32768) : null)
+            using (FileStream? mixStream = mixAudioPath is not null ? new FileStream(mixAudioPath, FileMode.Create, FileAccess.Write, FileShare.None, 32768) : null)
+            {
+                for (int i = 0; i < orderedPackets.Count; i++)
+                {
+                    EncodedPacket packet = orderedPackets[i].Packet;
+                    switch (packet.TrackType)
+                    {
+                        case MediaTrackType.Video:
+                            if (!wroteVideoHeader)
+                            {
+                                wroteVideoHeader = true;
+                                if (videoSequenceHeader is { Length: > 0 } &&
+                                    TryExtractAnnexBSpsPps(packet.Data) is null)
+                                {
+                                    videoStream.Write(videoSequenceHeader, 0, videoSequenceHeader.Length);
+                                }
+                            }
+
+                            videoStream.Write(packet.Buffer, 0, packet.Length);
+                            break;
+
+                        case MediaTrackType.SystemAudio when sysStream is not null:
+                            WriteAdtsAacFrame(sysStream, packet.Buffer, packet.Length, adtsHeader);
+                            break;
+
+                        case MediaTrackType.MicrophoneAudio when micStream is not null:
+                            WriteAdtsAacFrame(micStream, packet.Buffer, packet.Length, adtsHeader);
+                            break;
+
+                        case MediaTrackType.CombinedMixAudio when mixStream is not null:
+                            WriteAdtsAacFrame(mixStream, packet.Buffer, packet.Length, adtsHeader);
+                            break;
+                    }
+                }
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = ffmpegPath,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardError = true,
+                RedirectStandardOutput = false
+            };
+
+            startInfo.ArgumentList.Add("-hide_banner");
+            startInfo.ArgumentList.Add("-loglevel");
+            startInfo.ArgumentList.Add("error");
+            startInfo.ArgumentList.Add("-y");
+            startInfo.ArgumentList.Add("-r");
+            startInfo.ArgumentList.Add(fps.ToString(CultureInfo.InvariantCulture));
+            startInfo.ArgumentList.Add("-f");
+            startInfo.ArgumentList.Add("h264");
+            startInfo.ArgumentList.Add("-i");
+            startInfo.ArgumentList.Add(videoPath);
+
+            var audioInputIndices = new List<int>(3);
+            int nextInputIndex = 1;
+
+            void AddAudioInputIfValid(string? path)
+            {
+                if (path is not null && File.Exists(path) && new FileInfo(path).Length > 0)
+                {
+                    startInfo.ArgumentList.Add("-f");
+                    startInfo.ArgumentList.Add("aac");
+                    startInfo.ArgumentList.Add("-i");
+                    startInfo.ArgumentList.Add(path);
+                    audioInputIndices.Add(nextInputIndex++);
+                }
+            }
+
+            AddAudioInputIfValid(sysAudioPath);
+            AddAudioInputIfValid(micAudioPath);
+            AddAudioInputIfValid(mixAudioPath);
+
+            startInfo.ArgumentList.Add("-map");
+            startInfo.ArgumentList.Add("0:v:0");
+            for (int i = 0; i < audioInputIndices.Count; i++)
+            {
+                startInfo.ArgumentList.Add("-map");
+                startInfo.ArgumentList.Add($"{audioInputIndices[i]}:a:0");
+            }
+
+            startInfo.ArgumentList.Add("-c");
+            startInfo.ArgumentList.Add("copy");
+            startInfo.ArgumentList.Add("-movflags");
+            startInfo.ArgumentList.Add("+faststart");
+            startInfo.ArgumentList.Add("-f");
+            startInfo.ArgumentList.Add("mp4");
+            startInfo.ArgumentList.Add(outputFilePath);
+
+            using var process = new Process { StartInfo = startInfo };
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("Nie udało się uruchomić procesu ffmpeg.exe.");
+            }
+
+            string stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            if (process.ExitCode != 0 || !File.Exists(outputFilePath))
+            {
+                string detail = string.IsNullOrWhiteSpace(stderr)
+                    ? $"Kod wyjścia: {process.ExitCode}"
+                    : stderr.Trim();
+                throw new InvalidOperationException($"FFmpeg zakończył się błędem: {detail}");
+            }
+
+            TryPatchAudioTrackSelectionFlags(outputFilePath);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempDir))
+                {
+                    Directory.Delete(tempDir, recursive: true);
+                }
+            }
+            catch
+            {
+                // Best-effort temp cleanup.
+            }
+        }
+    }
+
+    private static void WriteAdtsAacFrame(FileStream stream, byte[] rawAacPayload, int length, Span<byte> headerBuffer)
+    {
+        if (length <= 0)
+        {
+            return;
+        }
+
+        // Standard 7-byte ISO 14496-3 ADTS header for AAC-LC (profile=1), 48000 Hz (freqIdx=3), Stereo (chanCfg=2).
+        const int profile = 1;
+        const int freqIdx = 3;
+        const int chanCfg = 2;
+        int frameLength = length + 7;
+
+        headerBuffer[0] = 0xFF;
+        headerBuffer[1] = 0xF1;
+        headerBuffer[2] = (byte)((profile << 6) | (freqIdx << 2) | (chanCfg >> 2));
+        headerBuffer[3] = (byte)(((chanCfg & 0x03) << 6) | ((frameLength >> 11) & 0x03));
+        headerBuffer[4] = (byte)((frameLength >> 3) & 0xFF);
+        headerBuffer[5] = (byte)(((frameLength & 0x07) << 5) | 0x1F);
+        headerBuffer[6] = 0xFC;
+
+        stream.Write(headerBuffer);
+        stream.Write(rawAacPayload, 0, length);
     }
 
     private static void WritePacketSample(

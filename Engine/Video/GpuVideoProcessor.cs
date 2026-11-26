@@ -1,7 +1,7 @@
+using ClipThat.Engine.Diagnostics;
 using ClipThat.Models;
 using SharpGen.Runtime;
 using Vortice;
-using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 using Vortice.MediaFoundation;
@@ -9,17 +9,20 @@ using Vortice.MediaFoundation;
 namespace ClipThat.Engine.Video;
 
 /// <summary>
-/// Owns the Direct3D11 device and hardware <see cref="ID3D11VideoProcessor"/> pipeline that scales
-/// incoming monitor-sized BGRA textures and converts them directly on the GPU into reusable NV12 surfaces.
+/// Hardware <see cref="ID3D11VideoProcessor"/> pipeline bound to the monitor-matched <see cref="ID3D11Device"/>
+/// that scales incoming monitor-sized BGRA textures and converts them directly on the GPU into reusable
+/// even-dimensioned NV12 surfaces across NVIDIA, AMD, and Intel GPUs, with automatic CPU staging/conversion
+/// fallback when software MFT encoding or a non-video driver is active.
 /// </summary>
 public sealed class GpuVideoProcessor : IDisposable
 {
-    private const int OutputSurfacePoolSize = 4;
+    private const int OutputSurfacePoolSize = 8;
 
     private readonly ID3D11Device _device;
     private readonly ID3D11DeviceContext _immediateContext;
-    private readonly ID3D11VideoDevice _videoDevice;
-    private readonly ID3D11VideoContext _videoContext;
+    private readonly bool _ownsDevice;
+    private readonly ID3D11VideoDevice? _videoDevice;
+    private readonly ID3D11VideoContext? _videoContext;
     private readonly ID3D11Texture2D[] _nv12OutputTextures;
     private readonly VideoProcessorStream[] _streams = new VideoProcessorStream[1];
 
@@ -28,6 +31,7 @@ public sealed class GpuVideoProcessor : IDisposable
     private ID3D11VideoProcessorOutputView?[] _nv12OutputViews;
     private ID3D11Texture2D? _fallbackBgraInputTexture;
     private ID3D11Texture2D? _cpuStagingNv12Texture;
+    private ID3D11Texture2D? _cpuStagingBgraTexture;
 
     private uint _configuredInputWidth;
     private uint _configuredInputHeight;
@@ -35,43 +39,92 @@ public sealed class GpuVideoProcessor : IDisposable
     private int _nextPoolIndex;
     private int _disposed;
 
-    public GpuVideoProcessor(ResolutionPreset resolutionPreset, int targetFps)
+    public GpuVideoProcessor(
+        ID3D11Device device,
+        ID3D11DeviceContext immediateContext,
+        ResolutionPreset resolutionPreset,
+        int targetFps,
+        string? adapterName = null,
+        Luid adapterLuid = default,
+        bool ownsDevice = false)
     {
-        (int width, int height) = GetTargetDimensions(resolutionPreset);
-        OutputWidth = width;
-        OutputHeight = height;
-        TargetFps = targetFps == 30 ? 30 : 60;
+        ArgumentNullException.ThrowIfNull(device);
+        ArgumentNullException.ThrowIfNull(immediateContext);
 
-        (_device, _immediateContext) = CreateD3D11Device();
+        (int rawWidth, int rawHeight) = GetTargetDimensions(resolutionPreset);
+        OutputWidth = Math.Max(2, rawWidth & ~1);
+        OutputHeight = Math.Max(2, rawHeight & ~1);
+        TargetFps = targetFps == 30 ? 30 : 60;
+        AdapterName = string.IsNullOrWhiteSpace(adapterName) ? "Unknown GPU" : adapterName.Trim();
+        AdapterLuid = adapterLuid;
+
+        _device = device;
+        _immediateContext = immediateContext;
+        _ownsDevice = ownsDevice;
+        _nv12OutputTextures = new ID3D11Texture2D[OutputSurfacePoolSize];
+        _nv12OutputViews = new ID3D11VideoProcessorOutputView?[OutputSurfacePoolSize];
 
         try
         {
             using ID3D11Multithread? multithread = _device.QueryInterfaceOrNull<ID3D11Multithread>();
             multithread?.SetMultithreadProtected(true);
 
-            _videoDevice = _device.QueryInterface<ID3D11VideoDevice>();
-            _videoContext = _immediateContext.QueryInterface<ID3D11VideoContext>();
+            _videoDevice = _device.QueryInterfaceOrNull<ID3D11VideoDevice>();
+            _videoContext = _immediateContext.QueryInterfaceOrNull<ID3D11VideoContext>();
 
-            _nv12OutputTextures = new ID3D11Texture2D[OutputSurfacePoolSize];
-            _nv12OutputViews = new ID3D11VideoProcessorOutputView?[OutputSurfacePoolSize];
-
-            Texture2DDescription nv12Desc = new()
+            if (_videoDevice is not null && _videoContext is not null)
             {
-                Width = (uint)OutputWidth,
-                Height = (uint)OutputHeight,
-                MipLevels = 1,
-                ArraySize = 1,
-                Format = Format.NV12,
-                SampleDescription = new SampleDescription(1, 0),
-                Usage = ResourceUsage.Default,
-                BindFlags = BindFlags.RenderTarget,
-                CPUAccessFlags = CpuAccessFlags.None,
-                MiscFlags = ResourceOptionFlags.None
-            };
+                Texture2DDescription nv12Desc = new()
+                {
+                    Width = (uint)OutputWidth,
+                    Height = (uint)OutputHeight,
+                    MipLevels = 1,
+                    ArraySize = 1,
+                    Format = Format.NV12,
+                    SampleDescription = new SampleDescription(1, 0),
+                    Usage = ResourceUsage.Default,
+                    BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
+                    CPUAccessFlags = CpuAccessFlags.None,
+                    MiscFlags = ResourceOptionFlags.None
+                };
 
-            for (int i = 0; i < OutputSurfacePoolSize; i++)
+                try
+                {
+                    try
+                    {
+                        for (int i = 0; i < OutputSurfacePoolSize; i++)
+                        {
+                            _nv12OutputTextures[i] = _device.CreateTexture2D(nv12Desc);
+                        }
+                    }
+                    catch (SharpGenException)
+                    {
+                        ReleaseNv12Textures();
+                        nv12Desc.BindFlags = BindFlags.RenderTarget;
+                        for (int i = 0; i < OutputSurfacePoolSize; i++)
+                        {
+                            _nv12OutputTextures[i] = _device.CreateTexture2D(nv12Desc);
+                        }
+                    }
+
+                    SupportsHardwareVideoProcessor = true;
+                }
+                catch (Exception ex)
+                {
+                    EngineLogger.Warn(
+                        "GpuVideoProcessor",
+                        $"GPU \"{AdapterName}\" failed to allocate NV12 VideoProcessor surfaces ({OutputWidth}x{OutputHeight}); falling back to CPU BGRA->NV12 conversion.",
+                        ex);
+                    ReleaseNv12Textures();
+                    SupportsHardwareVideoProcessor = false;
+                }
+            }
+            else
             {
-                _nv12OutputTextures[i] = _device.CreateTexture2D(nv12Desc);
+                EngineLogger.Warn(
+                    "GpuVideoProcessor",
+                    $"GPU \"{AdapterName}\" does not expose ID3D11VideoDevice/ID3D11VideoContext; falling back to CPU BGRA->NV12 conversion.");
+                SupportsHardwareVideoProcessor = false;
             }
         }
         catch
@@ -85,6 +138,12 @@ public sealed class GpuVideoProcessor : IDisposable
 
     public ID3D11DeviceContext ImmediateContext => _immediateContext;
 
+    public string AdapterName { get; }
+
+    public Luid AdapterLuid { get; }
+
+    public bool SupportsHardwareVideoProcessor { get; private set; }
+
     public int OutputWidth { get; }
 
     public int OutputHeight { get; }
@@ -92,21 +151,28 @@ public sealed class GpuVideoProcessor : IDisposable
     public int TargetFps { get; }
 
     /// <summary>
-    /// Maps each supported <see cref="ResolutionPreset"/> to even NV12-compatible target dimensions.
+    /// Maps each supported <see cref="ResolutionPreset"/> to guaranteed even NV12/H.264 target dimensions.
     /// </summary>
-    public static (int Width, int Height) GetTargetDimensions(ResolutionPreset preset) => preset switch
+    public static (int Width, int Height) GetTargetDimensions(ResolutionPreset preset)
     {
-        ResolutionPreset.P240 => (426, 240),
-        ResolutionPreset.P360 => (640, 360),
-        ResolutionPreset.P480 => (854, 480),
-        ResolutionPreset.P720 => (1280, 720),
-        ResolutionPreset.P1080 => (1920, 1080),
-        _ => (1920, 1080)
-    };
+        (int w, int h) = preset switch
+        {
+            ResolutionPreset.P240 => (426, 240),
+            ResolutionPreset.P360 => (640, 360),
+            ResolutionPreset.P480 => (854, 480),
+            ResolutionPreset.P720 => (1280, 720),
+            ResolutionPreset.P1080 => (1920, 1080),
+            _ => (1920, 1080)
+        };
+
+        return (w & ~1, h & ~1);
+    }
 
     /// <summary>
     /// Scales and color-converts an incoming <see cref="Format.B8G8R8A8_UNorm"/> GPU texture
     /// directly on the GPU into a reusable pooled <see cref="Format.NV12"/> <see cref="ID3D11Texture2D"/>.
+    /// When the active adapter does not support <see cref="ID3D11VideoProcessor"/>, returns the
+    /// BGRA texture unchanged for CPU-side NV12 conversion inside <see cref="CopyNv12ToMediaBuffer"/>.
     /// </summary>
     public ID3D11Texture2D ProcessFrame(ID3D11Texture2D inputBgraTexture)
     {
@@ -117,6 +183,11 @@ public sealed class GpuVideoProcessor : IDisposable
         if (inputDesc.Width == 0 || inputDesc.Height == 0)
         {
             throw new InvalidOperationException("Przechwycona tekstura GPU ma zerowe wymiary.");
+        }
+
+        if (!SupportsHardwareVideoProcessor || _videoDevice is null || _videoContext is null)
+        {
+            return inputBgraTexture;
         }
 
         EnsureVideoProcessor(inputDesc.Width, inputDesc.Height);
@@ -143,6 +214,9 @@ public sealed class GpuVideoProcessor : IDisposable
         try
         {
             _videoContext.VideoProcessorBlt(_videoProcessor!, outputView, _outputFrameIndex++, 1, _streams).CheckError();
+            // Flush queued D3D11 video blit commands so async hardware encoders (AMD AMF / NVENC / QSV)
+            // immediately observe the completed NV12 surface on their video encode engine queue.
+            _immediateContext.Flush();
         }
         finally
         {
@@ -154,14 +228,22 @@ public sealed class GpuVideoProcessor : IDisposable
     }
 
     /// <summary>
-    /// Copies a GPU NV12 texture into a CPU <see cref="IMFMediaBuffer"/> using a lazily allocated staging texture.
-    /// Only invoked when encoding falls back to a software MFT that cannot consume D3D11 DXGI surfaces directly.
+    /// Copies a GPU NV12 texture (or converts a BGRA texture when hardware video processing is unavailable)
+    /// into a CPU <see cref="IMFMediaBuffer"/> using a lazily allocated staging texture.
+    /// Used for Tier 2 (cross-adapter hardware MFT) and Tier 3 (software MFT) encoding.
     /// </summary>
-    public unsafe void CopyNv12ToMediaBuffer(ID3D11Texture2D nv12Texture, IMFMediaBuffer destinationBuffer)
+    public unsafe void CopyNv12ToMediaBuffer(ID3D11Texture2D sourceTexture, IMFMediaBuffer destinationBuffer)
     {
-        ArgumentNullException.ThrowIfNull(nv12Texture);
+        ArgumentNullException.ThrowIfNull(sourceTexture);
         ArgumentNullException.ThrowIfNull(destinationBuffer);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        Texture2DDescription sourceDesc = sourceTexture.Description;
+        if (sourceDesc.Format != Format.NV12)
+        {
+            CopyBgraToNv12MediaBuffer(sourceTexture, sourceDesc, destinationBuffer);
+            return;
+        }
 
         _cpuStagingNv12Texture ??= _device.CreateTexture2D(new Texture2DDescription
         {
@@ -177,7 +259,7 @@ public sealed class GpuVideoProcessor : IDisposable
             MiscFlags = ResourceOptionFlags.None
         });
 
-        _immediateContext.CopyResource(_cpuStagingNv12Texture, nv12Texture);
+        _immediateContext.CopyResource(_cpuStagingNv12Texture, sourceTexture);
 
         MappedSubresource mapped = _immediateContext.Map(_cpuStagingNv12Texture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
         try
@@ -230,6 +312,122 @@ public sealed class GpuVideoProcessor : IDisposable
         }
     }
 
+    private unsafe void CopyBgraToNv12MediaBuffer(
+        ID3D11Texture2D bgraTexture,
+        Texture2DDescription srcDesc,
+        IMFMediaBuffer destinationBuffer)
+    {
+        ID3D11Texture2D staging = EnsureCpuStagingBgraTexture(srcDesc.Width, srcDesc.Height, srcDesc.Format);
+        _immediateContext.CopyResource(staging, bgraTexture);
+
+        MappedSubresource mapped = _immediateContext.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        try
+        {
+            int srcW = (int)srcDesc.Width;
+            int srcH = (int)srcDesc.Height;
+            int dstW = OutputWidth;
+            int dstH = OutputHeight;
+            int requiredBytes = dstW * dstH * 3 / 2;
+
+            destinationBuffer.Lock(out nint dstPtr, out int maxLength, out _);
+            try
+            {
+                if (maxLength < requiredBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Bufor wyjściowy NV12 ({maxLength} B) jest mniejszy niż wymagane {requiredBytes} B.");
+                }
+
+                byte* srcBase = (byte*)mapped.DataPointer;
+                int srcPitch = (int)mapped.RowPitch;
+                byte* yPlane = (byte*)dstPtr;
+                byte* uvPlane = yPlane + (dstW * dstH);
+
+                // Fixed-point BT.709 studio-range (16..235 / 16..240) BGRA -> NV12 conversion with nearest scaling.
+                for (int dy = 0; dy < dstH; dy++)
+                {
+                    int sy = (int)((long)dy * srcH / dstH);
+                    byte* srcRow = srcBase + ((long)sy * srcPitch);
+                    byte* yRow = yPlane + ((long)dy * dstW);
+
+                    for (int dx = 0; dx < dstW; dx++)
+                    {
+                        int sx = (int)((long)dx * srcW / dstW);
+                        byte* px = srcRow + (sx * 4);
+                        int b = px[0];
+                        int g = px[1];
+                        int r = px[2];
+                        yRow[dx] = (byte)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
+                    }
+                }
+
+                int uvH = dstH / 2;
+                int uvW = dstW / 2;
+                for (int uy = 0; uy < uvH; uy++)
+                {
+                    int sy = (int)((long)(uy * 2) * srcH / dstH);
+                    byte* srcRow = srcBase + ((long)sy * srcPitch);
+                    byte* uvRow = uvPlane + ((long)uy * dstW);
+
+                    for (int ux = 0; ux < uvW; ux++)
+                    {
+                        int sx = (int)((long)(ux * 2) * srcW / dstW);
+                        byte* px = srcRow + (sx * 4);
+                        int b = px[0];
+                        int g = px[1];
+                        int r = px[2];
+                        int u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+                        int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+                        uvRow[ux * 2] = (byte)Math.Clamp(u, 16, 240);
+                        uvRow[ux * 2 + 1] = (byte)Math.Clamp(v, 16, 240);
+                    }
+                }
+            }
+            finally
+            {
+                destinationBuffer.Unlock();
+            }
+
+            destinationBuffer.CurrentLength = requiredBytes;
+        }
+        finally
+        {
+            _immediateContext.Unmap(staging, 0);
+        }
+    }
+
+    private ID3D11Texture2D EnsureCpuStagingBgraTexture(uint width, uint height, Format format)
+    {
+        Format effectiveFormat = format == Format.Unknown ? Format.B8G8R8A8_UNorm : format;
+        if (_cpuStagingBgraTexture is not null)
+        {
+            Texture2DDescription existing = _cpuStagingBgraTexture.Description;
+            if (existing.Width == width && existing.Height == height && existing.Format == effectiveFormat)
+            {
+                return _cpuStagingBgraTexture;
+            }
+
+            _cpuStagingBgraTexture.Dispose();
+            _cpuStagingBgraTexture = null;
+        }
+
+        _cpuStagingBgraTexture = _device.CreateTexture2D(new Texture2DDescription
+        {
+            Width = width,
+            Height = height,
+            MipLevels = 1,
+            ArraySize = 1,
+            Format = effectiveFormat,
+            SampleDescription = new SampleDescription(1, 0),
+            Usage = ResourceUsage.Staging,
+            BindFlags = BindFlags.None,
+            CPUAccessFlags = CpuAccessFlags.Read,
+            MiscFlags = ResourceOptionFlags.None
+        });
+
+        return _cpuStagingBgraTexture;
+    }
+
     private ID3D11VideoProcessorInputView CreateInputView(ID3D11Texture2D inputTexture, Texture2DDescription inputDesc)
     {
         var inputViewDesc = new VideoProcessorInputViewDescription
@@ -245,7 +443,7 @@ public sealed class GpuVideoProcessor : IDisposable
 
         try
         {
-            return _videoDevice.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
+            return _videoDevice!.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
         }
         catch (SharpGenException)
         {
@@ -253,7 +451,7 @@ public sealed class GpuVideoProcessor : IDisposable
             // Fall back to a GPU-only copy into a cached D3D11 texture on the same adapter (still zero CPU copy).
             ID3D11Texture2D gpuCopy = EnsureFallbackBgraTexture(inputDesc.Width, inputDesc.Height, inputDesc.Format);
             _immediateContext.CopyResource(gpuCopy, inputTexture);
-            return _videoDevice.CreateVideoProcessorInputView(gpuCopy, _enumerator!, inputViewDesc);
+            return _videoDevice!.CreateVideoProcessorInputView(gpuCopy, _enumerator!, inputViewDesc);
         }
     }
 
@@ -312,13 +510,13 @@ public sealed class GpuVideoProcessor : IDisposable
             Usage = VideoUsage.PlaybackNormal
         };
 
-        _enumerator = _videoDevice.CreateVideoProcessorEnumerator(contentDesc);
+        _enumerator = _videoDevice!.CreateVideoProcessorEnumerator(contentDesc);
         _videoProcessor = _videoDevice.CreateVideoProcessor(_enumerator, 0);
 
         var sourceRect = new RawRect(0, 0, (int)inputWidth, (int)inputHeight);
         var destRect = new RawRect(0, 0, OutputWidth, OutputHeight);
 
-        _videoContext.VideoProcessorSetStreamFrameFormat(_videoProcessor, 0, VideoFrameFormat.Progressive);
+        _videoContext!.VideoProcessorSetStreamFrameFormat(_videoProcessor, 0, VideoFrameFormat.Progressive);
         _videoContext.VideoProcessorSetStreamAutoProcessingMode(_videoProcessor, 0, false);
         _videoContext.VideoProcessorSetStreamSourceRect(_videoProcessor, 0, true, sourceRect);
         _videoContext.VideoProcessorSetStreamDestRect(_videoProcessor, 0, true, destRect);
@@ -385,50 +583,18 @@ public sealed class GpuVideoProcessor : IDisposable
         _configuredInputHeight = 0;
     }
 
-    private static (ID3D11Device Device, ID3D11DeviceContext Context) CreateD3D11Device()
+    private void ReleaseNv12Textures()
     {
-        FeatureLevel[] featureLevels =
+        if (_nv12OutputTextures is null)
         {
-            FeatureLevel.Level_11_1,
-            FeatureLevel.Level_11_0,
-            FeatureLevel.Level_10_1,
-            FeatureLevel.Level_10_0
-        };
-
-        Result hr = D3D11.D3D11CreateDevice(
-            nint.Zero,
-            DriverType.Hardware,
-            DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport,
-            featureLevels,
-            out ID3D11Device? device,
-            out FeatureLevel _,
-            out ID3D11DeviceContext? context);
-
-        if (hr.Failure || device is null || context is null)
-        {
-            device?.Dispose();
-            context?.Dispose();
-
-            hr = D3D11.D3D11CreateDevice(
-                nint.Zero,
-                DriverType.Hardware,
-                DeviceCreationFlags.BgraSupport,
-                featureLevels,
-                out device,
-                out FeatureLevel _,
-                out context);
-
-            hr.CheckError();
+            return;
         }
 
-        if (device is null || context is null)
+        for (int i = 0; i < _nv12OutputTextures.Length; i++)
         {
-            device?.Dispose();
-            context?.Dispose();
-            throw new InvalidOperationException("Nie udało się utworzyć sprzętowego urządzenia Direct3D11.");
+            _nv12OutputTextures[i]?.Dispose();
+            _nv12OutputTextures[i] = null!;
         }
-
-        return (device, context);
     }
 
     public void Dispose()
@@ -451,17 +617,18 @@ public sealed class GpuVideoProcessor : IDisposable
         _cpuStagingNv12Texture?.Dispose();
         _cpuStagingNv12Texture = null;
 
-        if (_nv12OutputTextures is not null)
-        {
-            for (int i = 0; i < _nv12OutputTextures.Length; i++)
-            {
-                _nv12OutputTextures[i]?.Dispose();
-            }
-        }
+        _cpuStagingBgraTexture?.Dispose();
+        _cpuStagingBgraTexture = null;
+
+        ReleaseNv12Textures();
 
         _videoContext?.Dispose();
         _videoDevice?.Dispose();
-        _immediateContext?.Dispose();
-        _device?.Dispose();
+
+        if (_ownsDevice)
+        {
+            _immediateContext?.Dispose();
+            _device?.Dispose();
+        }
     }
 }

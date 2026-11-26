@@ -9,6 +9,17 @@ public interface IReplayEngine : IDisposable
 {
     bool IsRecording { get; }
 
+    /// <summary>
+    /// Most recent human-readable engine status message, if any.
+    /// </summary>
+    string? CurrentStatus { get; }
+
+    /// <summary>
+    /// Most recent fatal startup, pipeline, or replay-save error message, or <see langword="null"/>
+    /// when the engine is healthy. Preserved across UI window opens so startup failures are never silent.
+    /// </summary>
+    string? LastError { get; }
+
     Task StartAsync(AppSettings settings);
 
     Task StopAsync();
@@ -18,6 +29,8 @@ public interface IReplayEngine : IDisposable
     Task UpdateSettingsAsync(AppSettings settings);
 
     event Action<string>? StatusChanged;
+
+    event Action<string>? ErrorOccurred;
 
     event Action<string>? ReplaySaved;
 }

@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Media;
 using ClipThat.Engine;
+using ClipThat.Engine.Diagnostics;
 using ClipThat.Models;
 using ClipThat.Services;
 using ClipThat.UI;
@@ -43,6 +44,8 @@ public partial class App : Application
     private Drawing.Icon? _recordingTrayIcon;
     private Drawing.Icon? _pausedTrayIcon;
     private long _lastHotkeyTriggerTickMs;
+    private long _lastTrayErrorTickMs;
+    private string? _lastTrayErrorMessage;
     private int _hotkeySaveInProgress;
     private bool _isShuttingDown;
     private bool _userPreferenceEventsSubscribed;
@@ -76,6 +79,7 @@ public partial class App : Application
             }
 
             _replayEngine.StatusChanged += OnEngineStatusChanged;
+            _replayEngine.ErrorOccurred += OnEngineErrorOccurred;
             _replayEngine.ReplaySaved += OnEngineReplaySaved;
 
             InitializeTrayIcon();
@@ -84,6 +88,7 @@ public partial class App : Application
             bool startMinimized = e.Args.Any(arg =>
                 string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
 
+            bool startupRecordingFailed = false;
             if (startMinimized || settings.StartRecordingOnLaunch)
             {
                 try
@@ -92,15 +97,13 @@ public partial class App : Application
                 }
                 catch (Exception ex)
                 {
-                    _notifyIcon?.ShowBalloonTip(
-                        4000,
-                        "ClipThat",
-                        $"Nie udało się uruchomić nagrywania: {ex.Message}",
-                        WinForms.ToolTipIcon.Warning);
+                    startupRecordingFailed = true;
+                    EngineLogger.Error("App", $"Fatal startup capture failure: {ex.Message}", ex);
+                    NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się uruchomić nagrywania: {ex.Message}");
                 }
             }
 
-            if (!startMinimized && !settings.StartRecordingOnLaunch)
+            if (!startMinimized && (!settings.StartRecordingOnLaunch || startupRecordingFailed))
             {
                 ShowMainWindow();
             }
@@ -109,6 +112,8 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
+            EngineLogger.Error("App", $"Fatal application startup failure: {ex.Message}", ex);
+            NotifyTrayError($"Nie udało się uruchomić aplikacji ClipThat: {ex.Message}");
             MessageBox.Show(
                 $"Nie udało się uruchomić aplikacji ClipThat:\n{ex.Message}",
                 "ClipThat",
@@ -205,14 +210,8 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            await Dispatcher.InvokeAsync(() =>
-            {
-                _notifyIcon?.ShowBalloonTip(
-                    3000,
-                    "ClipThat",
-                    $"Nie udało się zapisać powtórki: {ex.Message}",
-                    WinForms.ToolTipIcon.Error);
-            });
+            EngineLogger.Error("App", $"SaveReplayFromHotkeyAsync failed: {ex.Message}", ex);
+            NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się zapisać powtórki: {ex.Message}");
         }
         finally
         {
@@ -308,11 +307,8 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            _notifyIcon?.ShowBalloonTip(
-                3000,
-                "ClipThat",
-                $"Nie udało się zapisać powtórki: {ex.Message}",
-                WinForms.ToolTipIcon.Error);
+            EngineLogger.Error("App", $"SaveReplayFromTrayAsync failed: {ex.Message}", ex);
+            NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się zapisać powtórki: {ex.Message}");
         }
     }
 
@@ -332,11 +328,8 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            _notifyIcon?.ShowBalloonTip(
-                3000,
-                "ClipThat",
-                $"Błąd zmiany stanu nagrywania: {ex.Message}",
-                WinForms.ToolTipIcon.Error);
+            EngineLogger.Error("App", $"ToggleRecordingAsync failed: {ex.Message}", ex);
+            NotifyTrayError(_replayEngine.LastError ?? $"Błąd zmiany stanu nagrywania: {ex.Message}");
         }
         finally
         {
@@ -347,6 +340,58 @@ public partial class App : Application
     private void OnEngineStatusChanged(string _)
     {
         Dispatcher.InvokeAsync(SyncTrayState);
+    }
+
+    private void OnEngineErrorOccurred(string errorMessage)
+    {
+        NotifyTrayError(errorMessage);
+        Dispatcher.InvokeAsync(SyncTrayState);
+    }
+
+    /// <summary>
+    /// Surfaces a fatal startup, capture, or replay-save error in a Windows system tray balloon
+    /// notification with short-window deduplication so failures are never silent or double-popped.
+    /// </summary>
+    public void NotifyTrayError(string message)
+    {
+        if (_isShuttingDown || string.IsNullOrWhiteSpace(message))
+        {
+            return;
+        }
+
+        string trimmed = message.Trim();
+        string displayText = trimmed.Length > 240 ? trimmed[..237] + "..." : trimmed;
+
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (_isShuttingDown || _notifyIcon is null)
+            {
+                return;
+            }
+
+            long nowMs = Environment.TickCount64;
+            if (string.Equals(_lastTrayErrorMessage, displayText, StringComparison.Ordinal) &&
+                nowMs - _lastTrayErrorTickMs < 2000)
+            {
+                return;
+            }
+
+            _lastTrayErrorMessage = displayText;
+            _lastTrayErrorTickMs = nowMs;
+
+            try
+            {
+                _notifyIcon.ShowBalloonTip(
+                    5000,
+                    "ClipThat — Błąd",
+                    displayText,
+                    WinForms.ToolTipIcon.Error);
+            }
+            catch
+            {
+                // Ignore tray notification failures during OS shell transitions.
+            }
+        });
     }
 
     private void OnEngineReplaySaved(string filePath)
@@ -523,6 +568,7 @@ public partial class App : Application
             }
 
             _replayEngine.StatusChanged -= OnEngineStatusChanged;
+            _replayEngine.ErrorOccurred -= OnEngineErrorOccurred;
             _replayEngine.ReplaySaved -= OnEngineReplaySaved;
 
             try

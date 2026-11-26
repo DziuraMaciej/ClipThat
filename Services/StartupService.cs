@@ -1,29 +1,46 @@
 using System.Diagnostics;
+using System.IO;
 using Microsoft.Win32;
 
 namespace ClipThat.Services;
 
 /// <summary>
-/// Manages automatic launch with Windows via the current user's Run registry key.
+/// Manages automatic launch with Windows via the current user's Run registry key,
+/// supporting both standalone <c>ClipThat.exe</c> and <c>dotnet run</c> / <c>Start_ClipThat.bat</c> launches.
 /// </summary>
 public sealed class StartupService
 {
     private const string RunKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
     private const string ValueName = "ClipThat";
+    private const string LauncherScriptFileName = "Start_ClipThat.bat";
+    private const string ProjectFileName = "ClipThat.csproj";
 
     /// <summary>
-    /// Returns true if ClipThat is currently registered to start with Windows.
+    /// Returns true if ClipThat is currently registered to start with Windows
+    /// (whether registered as standalone <c>ClipThat.exe</c> or via <c>Start_ClipThat.bat</c> / <c>dotnet.exe</c>).
     /// </summary>
-    public bool IsEnabled()
+    public bool IsStartupEnabled()
     {
-        using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
-        object? value = key?.GetValue(ValueName);
-        return value is string command && !string.IsNullOrWhiteSpace(command);
+        try
+        {
+            using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
+            object? value = key?.GetValue(ValueName);
+            return value is string command && !string.IsNullOrWhiteSpace(command);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
-    /// Re-applies the current executable path (<see cref="Environment.ProcessPath"/>) to the Windows Run
-    /// registry key so moving <c>ClipThat.exe</c> to another folder never breaks autostart.
+    /// Alias for <see cref="IsStartupEnabled"/> used by existing settings UI callers.
+    /// </summary>
+    public bool IsEnabled() => IsStartupEnabled();
+
+    /// <summary>
+    /// Re-applies the current startup command to the Windows Run registry key so moving
+    /// <c>ClipThat.exe</c> or switching between standalone and <c>Start_ClipThat.bat</c> never breaks autostart.
     /// </summary>
     public void EnsureStartupPathUpToDate()
     {
@@ -44,7 +61,8 @@ public sealed class StartupService
     }
 
     /// <summary>
-    /// Adds or removes the ClipThat startup registry entry with the --minimized flag.
+    /// Adds or removes the ClipThat startup registry entry under
+    /// <c>HKCU\Software\Microsoft\Windows\CurrentVersion\Run</c>.
     /// </summary>
     public void SetEnabled(bool enabled)
     {
@@ -75,6 +93,77 @@ public sealed class StartupService
             throw new InvalidOperationException("Nie udało się ustalić ścieżki pliku wykonywalnego ClipThat.");
         }
 
+        if (IsDotnetHost(executablePath))
+        {
+            return BuildDotnetStartupCommand(executablePath);
+        }
+
         return $"\"{executablePath}\" --minimized";
+    }
+
+    private static bool IsDotnetHost(string executablePath)
+    {
+        string fileName = Path.GetFileName(executablePath);
+        return string.Equals(fileName, "dotnet.exe", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildDotnetStartupCommand(string dotnetPath)
+    {
+        string? launcherBatPath = null;
+        string? projectFilePath = null;
+
+        string baseDir = AppContext.BaseDirectory;
+        if (!string.IsNullOrWhiteSpace(baseDir))
+        {
+            DirectoryInfo? current = new DirectoryInfo(baseDir);
+            while (current is not null)
+            {
+                string candidateBat = Path.Combine(current.FullName, LauncherScriptFileName);
+                if (File.Exists(candidateBat))
+                {
+                    launcherBatPath = candidateBat;
+                    break;
+                }
+
+                if (projectFilePath is null)
+                {
+                    string candidateCsproj = Path.Combine(current.FullName, ProjectFileName);
+                    if (File.Exists(candidateCsproj))
+                    {
+                        projectFilePath = candidateCsproj;
+                    }
+                }
+
+                current = current.Parent;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(launcherBatPath))
+        {
+            return $"cmd.exe /c start \"\" /min \"{launcherBatPath}\"";
+        }
+
+        if (!string.IsNullOrWhiteSpace(projectFilePath))
+        {
+            string? projectDir = Path.GetDirectoryName(projectFilePath);
+            if (!string.IsNullOrWhiteSpace(projectDir))
+            {
+                string expectedBatPath = Path.Combine(projectDir, LauncherScriptFileName);
+                if (File.Exists(expectedBatPath))
+                {
+                    return $"cmd.exe /c start \"\" /min \"{expectedBatPath}\"";
+                }
+            }
+
+            return $"cmd.exe /c start \"\" /min \"{dotnetPath}\" run --project \"{projectFilePath}\" -- --minimized";
+        }
+
+        string fallbackDll = Path.Combine(AppContext.BaseDirectory, "ClipThat.dll");
+        if (File.Exists(fallbackDll))
+        {
+            return $"\"{dotnetPath}\" \"{fallbackDll}\" --minimized";
+        }
+
+        return $"\"{dotnetPath}\" --minimized";
     }
 }

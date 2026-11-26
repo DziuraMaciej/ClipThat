@@ -4,6 +4,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
 using System.Text.RegularExpressions;
+using ClipThat.Engine.Diagnostics;
 using ClipThat.Engine.Muxing;
 using ClipThat.Models;
 using Windows.Storage;
@@ -162,19 +163,59 @@ public sealed partial class ClipEditorService
     }
 
     /// <summary>
-    /// Resolves an installed or cached <c>ffmpeg.exe</c> from the application directory, <c>Tools\ffmpeg.exe</c>,
-    /// user cache, or the system <c>PATH</c>. Returns <see langword="null"/> if not found.
+    /// Resolves <c>ffmpeg.exe</c> from the portable embedded extraction cache
+    /// (<c>%LocalAppData%\ClipThat\bin\ffmpeg.exe</c>), the application directory, <c>Tools\ffmpeg.exe</c>,
+    /// user cache, or the system <c>PATH</c>. Returns <see langword="null"/> if not yet extracted or installed.
     /// </summary>
-    public string? ResolveFfmpegPath() => ResolveToolExecutable("ffmpeg.exe");
+    public string? ResolveFfmpegPath()
+    {
+        if (File.Exists(PortableFfmpegProvider.ExtractedFfmpegPath))
+        {
+            return PortableFfmpegProvider.ExtractedFfmpegPath;
+        }
+
+        return ResolveToolExecutable("ffmpeg.exe");
+    }
 
     /// <summary>
-    /// Ensures <c>ffmpeg.exe</c> is available locally, downloading the lightweight Windows x64 essentials build
-    /// once on demand if it is not installed on the machine.
+    /// Ensures <c>ffmpeg.exe</c> is available locally by extracting the embedded portable binary once on demand
+    /// to <c>%LocalAppData%\ClipThat\bin\ffmpeg.exe</c>, falling back to system-installed or downloaded FFmpeg
+    /// only if the embedded resource is unavailable.
     /// </summary>
     public async Task<string> EnsureFfmpegAvailableAsync(
         IProgress<ClipExportProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
+        try
+        {
+            bool needsExtraction = !File.Exists(PortableFfmpegProvider.ExtractedFfmpegPath);
+            if (needsExtraction)
+            {
+                progress?.Report(new ClipExportProgress(
+                    "Przygotowywanie wbudowanego FFmpeg...",
+                    null,
+                    IsIndeterminate: true));
+            }
+
+            string? portablePath = await PortableFfmpegProvider.TryEnsureExtractedAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (!string.IsNullOrWhiteSpace(portablePath) && File.Exists(portablePath))
+            {
+                return portablePath;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            EngineLogger.Warn(
+                "ClipEditorService",
+                $"Failed to extract embedded portable ffmpeg.exe ({ex.Message}); checking fallback locations.",
+                ex);
+        }
+
         string? existing = ResolveFfmpegPath();
         if (existing is not null)
         {
@@ -1079,6 +1120,12 @@ public sealed partial class ClipEditorService
 
     private static string? ResolveToolExecutable(string executableName)
     {
+        string portableBinCandidate = Path.Combine(PortableFfmpegProvider.BinDirectory, executableName);
+        if (File.Exists(portableBinCandidate))
+        {
+            return portableBinCandidate;
+        }
+
         string baseDirCandidate = Path.Combine(AppContext.BaseDirectory, executableName);
         if (File.Exists(baseDirCandidate))
         {

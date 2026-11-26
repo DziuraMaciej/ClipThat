@@ -22,6 +22,7 @@ public partial class SettingsPage : Page
 {
     private static readonly Brush RecordingDotBrush = CreateFrozenBrush(0xFF, 0x22, 0xC5, 0x5E);
     private static readonly Brush PausedDotBrush = CreateFrozenBrush(0xFF, 0x71, 0x71, 0x7A);
+    private static readonly Brush ErrorDotBrush = CreateFrozenBrush(0xFF, 0xEF, 0x44, 0x44);
 
     private readonly SettingsService _settingsService;
     private readonly DisplayService _displayService;
@@ -80,12 +81,13 @@ public partial class SettingsPage : Page
         MonitorLayout.MonitorSelected += MonitorLayout_MonitorSelected;
         SaveHotkeyBox.HotkeyCommitted += SaveHotkeyBox_HotkeyCommitted;
         _replayEngine.StatusChanged += OnEngineStatusChanged;
+        _replayEngine.ErrorOccurred += OnEngineErrorOccurred;
         _audioDeviceService.DevicesChanged += OnAudioDevicesChanged;
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
         Loaded += SettingsPage_Loaded;
         Unloaded += SettingsPage_Unloaded;
 
-        UpdateEngineControls(_replayEngine.IsRecording, null);
+        UpdateEngineControls(_replayEngine.IsRecording, _replayEngine.LastError, _replayEngine.CurrentStatus);
         UpdateFilenamePreview();
         UpdateResourceEstimate();
 
@@ -130,6 +132,7 @@ public partial class SettingsPage : Page
         SaveHotkeyBox.Cleanup();
 
         _replayEngine.StatusChanged -= OnEngineStatusChanged;
+        _replayEngine.ErrorOccurred -= OnEngineErrorOccurred;
         _audioDeviceService.DevicesChanged -= OnAudioDevicesChanged;
         SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         Loaded -= SettingsPage_Loaded;
@@ -143,6 +146,7 @@ public partial class SettingsPage : Page
             return;
         }
 
+        UpdateEngineControls(_replayEngine.IsRecording, _replayEngine.LastError, _replayEngine.CurrentStatus);
         UpdateFilenamePreview();
         _filenamePreviewTimer.Start();
     }
@@ -492,7 +496,9 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                UpdateEngineControls(_replayEngine.IsRecording, $"Błąd stosowania ustawień: {ex.Message}");
+                string errorMessage = $"Błąd stosowania ustawień: {ex.Message}";
+                UpdateEngineControls(_replayEngine.IsRecording, errorMessage);
+                (Application.Current as App)?.NotifyTrayError(errorMessage);
             }
         }
         finally
@@ -539,7 +545,9 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                ShowStatusError($"Błąd zapisu powtórki: {ex.Message}");
+                string errorMessage = $"Błąd zapisu powtórki: {ex.Message}";
+                ShowStatusError(errorMessage);
+                (Application.Current as App)?.NotifyTrayError(errorMessage);
             }
         }
         finally
@@ -569,7 +577,9 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                UpdateEngineControls(_replayEngine.IsRecording, $"Błąd zmiany stanu nagrywania: {ex.Message}");
+                string errorMessage = $"Błąd zmiany stanu nagrywania: {ex.Message}";
+                UpdateEngineControls(_replayEngine.IsRecording, errorMessage);
+                (Application.Current as App)?.NotifyTrayError(errorMessage);
             }
         }
         finally
@@ -609,29 +619,64 @@ public partial class SettingsPage : Page
             return;
         }
 
-        string? errorDetail = IsErrorStatusMessage(status) ? status : null;
+        string? errorDetail = IsErrorStatusMessage(status) ? status : _replayEngine.LastError;
+        string? infoDetail = IsErrorStatusMessage(status) ? null : status;
+
         Dispatcher.InvokeAsync(() =>
         {
             if (!_isDetached)
             {
-                UpdateEngineControls(_replayEngine.IsRecording, errorDetail);
+                UpdateEngineControls(_replayEngine.IsRecording, errorDetail, infoDetail);
             }
         });
     }
 
-    private void UpdateEngineControls(bool isRecording, string? errorMessage)
+    private void OnEngineErrorOccurred(string errorMessage)
     {
-        StatusDot.Fill = isRecording ? RecordingDotBrush : PausedDotBrush;
+        if (_isDetached)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (!_isDetached)
+            {
+                UpdateEngineControls(_replayEngine.IsRecording, errorMessage);
+            }
+        });
+    }
+
+    private void UpdateEngineControls(bool isRecording, string? errorMessage, string? statusDetail = null)
+    {
+        bool hasError = !string.IsNullOrWhiteSpace(errorMessage);
+        StatusDot.Fill = isRecording
+            ? RecordingDotBrush
+            : (hasError ? ErrorDotBrush : PausedDotBrush);
+
         EngineStatusTitleText.Text = isRecording ? "Nagrywanie w tle aktywne" : "Wstrzymano";
 
-        if (!string.IsNullOrWhiteSpace(errorMessage))
+        if (!string.IsNullOrWhiteSpace(statusDetail) &&
+            !IsErrorStatusMessage(statusDetail) &&
+            !string.Equals(statusDetail, "Nagrywanie wstrzymane", StringComparison.OrdinalIgnoreCase))
         {
-            ShowStatusError(errorMessage);
+            EngineStatusDetailText.Text = statusDetail;
+            EngineStatusDetailText.Visibility = Visibility.Visible;
         }
         else
         {
             EngineStatusDetailText.Text = string.Empty;
             EngineStatusDetailText.Visibility = Visibility.Collapsed;
+        }
+
+        if (hasError)
+        {
+            ShowStatusError(errorMessage!);
+        }
+        else
+        {
+            StatusErrorBannerText.Text = string.Empty;
+            StatusErrorBanner.Visibility = Visibility.Collapsed;
         }
 
         ToggleRecordingButton.Content = isRecording ? "Wstrzymaj" : "Wznów";
@@ -641,8 +686,12 @@ public partial class SettingsPage : Page
 
     private void ShowStatusError(string message)
     {
-        EngineStatusDetailText.Text = message;
-        EngineStatusDetailText.Visibility = Visibility.Visible;
+        StatusErrorBannerText.Text = message;
+        StatusErrorBanner.Visibility = Visibility.Visible;
+        if (!_replayEngine.IsRecording)
+        {
+            StatusDot.Fill = ErrorDotBrush;
+        }
     }
 
     private static bool IsErrorStatusMessage(string? status)

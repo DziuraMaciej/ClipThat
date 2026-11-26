@@ -428,3 +428,5 @@ FodyWeavers.xsd
 ReleaseBuild/
 bin/
 obj/
+
+Assets/ffmpeg.exe

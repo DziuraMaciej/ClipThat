@@ -18,6 +18,16 @@
     <Using Remove="System.Windows.Forms" />
     <Using Remove="System.Drawing" />
   </ItemGroup>
+
+  <Target Name="EnsureFfmpegAsset" BeforeTargets="BeforeBuild;AssignTargetPaths;PrepareResourceNames" Condition="!Exists('Assets\ffmpeg.exe')">
+    <Message Text="Pobieranie ffmpeg.exe do folderu Assets..." Importance="high" />
+    <Exec Command="powershell -NoProfile -Command &quot;$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; New-Item -ItemType Directory -Force -Path 'Assets' | Out-Null; $zip = Join-Path $env:TEMP 'ffmpeg-clipthat.zip'; Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip; $extract = Join-Path $env:TEMP 'ffmpeg-clipthat-extract'; Expand-Archive -Path $zip -DestinationPath $extract -Force; $exe = Get-ChildItem -Path $extract -Filter 'ffmpeg.exe' -Recurse | Select-Object -First 1; Copy-Item $exe.FullName 'Assets\ffmpeg.exe' -Force; Remove-Item $zip, $extract -Recurse -Force&quot;" />
+  </Target>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets\ffmpeg.exe" LogicalName="ClipThat.Assets.ffmpeg.exe" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="NAudio" Version="2.4.0" />
     <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
@@ -25,4 +35,28 @@
     <PackageReference Include="WPF-UI" Version="4.3.0" />
   </ItemGroup>
 
+  <Target Name="ResolveSignTool" Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
+    <ItemGroup>
+      <_SignToolCandidates Include="C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" />
+      <_SignToolCandidates Include="C:\Program Files (x86)\Windows Kits\10\bin\*\x86\signtool.exe" />
+    </ItemGroup>
+    <PropertyGroup>
+      <SignToolPath Condition="'@(_SignToolCandidates)' != ''">$([System.String]::Copy('@(_SignToolCandidates)').Split(';')[0])</SignToolPath>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="SignIntermediateOutputs" AfterTargets="CoreCompile" DependsOnTargets="ResolveSignTool" Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;@(IntermediateAssembly)&quot;"
+          Condition="'$(SignToolPath)' != '' and Exists('$(SignToolPath)') and Exists('@(IntermediateAssembly)')"
+          IgnoreExitCode="true" />
+  </Target>
+
+  <Target Name="SignOutputs" AfterTargets="Build" DependsOnTargets="ResolveSignTool" Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;$(TargetPath)&quot;"
+          Condition="'$(SignToolPath)' != '' and Exists('$(SignToolPath)') and Exists('$(TargetPath)')"
+          IgnoreExitCode="true" />
+    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;$(TargetDir)$(TargetName).exe&quot;"
+          Condition="'$(SignToolPath)' != '' and Exists('$(SignToolPath)') and Exists('$(TargetDir)$(TargetName).exe')"
+          IgnoreExitCode="true" />
+  </Target>
 </Project>

@@ -11,11 +11,22 @@ public sealed class StubReplayEngine : IReplayEngine
     private readonly SemaphoreSlim _gate = new(1, 1);
     private AppSettings? _currentSettings;
     private volatile bool _isRecording;
+    private string? _currentStatus;
     private int _disposed;
 
     public bool IsRecording => _isRecording;
 
+    public string? CurrentStatus => Volatile.Read(ref _currentStatus);
+
+    public string? LastError => null;
+
     public event Action<string>? StatusChanged;
+
+    public event Action<string>? ErrorOccurred
+    {
+        add { }
+        remove { }
+    }
 
     public event Action<string>? ReplaySaved;
 
@@ -40,6 +51,7 @@ public sealed class StubReplayEngine : IReplayEngine
             _gate.Release();
         }
 
+        Volatile.Write(ref _currentStatus, statusMessage);
         StatusChanged?.Invoke(statusMessage);
     }
 
@@ -109,6 +121,7 @@ public sealed class StubReplayEngine : IReplayEngine
             _gate.Release();
         }
 
+        Volatile.Write(ref _currentStatus, statusMessage);
         StatusChanged?.Invoke(statusMessage);
 
         if (outputFilePath is not null)
@@ -145,7 +158,8 @@ public sealed class StubReplayEngine : IReplayEngine
 
         if (statusMessage is not null)
         {
-            StatusChanged?.Invoke(statusMessage);
+            Volatile.Write(ref _currentStatus, statusMessage);
+        StatusChanged?.Invoke(statusMessage);
         }
     }
 
