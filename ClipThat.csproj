@@ -35,20 +35,9 @@
     <PackageReference Include="WPF-UI" Version="4.3.0" />
   </ItemGroup>
 
-  <Target Name="ResolveSignTool" Condition="Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
-    <ItemGroup>
-      <_SignToolCandidates Include="C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" />
-      <_SignToolCandidates Include="C:\Program Files (x86)\Windows Kits\10\bin\*\x86\signtool.exe" />
-    </ItemGroup>
-    <PropertyGroup>
-      <SignToolPath Condition="'@(_SignToolCandidates)' != ''">$([System.String]::Copy('@(_SignToolCandidates)').Split(';')[0])</SignToolPath>
-    </PropertyGroup>
+  <Target Name="SignOutputs" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Exec Command="powershell -NoProfile -Command &quot;$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object -First 1; if (-not $cert) { $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ClipThat Local' -CertStoreLocation Cert:\CurrentUser\My }; if (-not (Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Thumbprint -eq $cert.Thumbprint })) { $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser'); $store.Open('ReadWrite'); $store.Add($cert); $store.Close() }; if (Test-Path '$(TargetPath)') { Set-AuthenticodeSignature -FilePath '$(TargetPath)' -Certificate $cert | Out-Null }; if (Test-Path '$(TargetDir)$(TargetName).exe') { Set-AuthenticodeSignature -FilePath '$(TargetDir)$(TargetName).exe' -Certificate $cert | Out-Null }&quot;"
+          IgnoreExitCode="true" />
   </Target>
 
-  <Target Name="SignOutputs" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true' and Exists('C:\Program Files (x86)\Windows Kits\10\bin')">
-    <PropertyGroup>
-      <SignToolPath>$([System.IO.Directory]::GetFiles('C:\Program Files (x86)\Windows Kits\10\bin', 'signtool.exe', System.IO.SearchOption.AllDirectories)[0])</SignToolPath>
-    </PropertyGroup>
-    <Exec Command="&quot;$(SignToolPath)&quot; sign /sha1 E08AAF67D708179C02DAE325279ABFA26826388E /fd SHA256 &quot;$(TargetPath)&quot; &quot;$(TargetDir)$(TargetName).exe&quot;" IgnoreExitCode="true" />
-  </Target>
 </Project>
