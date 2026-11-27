@@ -34,6 +34,7 @@ internal static class CaptureInterop
 
     private static readonly Guid GraphicsCaptureItemInteropIid = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
     private static readonly Guid GraphicsCaptureItemIid = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+    private static readonly Guid GraphicsCaptureSession5Iid = new("67C0EA62-1F85-5061-925A-239BE0AC09CB");
     private static readonly Guid Direct3DDxgiInterfaceAccessIid = new("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
 
     /// <summary>
@@ -247,6 +248,58 @@ internal static class CaptureInterop
             if (surfaceAbi != nint.Zero)
             {
                 Marshal.Release(surfaceAbi);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attempts to configure <c>IGraphicsCaptureSession5::put_MinUpdateInterval</c> (Windows 11 24H2+,
+    /// build 26100+) directly via its WinRT vtable so WGC fallback sessions are not capped at 60 Hz
+    /// on high-refresh-rate displays.
+    /// </summary>
+    public static unsafe bool TrySetMinUpdateInterval(GraphicsCaptureSession session, TimeSpan interval)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        nint sessionAbi = nint.Zero;
+        nint session5Abi = nint.Zero;
+
+        try
+        {
+            sessionAbi = MarshalInterface<GraphicsCaptureSession>.FromManaged(session);
+            if (sessionAbi == nint.Zero)
+            {
+                return false;
+            }
+
+            Guid iid = GraphicsCaptureSession5Iid;
+            int hr = Marshal.QueryInterface(sessionAbi, ref iid, out session5Abi);
+            if (hr < 0 || session5Abi == nint.Zero)
+            {
+                return false;
+            }
+
+            // IInspectable occupies slots 0..5; IGraphicsCaptureSession5 has:
+            // slot 6 = get_MinUpdateInterval, slot 7 = put_MinUpdateInterval(TimeSpan).
+            void** vtable = *(void***)session5Abi;
+            var putMinUpdateInterval = (delegate* unmanaged[Stdcall]<nint, long, int>)vtable[7];
+            hr = putMinUpdateInterval(session5Abi, Math.Max(0L, interval.Ticks));
+            return hr >= 0;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (session5Abi != nint.Zero)
+            {
+                Marshal.Release(session5Abi);
+            }
+
+            if (sessionAbi != nint.Zero)
+            {
+                Marshal.Release(sessionAbi);
             }
         }
     }

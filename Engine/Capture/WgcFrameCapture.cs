@@ -22,18 +22,10 @@ namespace ClipThat.Engine.Capture;
 /// <see cref="DeviceCreationFlags.VideoSupport"/>, and delivers phase-paced GPU BGRA textures across
 /// NVIDIA, AMD, Intel, single-GPU, and hybrid iGPU+dGPU configurations.
 /// </summary>
-public sealed class WgcFrameCapture : IDisposable
+public sealed class WgcFrameCapture : IFrameCaptureSource
 {
-    private const int FramePoolBufferCount = 2;
+    private const int FramePoolBufferCount = 3;
     private const long ClockReanchorThresholdTicks = 250 * TimeSpan.TicksPerMillisecond;
-
-    private static readonly FeatureLevel[] SupportedFeatureLevels =
-    {
-        FeatureLevel.Level_11_1,
-        FeatureLevel.Level_11_0,
-        FeatureLevel.Level_10_1,
-        FeatureLevel.Level_10_0
-    };
 
     private readonly long _frameIntervalTicks;
     private readonly long _pacingToleranceTicks;
@@ -101,7 +93,13 @@ public sealed class WgcFrameCapture : IDisposable
             nint monitorHandle = CaptureInterop.ResolveMonitorHandle(monitorDeviceName);
             MonitorHandle = monitorHandle;
 
-            MatchedDeviceInfo deviceInfo = CreateD3D11DeviceForMonitor(monitorHandle, monitorDeviceName);
+            MonitorDeviceFactory.MatchedDeviceInfo deviceInfo = MonitorDeviceFactory.CreateD3D11DeviceForMonitor(
+                monitorHandle,
+                monitorDeviceName,
+                logTag: "WgcFrameCapture",
+                requireExactMonitorMatch: false,
+                out IDXGIOutput? matchedOutput);
+            matchedOutput?.Dispose();
             device = deviceInfo.Device;
             immediateContext = deviceInfo.ImmediateContext;
             AdapterName = deviceInfo.AdapterName;
@@ -176,6 +174,8 @@ public sealed class WgcFrameCapture : IDisposable
 
     public bool MatchedMonitorAdapter { get; }
 
+    public string CaptureBackendName => "WGC";
+
     public SizeInt32 ContentSize => _lastContentSize;
 
     public int CapturedFrameCount => Volatile.Read(ref _capturedFrameCount);
@@ -239,266 +239,7 @@ public sealed class WgcFrameCapture : IDisposable
     /// Returns <see langword="null"/> only if no DXGI output matches.
     /// </summary>
     public static IDXGIAdapter1? FindAdapterForMonitor(nint targetMonitorHandle)
-    {
-        if (targetMonitorHandle == nint.Zero)
-        {
-            return null;
-        }
-
-        try
-        {
-            using IDXGIFactory1 factory = DXGI.CreateDXGIFactory1<IDXGIFactory1>();
-
-            for (uint adapterIndex = 0; ; adapterIndex++)
-            {
-                Result enumAdapterResult = factory.EnumAdapters1(adapterIndex, out IDXGIAdapter1? adapter);
-                if (enumAdapterResult.Failure || adapter is null)
-                {
-                    adapter?.Dispose();
-                    break;
-                }
-
-                bool matched = false;
-                try
-                {
-                    AdapterDescription1 adapterDesc = adapter.Description1;
-                    string adapterName = SanitizeNativeString(adapterDesc.Description, "Unknown GPU");
-
-                    for (uint outputIndex = 0; ; outputIndex++)
-                    {
-                        Result enumOutputResult = adapter.EnumOutputs(outputIndex, out IDXGIOutput? output);
-                        if (enumOutputResult.Failure || output is null)
-                        {
-                            output?.Dispose();
-                            break;
-                        }
-
-                        using (output)
-                        {
-                            nint outputMonitor = GetOutputMonitorHandle(output, out string outputDeviceName);
-                            if (outputMonitor == targetMonitorHandle)
-                            {
-                                EngineLogger.Info(
-                                    "WgcFrameCapture",
-                                    $"Matched HMONITOR=0x{targetMonitorHandle:X} ({outputDeviceName}) -> " +
-                                    $"DXGI Adapter[{adapterIndex}] \"{adapterName}\" " +
-                                    $"(VendorId=0x{adapterDesc.VendorId:X4}, LUID={adapterDesc.Luid.HighPart:X8}:{adapterDesc.Luid.LowPart:X8})");
-                                matched = true;
-                                return adapter;
-                            }
-                        }
-                    }
-                }
-                finally
-                {
-                    if (!matched)
-                    {
-                        adapter.Dispose();
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            EngineLogger.Warn(
-                "WgcFrameCapture",
-                $"DXGI adapter/output enumeration failed for HMONITOR=0x{targetMonitorHandle:X}; falling back to default hardware adapter.",
-                ex);
-        }
-
-        EngineLogger.Warn(
-            "WgcFrameCapture",
-            $"No DXGI output matched HMONITOR=0x{targetMonitorHandle:X}; falling back to default hardware adapter.");
-        return null;
-    }
-
-    private static nint GetOutputMonitorHandle(IDXGIOutput output, out string deviceName)
-    {
-        try
-        {
-            using IDXGIOutput6? output6 = output.QueryInterfaceOrNull<IDXGIOutput6>();
-            if (output6 is not null)
-            {
-                OutputDescription1 desc1 = output6.Description1;
-                deviceName = SanitizeNativeString(desc1.DeviceName, string.Empty);
-                return desc1.Monitor;
-            }
-        }
-        catch
-        {
-            // Fall back to base IDXGIOutput.Description if IDXGIOutput6 is unavailable on an older driver.
-        }
-
-        OutputDescription desc = output.Description;
-        deviceName = SanitizeNativeString(desc.DeviceName, string.Empty);
-        return desc.Monitor;
-    }
-
-    private static MatchedDeviceInfo CreateD3D11DeviceForMonitor(nint targetMonitorHandle, string? monitorDeviceName)
-    {
-        using IDXGIAdapter1? matchedAdapter = FindAdapterForMonitor(targetMonitorHandle);
-
-        ID3D11Device? device = null;
-        ID3D11DeviceContext? context = null;
-        bool usedMatchedAdapter = false;
-
-        if (matchedAdapter is not null)
-        {
-            // Direct3D11 contract: when passing an explicit IDXGIAdapter, DriverType MUST be DriverType.Unknown.
-            if (TryCreateDeviceOnAdapter(
-                    matchedAdapter,
-                    DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport,
-                    out device,
-                    out context))
-            {
-                usedMatchedAdapter = true;
-            }
-            else if (TryCreateDeviceOnAdapter(
-                         matchedAdapter,
-                         DeviceCreationFlags.BgraSupport,
-                         out device,
-                         out context))
-            {
-                usedMatchedAdapter = true;
-                EngineLogger.Warn(
-                    "WgcFrameCapture",
-                    $"Matched GPU adapter \"{SanitizeNativeString(matchedAdapter.Description1.Description, "Unknown GPU")}\" rejected VideoSupport flag; initialized with BgraSupport only.");
-            }
-            else
-            {
-                EngineLogger.Warn(
-                    "WgcFrameCapture",
-                    $"D3D11CreateDevice failed on monitor-matched adapter \"{SanitizeNativeString(matchedAdapter.Description1.Description, "Unknown GPU")}\"; falling back to default hardware adapter.");
-            }
-        }
-
-        if (device is null || context is null)
-        {
-            Result hr = D3D11.D3D11CreateDevice(
-                nint.Zero,
-                DriverType.Hardware,
-                DeviceCreationFlags.BgraSupport | DeviceCreationFlags.VideoSupport,
-                SupportedFeatureLevels,
-                out device,
-                out FeatureLevel _,
-                out context);
-
-            if (hr.Failure || device is null || context is null)
-            {
-                SafeDispose(context);
-                SafeDispose(device);
-
-                EngineLogger.Warn(
-                    "WgcFrameCapture",
-                    $"Default hardware D3D11CreateDevice with VideoSupport failed (HR=0x{hr.Code:X8}); retrying with BgraSupport.");
-
-                hr = D3D11.D3D11CreateDevice(
-                    nint.Zero,
-                    DriverType.Hardware,
-                    DeviceCreationFlags.BgraSupport,
-                    SupportedFeatureLevels,
-                    out device,
-                    out FeatureLevel _,
-                    out context);
-
-                hr.CheckError();
-            }
-        }
-
-        if (device is null || context is null)
-        {
-            SafeDispose(context);
-            SafeDispose(device);
-            throw new InvalidOperationException(
-                $"Nie udało się utworzyć sprzętowego urządzenia Direct3D11 dla monitora '{monitorDeviceName ?? "domyślnego"}'.");
-        }
-
-        try
-        {
-            using ID3D11Multithread? multithread = device.QueryInterfaceOrNull<ID3D11Multithread>();
-            multithread?.SetMultithreadProtected(true);
-
-            (string adapterName, uint vendorId, uint deviceId, Luid luid) = QueryActiveAdapterInfo(device);
-
-            return new MatchedDeviceInfo(
-                device,
-                context,
-                adapterName,
-                vendorId,
-                deviceId,
-                luid,
-                usedMatchedAdapter);
-        }
-        catch
-        {
-            SafeDispose(context);
-            SafeDispose(device);
-            throw;
-        }
-    }
-
-    private static bool TryCreateDeviceOnAdapter(
-        IDXGIAdapter1 adapter,
-        DeviceCreationFlags flags,
-        out ID3D11Device? device,
-        out ID3D11DeviceContext? context)
-    {
-        Result hr = D3D11.D3D11CreateDevice(
-            adapter,
-            DriverType.Unknown,
-            flags,
-            SupportedFeatureLevels,
-            out device,
-            out FeatureLevel _,
-            out context);
-
-        if (hr.Success && device is not null && context is not null)
-        {
-            return true;
-        }
-
-        SafeDispose(context);
-        SafeDispose(device);
-        device = null;
-        context = null;
-        return false;
-    }
-
-    private static (string AdapterName, uint VendorId, uint DeviceId, Luid Luid) QueryActiveAdapterInfo(ID3D11Device device)
-    {
-        try
-        {
-            using IDXGIDevice dxgiDevice = device.QueryInterface<IDXGIDevice>();
-            using IDXGIAdapter adapter = dxgiDevice.GetAdapter();
-            using IDXGIAdapter1? adapter1 = adapter.QueryInterfaceOrNull<IDXGIAdapter1>();
-            if (adapter1 is not null)
-            {
-                AdapterDescription1 desc1 = adapter1.Description1;
-                string name = SanitizeNativeString(desc1.Description, "Unknown GPU");
-                return (name, desc1.VendorId, desc1.DeviceId, desc1.Luid);
-            }
-
-            AdapterDescription desc = adapter.Description;
-            string fallbackName = SanitizeNativeString(desc.Description, "Unknown GPU");
-            return (fallbackName, desc.VendorId, desc.DeviceId, desc.Luid);
-        }
-        catch
-        {
-            return ("Unknown GPU", 0u, 0u, default);
-        }
-    }
-
-    private static string SanitizeNativeString(string? raw, string fallback)
-    {
-        if (string.IsNullOrEmpty(raw))
-        {
-            return fallback;
-        }
-
-        int nullIdx = raw.IndexOf('\0');
-        string cleaned = (nullIdx >= 0 ? raw[..nullIdx] : raw).Trim();
-        return string.IsNullOrEmpty(cleaned) ? fallback : cleaned;
-    }
+        => MonitorDeviceFactory.FindAdapterForMonitor(targetMonitorHandle, logTag: "WgcFrameCapture");
 
     private static void ConfigureCaptureSessionOptions(GraphicsCaptureSession captureSession)
     {
@@ -525,6 +266,21 @@ public sealed class WgcFrameCapture : IDisposable
         catch
         {
             // Disabling the yellow capture border requires OS permission/Windows 11; ignore if unavailable.
+        }
+
+        try
+        {
+            if (ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "MinUpdateInterval"))
+            {
+                if (CaptureInterop.TrySetMinUpdateInterval(captureSession, TimeSpan.FromMilliseconds(1)))
+                {
+                    EngineLogger.Info("WgcFrameCapture", "Configured WGC MinUpdateInterval=1ms (unthrottled high-refresh capture).");
+                }
+            }
+        }
+        catch
+        {
+            // MinUpdateInterval requires Windows 11 24H2+; ignore if unavailable.
         }
     }
 
@@ -726,13 +482,4 @@ public sealed class WgcFrameCapture : IDisposable
             Debug.WriteLine($"Błąd zwalniania zasobu WGC/D3D11: {ex.Message}");
         }
     }
-
-    private readonly record struct MatchedDeviceInfo(
-        ID3D11Device Device,
-        ID3D11DeviceContext ImmediateContext,
-        string AdapterName,
-        uint VendorId,
-        uint DeviceId,
-        Luid Luid,
-        bool MatchedMonitorOutput);
 }

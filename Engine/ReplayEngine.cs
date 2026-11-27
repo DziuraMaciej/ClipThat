@@ -33,6 +33,7 @@ public sealed class ReplayEngine : IReplayEngine
     private CapturePipelineSession? _activeSession;
     private string? _currentStatus;
     private string? _lastError;
+    private int _consecutiveDxgiFaults;
     private volatile bool _isRecording;
     private int _disposed;
 
@@ -82,8 +83,9 @@ public sealed class ReplayEngine : IReplayEngine
             _ringBuffer.Clear();
             _ringBuffer.SetBufferDuration(normalized.BufferDurationMinutes);
             _currentSettings = normalized;
+            _consecutiveDxgiFaults = 0;
 
-            _activeSession = StartCapturePipelineLocked(normalized, EncoderNegotiationTier.HardwareGpuZeroCopy);
+            _activeSession = StartCapturePipelineLocked(normalized, EncoderNegotiationTier.HardwareGpuZeroCopy, preferDxgiDuplication: true);
             _isRecording = true;
 
             MfH264Encoder activeEncoder = _activeSession.Encoder
@@ -200,8 +202,9 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 TeardownActiveSessionLocked();
                 _ringBuffer.Clear();
+                _consecutiveDxgiFaults = 0;
 
-                _activeSession = StartCapturePipelineLocked(updated, EncoderNegotiationTier.HardwareGpuZeroCopy);
+                _activeSession = StartCapturePipelineLocked(updated, EncoderNegotiationTier.HardwareGpuZeroCopy, preferDxgiDuplication: true);
                 _isRecording = true;
 
                 if (_activeSession.Encoder is not null)
@@ -385,9 +388,10 @@ public sealed class ReplayEngine : IReplayEngine
 
     private CapturePipelineSession StartCapturePipelineLocked(
         AppSettings settings,
-        EncoderNegotiationTier minimumTier)
+        EncoderNegotiationTier minimumTier,
+        bool preferDxgiDuplication = true)
     {
-        WgcFrameCapture? wgcCapture = null;
+        IFrameCaptureSource? captureSource = null;
         GpuVideoProcessor? gpuProcessor = null;
         MfH264Encoder? encoder = null;
         DualAudioCaptureService? audioCapture = null;
@@ -397,30 +401,55 @@ public sealed class ReplayEngine : IReplayEngine
             var sharedSessionClock = new Stopwatch();
             CapturePipelineSession? createdSession = null;
 
-            wgcCapture = new WgcFrameCapture(
+            Action<ID3D11Texture2D, long, long> onFrameCaptured = (bgraTexture, timestamp100Ns, frameDuration100Ns) =>
+            {
+                createdSession?.HandleCapturedFrame(bgraTexture, timestamp100Ns, frameDuration100Ns);
+            };
+            Action onSessionClosed = () =>
+            {
+                if (createdSession is not null)
+                {
+                    OnSessionClosed(createdSession);
+                }
+            };
+            Action<Exception> onCaptureError = ex => OnActivePipelineFault(ex, isEncoderFault: false);
+
+            if (preferDxgiDuplication)
+            {
+                try
+                {
+                    captureSource = new DxgiFrameCapture(
+                        settings.SelectedMonitorDeviceName,
+                        settings.Fps,
+                        sharedSessionClock,
+                        onFrameCaptured,
+                        onSessionClosed,
+                        onCaptureError);
+                }
+                catch (Exception ex)
+                {
+                    EngineLogger.Warn(
+                        "ReplayEngine",
+                        $"DXGI Desktop Duplication initialization failed ({ex.Message}); falling back to Windows.Graphics.Capture (WGC).");
+                    captureSource = null;
+                }
+            }
+
+            captureSource ??= new WgcFrameCapture(
                 settings.SelectedMonitorDeviceName,
                 settings.Fps,
                 sharedSessionClock,
-                onFrameCaptured: (bgraTexture, timestamp100Ns, frameDuration100Ns) =>
-                {
-                    createdSession?.HandleCapturedFrame(bgraTexture, timestamp100Ns, frameDuration100Ns);
-                },
-                onSessionClosed: () =>
-                {
-                    if (createdSession is not null)
-                    {
-                        OnSessionClosed(createdSession);
-                    }
-                },
-                onFrameError: ex => OnActivePipelineFault(ex, isEncoderFault: false));
+                onFrameCaptured,
+                onSessionClosed,
+                onCaptureError);
 
             gpuProcessor = new GpuVideoProcessor(
-                wgcCapture.Device,
-                wgcCapture.ImmediateContext,
+                captureSource.Device,
+                captureSource.ImmediateContext,
                 settings.Resolution,
                 settings.Fps,
-                wgcCapture.AdapterName,
-                wgcCapture.AdapterLuid,
+                captureSource.AdapterName,
+                captureSource.AdapterLuid,
                 ownsDevice: false);
 
             encoder = CreateEncoder(gpuProcessor, settings, minimumTier);
@@ -446,18 +475,20 @@ public sealed class ReplayEngine : IReplayEngine
             var pipeline = new CapturePipelineSession(
                 settings.Fps,
                 sharedSessionClock,
-                wgcCapture,
+                captureSource,
                 gpuProcessor,
                 encoder,
-                audioCapture);
+                audioCapture,
+                onEncodeError: ex => OnActivePipelineFault(ex, isEncoderFault: true));
 
             createdSession = pipeline;
             pipeline.Start();
 
             EngineLogger.Info(
                 "ReplayEngine",
-                $"Capture pipeline started: Monitor={settings.SelectedMonitorDeviceName ?? "(Primary)"} | " +
-                $"GPU=\"{wgcCapture.AdapterName}\" | Encoder=\"{encoder.EncoderName}\" ({encoder.ActiveTier}) | " +
+                $"Capture pipeline started: Backend=\"{captureSource.CaptureBackendName}\" | " +
+                $"Monitor={settings.SelectedMonitorDeviceName ?? "(Primary)"} | " +
+                $"GPU=\"{captureSource.AdapterName}\" | Encoder=\"{encoder.EncoderName}\" ({encoder.ActiveTier}) | " +
                 $"Output={encoder.OutputWidth}x{encoder.OutputHeight}@{encoder.TargetFps}fps");
 
             return pipeline;
@@ -467,7 +498,7 @@ public sealed class ReplayEngine : IReplayEngine
             audioCapture?.Dispose();
             encoder?.Dispose();
             gpuProcessor?.Dispose();
-            wgcCapture?.Dispose();
+            captureSource?.Dispose();
             throw;
         }
     }
@@ -639,10 +670,12 @@ public sealed class ReplayEngine : IReplayEngine
 
     private void OnSessionClosed(CapturePipelineSession closedSession)
     {
+        bool preferDxgi = ShouldRetryDxgiAfterCaptureInterruption(closedSession);
         _ = Task.Run(() => RecoverFromSessionInterruptionAsync(
             closedSession,
             "Monitor zmienił stan — ponowne uruchamianie przechwytywania...",
-            minimumTier: EncoderNegotiationTier.HardwareGpuZeroCopy));
+            minimumTier: EncoderNegotiationTier.HardwareGpuZeroCopy,
+            preferDxgiDuplication: preferDxgi));
     }
 
     private void OnActivePipelineFault(Exception exception, bool isEncoderFault)
@@ -652,6 +685,7 @@ public sealed class ReplayEngine : IReplayEngine
         if (session is not null)
         {
             EncoderNegotiationTier recoveryTier = EncoderNegotiationTier.HardwareGpuZeroCopy;
+            bool preferDxgi = session.Capture is DxgiFrameCapture;
             if (isEncoderFault)
             {
                 MfH264Encoder? currentEncoder = session.Encoder;
@@ -660,18 +694,40 @@ public sealed class ReplayEngine : IReplayEngine
                     recoveryTier = GetNextDowngradeTier(currentEncoder.ActiveTier) ?? EncoderNegotiationTier.SoftwareFallback;
                 }
             }
+            else
+            {
+                preferDxgi = ShouldRetryDxgiAfterCaptureInterruption(session);
+            }
 
             _ = Task.Run(() => RecoverFromSessionInterruptionAsync(
                 session,
                 $"Błąd kodera wideo ({exception.Message}) — próba wznowienia ({recoveryTier})...",
-                minimumTier: recoveryTier));
+                minimumTier: recoveryTier,
+                preferDxgiDuplication: preferDxgi));
         }
+    }
+
+    private bool ShouldRetryDxgiAfterCaptureInterruption(CapturePipelineSession session)
+    {
+        if (session.Capture is not DxgiFrameCapture)
+        {
+            return true;
+        }
+
+        if (session.Capture.CapturedFrameCount == 0)
+        {
+            _consecutiveDxgiFaults = 2;
+            return false;
+        }
+
+        return Interlocked.Increment(ref _consecutiveDxgiFaults) < 2;
     }
 
     private async Task RecoverFromSessionInterruptionAsync(
         CapturePipelineSession interruptedSession,
         string notice,
-        EncoderNegotiationTier minimumTier)
+        EncoderNegotiationTier minimumTier,
+        bool preferDxgiDuplication = true)
     {
         if (Volatile.Read(ref _disposed) != 0)
         {
@@ -694,14 +750,14 @@ public sealed class ReplayEngine : IReplayEngine
                 return;
             }
 
-            EngineLogger.Warn("ReplayEngine", $"{notice} (minimumTier={minimumTier})");
+            EngineLogger.Warn("ReplayEngine", $"{notice} (minimumTier={minimumTier}, preferDxgi={preferDxgiDuplication})");
             TeardownActiveSessionLocked();
             _ringBuffer.Clear();
 
-            // Attempt clean recovery (falling back to primary monitor if disconnected or lower encoder tier on fault).
+            // Attempt clean recovery (falling back to WGC or lower encoder tier on repeated faults).
             try
             {
-                _activeSession = StartCapturePipelineLocked(_currentSettings, minimumTier);
+                _activeSession = StartCapturePipelineLocked(_currentSettings, minimumTier, preferDxgiDuplication);
                 _isRecording = true;
                 recoveredSession = _activeSession;
                 recoveredEncoder = _activeSession.Encoder;
@@ -768,13 +824,14 @@ public sealed class ReplayEngine : IReplayEngine
 
     private static string BuildActiveStatusMessage(
         AppSettings settings,
-        WgcFrameCapture capture,
+        IFrameCaptureSource capture,
         MfH264Encoder encoder,
         DualAudioCaptureService? audioCapture)
     {
         string mode = encoder.IsHardwareAccelerated ? "GPU" : "CPU";
+        string backendShort = capture is DxgiFrameCapture ? "DXGI" : "WGC";
         string resolutionLabel = $"{settings.Resolution.ToString()[1..]}p";
-        string baseStatus = $"Nagrywanie aktywne ({mode} · {resolutionLabel} {settings.Fps} FPS · {capture.AdapterName} / {encoder.EncoderName})";
+        string baseStatus = $"Nagrywanie aktywne ({backendShort} · {mode} · {resolutionLabel} {settings.Fps} FPS · {capture.AdapterName} / {encoder.EncoderName})";
 
         string? audioError = audioCapture?.GetInitializationErrorSummary();
         return string.IsNullOrWhiteSpace(audioError)
@@ -806,44 +863,53 @@ public sealed class ReplayEngine : IReplayEngine
     }
 
     /// <summary>
-    /// Encapsulates one live monitor-matched WGC + D3D11 + 3-tier H.264 MFT + dual-track WASAPI AAC session
-    /// on a single shared <see cref="Stopwatch"/> epoch with live encoder tier replacement and deterministic
-    /// reverse-order COM teardown.
+    /// Encapsulates one live monitor-matched DXGI/WGC + D3D11 + 3-tier H.264 MFT + dual-track WASAPI AAC
+    /// session on a single shared <see cref="Stopwatch"/> epoch with decoupled background video encoding,
+    /// live encoder tier replacement, and deterministic reverse-order COM teardown.
     /// </summary>
     private sealed class CapturePipelineSession : IDisposable
     {
         private readonly long _frameIntervalTicks;
         private readonly Stopwatch _sessionClock;
-        private readonly WgcFrameCapture _wgcCapture;
+        private readonly IFrameCaptureSource _capture;
         private readonly GpuVideoProcessor _gpuProcessor;
         private readonly DualAudioCaptureService? _audioCapture;
+        private readonly Action<Exception> _onEncodeError;
         private readonly object _frameSubmitLock = new();
+        private readonly object _encodeQueueLock = new();
+        private readonly AutoResetEvent _encodeWorkSignal = new(initialState: false);
 
         private MfH264Encoder? _encoder;
+        private Thread? _encodeWorkerThread;
+        private PendingVideoFrame? _pendingEncodeFrame;
+        private ID3D11Texture2D? _activeEncodeTexture;
         private ID3D11Texture2D? _lastProcessedFrame;
         private long _lastSubmittedTimestamp100Ns = -1;
         private Timer? _startupPrimingTimer;
         private int _primingFramesRemaining = MaxStartupPrimingFrames;
+        private int _encodeWorkerStopped;
         private int _disposed;
 
         public CapturePipelineSession(
             int targetFps,
             Stopwatch sessionClock,
-            WgcFrameCapture wgcCapture,
+            IFrameCaptureSource capture,
             GpuVideoProcessor gpuProcessor,
             MfH264Encoder encoder,
-            DualAudioCaptureService? audioCapture)
+            DualAudioCaptureService? audioCapture,
+            Action<Exception> onEncodeError)
         {
             int normalizedFps = targetFps == 30 ? 30 : 60;
             _frameIntervalTicks = TimeSpan.TicksPerSecond / normalizedFps;
             _sessionClock = sessionClock;
-            _wgcCapture = wgcCapture;
+            _capture = capture;
             _gpuProcessor = gpuProcessor;
             _encoder = encoder;
             _audioCapture = audioCapture;
+            _onEncodeError = onEncodeError;
         }
 
-        public WgcFrameCapture Capture => _wgcCapture;
+        public IFrameCaptureSource Capture => _capture;
 
         public GpuVideoProcessor GpuProcessor => _gpuProcessor;
 
@@ -854,6 +920,17 @@ public sealed class ReplayEngine : IReplayEngine
         public void Start()
         {
             _sessionClock.Start();
+
+            if (_gpuProcessor.SupportsHardwareVideoProcessor)
+            {
+                _encodeWorkerThread = new Thread(VideoEncodeWorkerLoop)
+                {
+                    Name = "ClipThat.VideoEncodeWorker",
+                    IsBackground = true
+                };
+                _encodeWorkerThread.SetApartmentState(ApartmentState.MTA);
+                _encodeWorkerThread.Start();
+            }
 
             if (_audioCapture is not null)
             {
@@ -868,7 +945,7 @@ public sealed class ReplayEngine : IReplayEngine
                 }
             }
 
-            _wgcCapture.Start();
+            _capture.Start();
             ArmStartupPrimingTimer();
         }
 
@@ -879,6 +956,42 @@ public sealed class ReplayEngine : IReplayEngine
                 return;
             }
 
+            if (_gpuProcessor.SupportsHardwareVideoProcessor)
+            {
+                ID3D11Texture2D? busyActive;
+                ID3D11Texture2D? busyPending;
+                lock (_encodeQueueLock)
+                {
+                    if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
+                    {
+                        return;
+                    }
+
+                    busyActive = _activeEncodeTexture;
+                    busyPending = _pendingEncodeFrame?.Texture;
+                }
+
+                // Perform only the fast GPU BGRA->NV12 VideoProcessorBlt on the capture thread (<0.2ms)
+                // and offload staging/encoding to ClipThat.VideoEncodeWorker so capture never stalls DWM.
+                ID3D11Texture2D processed = _gpuProcessor.ProcessFrame(bgraTexture, busyActive, busyPending);
+
+                lock (_encodeQueueLock)
+                {
+                    if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
+                    {
+                        return;
+                    }
+
+                    long monotonicTs = NextMonotonicTimestampLocked(timestamp100Ns);
+                    _lastProcessedFrame = processed;
+                    _pendingEncodeFrame = new PendingVideoFrame(processed, monotonicTs, frameDuration100Ns);
+                }
+
+                SignalEncodeWorkerSafe();
+                return;
+            }
+
+            // Fallback when GPU VideoProcessor is unavailable: bgraTexture is transient so encode synchronously.
             lock (_frameSubmitLock)
             {
                 if (Volatile.Read(ref _disposed) != 0)
@@ -892,33 +1005,115 @@ public sealed class ReplayEngine : IReplayEngine
                     return;
                 }
 
-                ID3D11Texture2D processed = _gpuProcessor.ProcessFrame(bgraTexture);
-                // Only cache pooled GPU NV12 textures for startup priming (never cache transient WGC BGRA surfaces).
-                if (_gpuProcessor.SupportsHardwareVideoProcessor)
+                long monotonicTs;
+                lock (_encodeQueueLock)
                 {
-                    _lastProcessedFrame = processed;
+                    monotonicTs = NextMonotonicTimestampLocked(timestamp100Ns);
                 }
 
-                long monotonicTs = timestamp100Ns;
-                if (monotonicTs <= _lastSubmittedTimestamp100Ns)
+                encoder.EncodeFrame(bgraTexture, monotonicTs, frameDuration100Ns);
+            }
+        }
+
+        private void VideoEncodeWorkerLoop()
+        {
+            while (Volatile.Read(ref _encodeWorkerStopped) == 0 && Volatile.Read(ref _disposed) == 0)
+            {
+                PendingVideoFrame? nextFrame;
+                lock (_encodeQueueLock)
                 {
-                    monotonicTs = _lastSubmittedTimestamp100Ns + 1;
+                    nextFrame = _pendingEncodeFrame;
+                    _pendingEncodeFrame = null;
+                    if (nextFrame.HasValue)
+                    {
+                        _activeEncodeTexture = nextFrame.Value.Texture;
+                    }
                 }
 
-                _lastSubmittedTimestamp100Ns = monotonicTs;
-                encoder.EncodeFrame(processed, monotonicTs, frameDuration100Ns);
+                if (!nextFrame.HasValue)
+                {
+                    try
+                    {
+                        _encodeWorkSignal.WaitOne(100);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                try
+                {
+                    PendingVideoFrame frame = nextFrame.Value;
+                    lock (_frameSubmitLock)
+                    {
+                        if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
+                        {
+                            break;
+                        }
+
+                        MfH264Encoder? encoder = _encoder;
+                        encoder?.EncodeFrame(frame.Texture, frame.Timestamp100Ns, frame.Duration100Ns);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (Volatile.Read(ref _disposed) == 0 && Volatile.Read(ref _encodeWorkerStopped) == 0)
+                    {
+                        EngineLogger.Error("ReplayEngine", $"Background video encode worker failed: {ex.Message}", ex);
+                        _onEncodeError(ex);
+                    }
+                }
+                finally
+                {
+                    lock (_encodeQueueLock)
+                    {
+                        _activeEncodeTexture = null;
+                    }
+                }
+            }
+        }
+
+        private long NextMonotonicTimestampLocked(long candidateTicks)
+        {
+            long monotonicTs = candidateTicks;
+            if (monotonicTs <= _lastSubmittedTimestamp100Ns)
+            {
+                monotonicTs = _lastSubmittedTimestamp100Ns + 1;
+            }
+
+            _lastSubmittedTimestamp100Ns = monotonicTs;
+            return monotonicTs;
+        }
+
+        private void SignalEncodeWorkerSafe()
+        {
+            try
+            {
+                _encodeWorkSignal.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Pipeline is shutting down.
             }
         }
 
         /// <summary>
         /// Disposes the currently active encoder and swaps in a lower-tier encoder without interrupting
-        /// WGC capture or WASAPI audio streams.
+        /// capture or WASAPI audio streams.
         /// </summary>
         public MfH264Encoder ReplaceEncoder(Func<MfH264Encoder> encoderFactory)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
             StopStartupPrimingTimer();
+
+            lock (_encodeQueueLock)
+            {
+                _pendingEncodeFrame = null;
+            }
 
             MfH264Encoder? oldEncoder;
             lock (_frameSubmitLock)
@@ -943,13 +1138,22 @@ public sealed class ReplayEngine : IReplayEngine
 
                 // Immediately feed the most recent NV12 surface if available so the replacement encoder
                 // can produce its initial keyframe even on a completely static desktop.
-                if (_lastProcessedFrame is not null)
+                ID3D11Texture2D? cachedFrame;
+                long ts = 0;
+                lock (_encodeQueueLock)
                 {
-                    long ts = Math.Max(_sessionClock.Elapsed.Ticks, _lastSubmittedTimestamp100Ns + 1);
-                    _lastSubmittedTimestamp100Ns = ts;
+                    cachedFrame = _lastProcessedFrame;
+                    if (cachedFrame is not null)
+                    {
+                        ts = NextMonotonicTimestampLocked(_sessionClock.Elapsed.Ticks);
+                    }
+                }
+
+                if (cachedFrame is not null)
+                {
                     try
                     {
-                        replacement.EncodeFrame(_lastProcessedFrame, ts, _frameIntervalTicks);
+                        replacement.EncodeFrame(cachedFrame, ts, _frameIntervalTicks);
                     }
                     catch (Exception ex)
                     {
@@ -999,10 +1203,25 @@ public sealed class ReplayEngine : IReplayEngine
                     return;
                 }
 
-                // If WGC captured at least one initial frame on a static desktop and the encoder has
+                // If capture delivered at least one initial frame on a static desktop and the encoder has
                 // not yet emitted a keyframe (e.g. multi-frame internal priming depth), re-submit the
                 // cached NV12 frame a few times until the first keyframe emerges.
-                if (_lastProcessedFrame is not null)
+                ID3D11Texture2D? cachedFrame;
+                long nowTicks = _sessionClock.Elapsed.Ticks;
+                long ts = 0;
+                bool shouldSubmit = false;
+
+                lock (_encodeQueueLock)
+                {
+                    cachedFrame = _lastProcessedFrame;
+                    if (cachedFrame is not null && nowTicks - _lastSubmittedTimestamp100Ns >= _frameIntervalTicks)
+                    {
+                        ts = NextMonotonicTimestampLocked(nowTicks);
+                        shouldSubmit = true;
+                    }
+                }
+
+                if (cachedFrame is not null)
                 {
                     if (Interlocked.Decrement(ref _primingFramesRemaining) < 0)
                     {
@@ -1010,14 +1229,11 @@ public sealed class ReplayEngine : IReplayEngine
                         return;
                     }
 
-                    long nowTicks = _sessionClock.Elapsed.Ticks;
-                    if (nowTicks - _lastSubmittedTimestamp100Ns >= _frameIntervalTicks)
+                    if (shouldSubmit)
                     {
-                        long ts = Math.Max(nowTicks, _lastSubmittedTimestamp100Ns + 1);
-                        _lastSubmittedTimestamp100Ns = ts;
                         try
                         {
-                            encoder.EncodeFrame(_lastProcessedFrame, ts, _frameIntervalTicks);
+                            encoder.EncodeFrame(cachedFrame, ts, _frameIntervalTicks);
                         }
                         catch (Exception ex)
                         {
@@ -1067,17 +1283,35 @@ public sealed class ReplayEngine : IReplayEngine
             _sessionClock.Stop();
             StopStartupPrimingTimer();
 
-            // 1. Stop WGC callbacks and wait deterministically for any in-flight GPU frame to finish.
+            // 1. Stop capture callbacks/loop first so no further frames enter HandleCapturedFrame.
             try
             {
-                _wgcCapture.StopCapture();
+                _capture.StopCapture();
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Błąd zatrzymywania przechwytywania WGC: {ex.Message}");
+                Debug.WriteLine($"Błąd zatrzymywania przechwytywania: {ex.Message}");
             }
 
-            // 2. Stop audio capture so no further audio packets enter the ring buffer.
+            // 2. Stop and join the background encode worker before disposing encoder or GPU surfaces.
+            Interlocked.Exchange(ref _encodeWorkerStopped, 1);
+            lock (_encodeQueueLock)
+            {
+                _pendingEncodeFrame = null;
+                _lastProcessedFrame = null;
+            }
+
+            SignalEncodeWorkerSafe();
+
+            Thread? encodeWorker = _encodeWorkerThread;
+            if (encodeWorker is not null && encodeWorker != Thread.CurrentThread)
+            {
+                encodeWorker.Join(2000);
+            }
+
+            _encodeWorkerThread = null;
+
+            // 3. Stop audio capture so no further audio packets enter the ring buffer.
             SafeDispose(_audioCapture);
 
             MfH264Encoder? activeEncoder;
@@ -1085,14 +1319,19 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 activeEncoder = _encoder;
                 _encoder = null;
-                _lastProcessedFrame = null;
             }
 
-            // 3. Dispose downstream GPU consumers BEFORE WgcFrameCapture releases the shared ID3D11Device.
+            // 4. Dispose downstream GPU consumers BEFORE the capture source releases the shared ID3D11Device.
             SafeDispose(activeEncoder);
             SafeDispose(_gpuProcessor);
-            SafeDispose(_wgcCapture);
+            SafeDispose(_capture);
+            SafeDispose(_encodeWorkSignal);
         }
+
+        private readonly record struct PendingVideoFrame(
+            ID3D11Texture2D Texture,
+            long Timestamp100Ns,
+            long Duration100Ns);
 
         private static void SafeDispose(IDisposable? disposable)
         {

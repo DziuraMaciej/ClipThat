@@ -174,7 +174,10 @@ public sealed class GpuVideoProcessor : IDisposable
     /// When the active adapter does not support <see cref="ID3D11VideoProcessor"/>, returns the
     /// BGRA texture unchanged for CPU-side NV12 conversion inside <see cref="CopyNv12ToMediaBuffer"/>.
     /// </summary>
-    public ID3D11Texture2D ProcessFrame(ID3D11Texture2D inputBgraTexture)
+    public ID3D11Texture2D ProcessFrame(
+        ID3D11Texture2D inputBgraTexture,
+        ID3D11Texture2D? busyTexture1 = null,
+        ID3D11Texture2D? busyTexture2 = null)
     {
         ArgumentNullException.ThrowIfNull(inputBgraTexture);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -192,8 +195,7 @@ public sealed class GpuVideoProcessor : IDisposable
 
         EnsureVideoProcessor(inputDesc.Width, inputDesc.Height);
 
-        int poolIndex = _nextPoolIndex;
-        _nextPoolIndex = (_nextPoolIndex + 1) % OutputSurfacePoolSize;
+        int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2);
 
         ID3D11Texture2D outputTexture = _nv12OutputTextures[poolIndex];
         ID3D11VideoProcessorOutputView outputView = _nv12OutputViews[poolIndex]
@@ -260,8 +262,9 @@ public sealed class GpuVideoProcessor : IDisposable
         });
 
         _immediateContext.CopyResource(_cpuStagingNv12Texture, sourceTexture);
+        _immediateContext.Flush();
 
-        MappedSubresource mapped = _immediateContext.Map(_cpuStagingNv12Texture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        MappedSubresource mapped = MapStagingReadNonStalling(_cpuStagingNv12Texture);
         try
         {
             int width = OutputWidth;
@@ -426,6 +429,57 @@ public sealed class GpuVideoProcessor : IDisposable
         });
 
         return _cpuStagingBgraTexture;
+    }
+
+    private int SelectAvailablePoolIndex(ID3D11Texture2D? busyTexture1, ID3D11Texture2D? busyTexture2)
+    {
+        for (int attempt = 0; attempt < OutputSurfacePoolSize; attempt++)
+        {
+            int candidateIndex = _nextPoolIndex;
+            _nextPoolIndex = (_nextPoolIndex + 1) % OutputSurfacePoolSize;
+
+            ID3D11Texture2D candidate = _nv12OutputTextures[candidateIndex];
+            if (!ReferenceEquals(candidate, busyTexture1) && !ReferenceEquals(candidate, busyTexture2))
+            {
+                return candidateIndex;
+            }
+        }
+
+        int fallback = _nextPoolIndex;
+        _nextPoolIndex = (_nextPoolIndex + 1) % OutputSurfacePoolSize;
+        return fallback;
+    }
+
+    /// <summary>
+    /// Polls <see cref="Vortice.Direct3D11.MapFlags.DoNotWait"/> briefly outside the D3D11 multithread
+    /// critical section so CPU staging readback does not stall the capture thread while the GPU finishes
+    /// copying the NV12 frame.
+    /// </summary>
+    private MappedSubresource MapStagingReadNonStalling(ID3D11Texture2D stagingTexture)
+    {
+        for (int attempt = 0; attempt < 12; attempt++)
+        {
+            Result hr = _immediateContext.Map(
+                stagingTexture,
+                0,
+                MapMode.Read,
+                Vortice.Direct3D11.MapFlags.DoNotWait,
+                out MappedSubresource mapped);
+
+            if (hr.Success)
+            {
+                return mapped;
+            }
+
+            if (hr != Vortice.DXGI.ResultCode.WasStillDrawing)
+            {
+                break;
+            }
+
+            Thread.Sleep(1);
+        }
+
+        return _immediateContext.Map(stagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
     }
 
     private ID3D11VideoProcessorInputView CreateInputView(ID3D11Texture2D inputTexture, Texture2DDescription inputDesc)
