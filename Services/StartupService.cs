@@ -77,11 +77,6 @@ public sealed class StartupService
     }
 
     /// <summary>
-    /// Alias for <see cref="IsStartupEnabled"/> used by existing settings UI callers.
-    /// </summary>
-    public bool IsEnabled() => IsStartupEnabled();
-
-    /// <summary>
     /// Re-applies the current startup command to the Windows Run registry key so moving
     /// <c>ClipThat.exe</c> or switching between standalone and <c>Start_ClipThat.bat</c> never breaks autostart.
     /// </summary>

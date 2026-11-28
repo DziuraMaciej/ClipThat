@@ -90,6 +90,40 @@ public sealed class Mp4ReplayMuxerTests : IDisposable
         Assert.Equal(1, tracksV1);
     }
 
+    [Fact]
+    public void TryReadMp4Metadata_Handles64BitBoxBeforeMoovSizeZeroAndInvalidFiles()
+    {
+        // 64-bit extended size (size == 1 + 8-byte largesize) mdat box preceding moov.
+        string path64 = Path.Combine(_tempDir, "large64_mdat.mp4");
+        var largeMdat = new byte[24];
+        BinaryPrimitives.WriteUInt32BigEndian(largeMdat.AsSpan(0, 4), 1u);
+        Encoding.ASCII.GetBytes("mdat", largeMdat.AsSpan(4, 4));
+        BinaryPrimitives.WriteUInt64BigEndian(largeMdat.AsSpan(8, 8), (ulong)largeMdat.Length);
+
+        byte[] moov = WrapBox("moov", BuildMvhdV0(1000, 9_500), BuildTrak("vide", 0), BuildTrak("soun", 0));
+        File.WriteAllBytes(path64, Concat(WrapBox("ftyp", new byte[8]), largeMdat, moov));
+
+        Assert.True(Mp4ReplayMuxer.TryReadMp4Metadata(path64, out TimeSpan dur64, out int tracks64));
+        Assert.Equal(TimeSpan.FromSeconds(9.5), dur64);
+        Assert.Equal(1, tracks64);
+
+        // size == 0 means box extends to EOF.
+        string pathEof = Path.Combine(_tempDir, "size0_moov.mp4");
+        byte[] moovEof = WrapBox("moov", BuildMvhdV0(1000, 4_000), BuildTrak("soun", 0));
+        BinaryPrimitives.WriteUInt32BigEndian(moovEof.AsSpan(0, 4), 0u);
+        File.WriteAllBytes(pathEof, Concat(WrapBox("ftyp", new byte[8]), moovEof));
+
+        Assert.True(Mp4ReplayMuxer.TryReadMp4Metadata(pathEof, out TimeSpan durEof, out int tracksEof));
+        Assert.Equal(TimeSpan.FromSeconds(4.0), durEof);
+        Assert.Equal(1, tracksEof);
+
+        // Corrupt / empty / missing files return false cleanly.
+        string corruptPath = Path.Combine(_tempDir, "corrupt.mp4");
+        File.WriteAllBytes(corruptPath, new byte[] { 0x00, 0x00, 0x00, 0x02, 0x66, 0x74, 0x79, 0x70 });
+        Assert.False(Mp4ReplayMuxer.TryReadMp4Metadata(corruptPath, out _, out _));
+        Assert.False(Mp4ReplayMuxer.TryReadMp4Metadata(Path.Combine(_tempDir, "missing.mp4"), out _, out _));
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
@@ -246,6 +280,74 @@ public sealed class Mp4ReplayMuxerTests : IDisposable
         // Exact VFR spacing: v0 at 0.0 s (0), v1 at +2.5 s (225000 ticks @ 90 kHz), audio at +0.5 s (45000 ticks @ 90 kHz)
         Assert.Equal(new long[] { 0L, 225_000L }, videoPtsValues);
         Assert.Equal(new long[] { 45_000L }, audioPtsValues);
+    }
+
+    [Fact]
+    public void WriteMpegTsIntermediate_SupportsThreeAudioTracksAndMultiPacketVideoFrames()
+    {
+        string tsPath = Path.Combine(_tempDir, "multi_track_large.ts");
+        byte[] spsPps =
+        {
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80
+        };
+
+        // Large IDR frame (> 3500 bytes -> spans > 18 TS packets, testing continuity counter wrap 0..15)
+        var largeIdr = new byte[3600];
+        largeIdr[3] = 0x01;
+        largeIdr[4] = 0x65;
+        Array.Fill(largeIdr, (byte)0x7A, 5, largeIdr.Length - 5);
+
+        byte[] aacPayload = { 0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C };
+        using var v0 = new EncodedPacket(MediaTrackType.Video, largeIdr, largeIdr.Length, 0, 166_667, isKeyframe: true, returnToArrayPool: false);
+        using var sys = new EncodedPacket(MediaTrackType.SystemAudio, aacPayload, aacPayload.Length, 100_000, 213_333, isKeyframe: true, returnToArrayPool: false);
+        using var mic = new EncodedPacket(MediaTrackType.MicrophoneAudio, aacPayload, aacPayload.Length, 200_000, 213_333, isKeyframe: true, returnToArrayPool: false);
+        using var mix = new EncodedPacket(MediaTrackType.CombinedMixAudio, aacPayload, aacPayload.Length, 300_000, 213_333, isKeyframe: true, returnToArrayPool: false);
+
+        var ordered = new List<Mp4ReplayMuxer.IndexedPacket>
+        {
+            new(v0, 0),
+            new(sys, 1),
+            new(mic, 2),
+            new(mix, 3)
+        };
+
+        int audioCount = Mp4ReplayMuxer.WriteMpegTsIntermediate(
+            tsPath,
+            ordered,
+            baseTimestamp100Ns: 0,
+            videoSequenceHeader: spsPps,
+            hasSystemAudio: true,
+            hasMicrophoneAudio: true,
+            includeCombinedMix: true);
+
+        Assert.Equal(3, audioCount);
+
+        byte[] tsBytes = File.ReadAllBytes(tsPath);
+        Assert.Equal(0, tsBytes.Length % 188);
+
+        var videoContinuity = new List<int>();
+        var seenPids = new HashSet<ushort>();
+        for (int offset = 0; offset < tsBytes.Length; offset += 188)
+        {
+            Assert.Equal((byte)0x47, tsBytes[offset]);
+            ushort pid = (ushort)(((tsBytes[offset + 1] & 0x1F) << 8) | tsBytes[offset + 2]);
+            seenPids.Add(pid);
+            if (pid == 0x0100)
+            {
+                videoContinuity.Add(tsBytes[offset + 3] & 0x0F);
+            }
+        }
+
+        Assert.Contains((ushort)0x0100, seenPids);
+        Assert.Contains((ushort)0x0101, seenPids);
+        Assert.Contains((ushort)0x0102, seenPids);
+        Assert.Contains((ushort)0x0103, seenPids);
+        Assert.True(videoContinuity.Count > 16, "Large IDR should span > 16 TS packets to exercise CC wrap");
+        for (int i = 0; i < videoContinuity.Count; i++)
+        {
+            Assert.Equal(i % 16, videoContinuity[i]);
+        }
     }
 
     private static long DecodePts90k(ReadOnlySpan<byte> ptsBytes)

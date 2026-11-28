@@ -5,6 +5,7 @@ using ClipThat.Engine.Buffer;
 using ClipThat.Engine.Capture;
 using ClipThat.Engine.Diagnostics;
 using ClipThat.Engine.Encoding;
+using ClipThat.Engine.Interop;
 using ClipThat.Engine.Muxing;
 using ClipThat.Engine.Video;
 using ClipThat.Models;
@@ -55,11 +56,6 @@ public sealed class ReplayEngine : IReplayEngine
     public string? CurrentStatus => Volatile.Read(ref _currentStatus);
 
     public string? LastError => Volatile.Read(ref _lastError);
-
-    /// <summary>
-    /// Exposes the active thread-safe circular buffer for diagnostics and replay inspection.
-    /// </summary>
-    public MediaRingBuffer RingBuffer => _ringBuffer;
 
     public event Action<string>? StatusChanged;
 
@@ -990,7 +986,7 @@ public sealed class ReplayEngine : IReplayEngine
     {
         string mode = encoder.IsHardwareAccelerated ? "GPU" : "CPU";
         string backendShort = capture is DxgiFrameCapture ? "DXGI" : "WGC";
-        string resolutionLabel = $"{settings.Resolution.ToString()[1..]}p";
+        string resolutionLabel = $"{(int)settings.Resolution}p";
         string baseStatus = $"Nagrywanie aktywne ({backendShort} · {mode} · {resolutionLabel} {settings.Fps} FPS · {capture.AdapterName} / {encoder.EncoderName})";
 
         string? audioError = audioCapture?.GetInitializationErrorSummary();
@@ -1673,20 +1669,6 @@ public sealed class ReplayEngine : IReplayEngine
             long Duration100Ns);
 
         private static void SafeDispose(IDisposable? disposable)
-        {
-            if (disposable is null)
-            {
-                return;
-            }
-
-            try
-            {
-                disposable.Dispose();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Błąd zwalniania zasobu potoku: {ex.Message}");
-            }
-        }
+            => EngineDisposeHelper.SafeDispose(disposable, "Błąd zwalniania zasobu potoku");
     }
 }

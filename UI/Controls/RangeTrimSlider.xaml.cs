@@ -17,9 +17,9 @@ public partial class RangeTrimSlider : UserControl
     public const double MinimumGapSeconds = 0.5;
     private const double HandleWidth = 14.0;
 
-    private static readonly Brush PlayheadNormalFillBrush = CreateFrozenBrush(0xFF, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush PlayheadNormalStrokeBrush = CreateFrozenBrush(0xCC, 0x09, 0x09, 0x0B);
-    private static readonly Brush PlayheadScrubbingStrokeBrush = CreateFrozenBrush(0xFF, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush PlayheadNormalFillBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush PlayheadNormalStrokeBrush = UiBrushHelper.CreateFrozenBrush(0xCC, 0x09, 0x09, 0x0B);
+    private static readonly SolidColorBrush PlayheadScrubbingStrokeBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xFF, 0xFF, 0xFF);
 
     public static readonly DependencyProperty MinimumProperty =
         DependencyProperty.Register(
@@ -493,12 +493,5 @@ public partial class RangeTrimSlider : UserControl
 
         Canvas.SetLeft(EndThumb, endX);
         Canvas.SetTop(EndThumb, thumbTop);
-    }
-
-    private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)
-    {
-        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
-        brush.Freeze();
-        return brush;
     }
 }

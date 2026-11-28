@@ -32,10 +32,6 @@ public sealed class ClipExportOptions
 
     public string? OutputFileName { get; init; }
 
-    public TimeSpan StartTime { get; init; }
-
-    public TimeSpan EndTime { get; init; }
-
     public double SystemVolume { get; init; } = 1.0;
 
     public double MicrophoneVolume { get; init; } = 1.0;
@@ -71,7 +67,7 @@ public sealed record PreviewAudioExtractionResult(
 /// Discovers recorded MP4 replays, reads media metadata without blocking UI, resolves or downloads
 /// FFmpeg on demand, and performs near-instant <c>-c:v copy</c> trimming and audio mixing.
 /// </summary>
-public sealed partial class ClipEditorService
+public sealed partial class ClipEditorService : IDisposable
 {
     private const string FfmpegEssentialsDownloadUrl =
         "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
@@ -79,6 +75,7 @@ public sealed partial class ClipEditorService
         "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256";
     private static readonly string[] HardwareEncoderCandidates =
         { "h264_nvenc", "h264_amf", "h264_qsv" };
+    private static readonly char[] Sha256Separators = { ' ', '\t', '\r', '\n' };
 
     private static readonly HttpClient SharedHttpClient = CreateHttpClient();
     private static readonly SemaphoreSlim FfmpegDownloadGate = new(1, 1);
@@ -625,20 +622,8 @@ public sealed partial class ClipEditorService
                 return false;
             }
 
-            using CancellationTokenRegistration cancelRegistration = cancellationToken.Register(() =>
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                }
-                catch
-                {
-                    // Process may have already exited.
-                }
-            });
+            using CancellationTokenRegistration cancelRegistration =
+                RegisterProcessTermination(process, cancellationToken);
 
             Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
@@ -895,28 +880,6 @@ public sealed partial class ClipEditorService
         }
     }
 
-    /// <summary>
-    /// Overload reading <see cref="ClipExportOptions.StartTime"/> and <see cref="ClipExportOptions.EndTime"/>
-    /// from <paramref name="options"/>.
-    /// </summary>
-    public Task<ClipExportResult> ExportTrimmedClipAsync(
-        ClipExportOptions options,
-        IProgress<ClipExportProgress>? progress = null,
-        CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(options);
-        return ExportTrimmedClipAsync(options, options.StartTime, options.EndTime, progress, cancellationToken);
-    }
-
-    /// <summary>
-    /// Compatibility alias for <see cref="ExportTrimmedClipAsync(ClipExportOptions, TimeSpan, TimeSpan, IProgress{ClipExportProgress}?, CancellationToken)"/>.
-    /// </summary>
-    public Task<ClipExportResult> ExportClipAsync(
-        ClipExportOptions options,
-        IProgress<ClipExportProgress>? progress = null,
-        CancellationToken cancellationToken = default) =>
-        ExportTrimmedClipAsync(options, progress, cancellationToken);
-
     private static async Task RunFfmpegExportProcessAsync(
         ProcessStartInfo startInfo,
         TimeSpan expectedDuration,
@@ -932,20 +895,8 @@ public sealed partial class ClipEditorService
             throw new InvalidOperationException("Nie udało się uruchomić procesu ffmpeg.exe.");
         }
 
-        using CancellationTokenRegistration cancelRegistration = cancellationToken.Register(() =>
-        {
-            try
-            {
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch
-            {
-                // Process may have already exited.
-            }
-        });
+        using CancellationTokenRegistration cancelRegistration =
+            RegisterProcessTermination(process, cancellationToken);
 
         string? line;
         while ((line = await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
@@ -1266,20 +1217,8 @@ public sealed partial class ClipEditorService
             using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             probeCts.CancelAfter(TimeSpan.FromSeconds(4));
 
-            using CancellationTokenRegistration cancelReg = probeCts.Token.Register(() =>
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                }
-                catch
-                {
-                    // Process already exited.
-                }
-            });
+            using CancellationTokenRegistration cancelReg =
+                RegisterProcessTermination(process, probeCts.Token);
 
             Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(probeCts.Token);
             Task<string> stderrTask = process.StandardError.ReadToEndAsync(probeCts.Token);
@@ -1397,20 +1336,8 @@ public sealed partial class ClipEditorService
                 return (TimeSpan.Zero, 0);
             }
 
-            using CancellationTokenRegistration cancelRegistration = cancellationToken.Register(() =>
-            {
-                try
-                {
-                    if (!process.HasExited)
-                    {
-                        process.Kill(entireProcessTree: true);
-                    }
-                }
-                catch
-                {
-                    // Process may have already exited.
-                }
-            });
+            using CancellationTokenRegistration cancelRegistration =
+                RegisterProcessTermination(process, cancellationToken);
 
             Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
             Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
@@ -1500,7 +1427,7 @@ public sealed partial class ClipEditorService
             return false;
         }
 
-        string token = content.Trim().Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)[0];
+        string token = content.Trim().Split(Sha256Separators, StringSplitOptions.RemoveEmptyEntries)[0];
         if (token.Length != 64)
         {
             return false;
@@ -1769,6 +1696,31 @@ public sealed partial class ClipEditorService
         {
             // Ignore best-effort temporary file cleanup errors.
         }
+    }
+
+    private static CancellationTokenRegistration RegisterProcessTermination(
+        Process process,
+        CancellationToken cancellationToken)
+    {
+        return cancellationToken.Register(() =>
+        {
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+            }
+            catch
+            {
+                // Process may have already exited.
+            }
+        });
+    }
+
+    public void Dispose()
+    {
+        _hwEncoderProbeLock.Dispose();
     }
 
     private readonly record struct CachedClipMetadata(

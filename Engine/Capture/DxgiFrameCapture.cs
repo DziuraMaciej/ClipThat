@@ -99,10 +99,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
             device = deviceInfo.Device;
             immediateContext = deviceInfo.ImmediateContext;
             AdapterName = deviceInfo.AdapterName;
-            AdapterVendorId = deviceInfo.VendorId;
-            AdapterDeviceId = deviceInfo.DeviceId;
             AdapterLuid = deviceInfo.Luid;
-            MatchedMonitorAdapter = deviceInfo.MatchedMonitorOutput;
 
             if (matchedOutput is null)
             {
@@ -131,7 +128,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                 "DxgiFrameCapture",
                 $"Initialized DXGI Desktop Duplication: Monitor={monitorDeviceName ?? "(Primary)"} (HMONITOR=0x{monitorHandle:X}), " +
                 $"Mode={duplDesc.ModeDescription.Width}x{duplDesc.ModeDescription.Height} ({duplDesc.ModeDescription.Format}), " +
-                $"ActiveGPU=\"{AdapterName}\" (VendorId=0x{AdapterVendorId:X4}, DeviceId=0x{AdapterDeviceId:X4}, " +
+                $"ActiveGPU=\"{AdapterName}\" (VendorId=0x{deviceInfo.VendorId:X4}, DeviceId=0x{deviceInfo.DeviceId:X4}, " +
                 $"LUID={AdapterLuid.HighPart:X8}:{AdapterLuid.LowPart:X8})");
         }
         catch (Exception ex)
@@ -157,17 +154,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
     public ID3D11DeviceContext ImmediateContext => _immediateContext;
 
-    public nint MonitorHandle => _monitorHandle;
-
     public string AdapterName { get; }
 
-    public uint AdapterVendorId { get; }
-
-    public uint AdapterDeviceId { get; }
-
     public Luid AdapterLuid { get; }
-
-    public bool MatchedMonitorAdapter { get; }
 
     public string CaptureBackendName => "DXGI Desktop Duplication";
 
@@ -664,21 +653,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
     }
 
     private static void SafeDispose(IDisposable? disposable)
-    {
-        if (disposable is null)
-        {
-            return;
-        }
-
-        try
-        {
-            disposable.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Błąd zwalniania zasobu DXGI/D3D11: {ex.Message}");
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(disposable, "Błąd zwalniania zasobu DXGI/D3D11");
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern nint SetThreadDpiAwarenessContext(nint dpiContext);

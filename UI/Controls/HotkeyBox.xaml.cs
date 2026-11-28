@@ -24,8 +24,8 @@ public partial class HotkeyBox : UserControl
     private const uint ModShift = 0x0004u;
     private const uint ModWin = 0x0008u;
 
-    private static readonly Brush IdleBackgroundBrush = CreateFrozenBrush(0x1A, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush IdleBorderBrush = CreateFrozenBrush(0x33, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush IdleBackgroundBrush = UiBrushHelper.CreateFrozenBrush(0x1A, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush IdleBorderBrush = UiBrushHelper.CreateFrozenBrush(0x33, 0xFF, 0xFF, 0xFF);
 
     private GlobalHotkeyService? _hotkeyService;
     private uint _currentModifiers;
@@ -261,11 +261,4 @@ public partial class HotkeyBox : UserControl
         Key.LeftShift or Key.RightShift or
         Key.LWin or Key.RWin or
         Key.System or Key.DeadCharProcessed;
-
-    private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)
-    {
-        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
-        brush.Freeze();
-        return brush;
-    }
 }

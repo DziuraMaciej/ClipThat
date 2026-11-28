@@ -2,10 +2,11 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
-using System.Runtime.InteropServices;
 using ClipThat.Engine.Audio;
 using ClipThat.Engine.Buffer;
 using ClipThat.Engine.Diagnostics;
+using ClipThat.Engine.Encoding;
+using ClipThat.Engine.Interop;
 using ClipThat.Services;
 using Vortice.MediaFoundation;
 
@@ -208,7 +209,6 @@ public sealed class Mp4ReplayMuxer
                         orderedPackets,
                         baseTimestamp100Ns,
                         tempOutputPath,
-                        fps,
                         videoSequenceHeader,
                         hasSystemAudio,
                         hasMicrophoneAudio,
@@ -477,7 +477,6 @@ public sealed class Mp4ReplayMuxer
         List<IndexedPacket> orderedPackets,
         long baseTimestamp100Ns,
         string outputFilePath,
-        int fps,
         byte[]? videoSequenceHeader,
         bool hasSystemAudio,
         bool hasMicrophoneAudio,
@@ -1077,56 +1076,7 @@ public sealed class Mp4ReplayMuxer
     }
 
     internal static byte[]? TryExtractAnnexBSpsPps(ReadOnlySpan<byte> data)
-    {
-        using var stream = new MemoryStream();
-        int pos = FindNextStartCode(data, 0, out int startCodeLen);
-        bool hasSps = false;
-        bool hasPps = false;
-
-        while (pos >= 0 && pos + startCodeLen < data.Length)
-        {
-            int nalStart = pos + startCodeLen;
-            int nextPos = FindNextStartCode(data, nalStart, out int nextStartCodeLen);
-            int nalEnd = nextPos >= 0 ? nextPos : data.Length;
-
-            int nalType = data[nalStart] & 0x1F;
-            if (nalType is 7 or 8)
-            {
-                if (nalType == 7) hasSps = true;
-                else hasPps = true;
-                stream.Write(data.Slice(pos, nalEnd - pos));
-            }
-
-            pos = nextPos;
-            startCodeLen = nextStartCodeLen;
-        }
-
-        return (hasSps && hasPps && stream.Length > 0) ? stream.ToArray() : null;
-    }
-
-    private static int FindNextStartCode(ReadOnlySpan<byte> data, int startIndex, out int startCodeLength)
-    {
-        for (int i = startIndex; i + 2 < data.Length; i++)
-        {
-            if (data[i] == 0 && data[i + 1] == 0)
-            {
-                if (data[i + 2] == 1)
-                {
-                    startCodeLength = 3;
-                    return i;
-                }
-
-                if (i + 3 < data.Length && data[i + 2] == 0 && data[i + 3] == 1)
-                {
-                    startCodeLength = 4;
-                    return i;
-                }
-            }
-        }
-
-        startCodeLength = 0;
-        return -1;
-    }
+        => AnnexBHelper.TryExtractSpsPps(data);
 
     private static ulong PackUInt64(uint high, uint low) => ((ulong)high << 32) | low;
 
@@ -1146,21 +1096,7 @@ public sealed class Mp4ReplayMuxer
     }
 
     private static void SafeDispose(IDisposable? disposable)
-    {
-        if (disposable is null)
-        {
-            return;
-        }
-
-        try
-        {
-            disposable.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Błąd zwalniania obiektu COM muksera MP4: {ex.Message}");
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(disposable, "Błąd zwalniania obiektu COM muksera MP4");
 
     /// <summary>
     /// Patches <c>moov -&gt; trak -&gt; tkhd</c> audio track headers in-place so Windows Media Player,

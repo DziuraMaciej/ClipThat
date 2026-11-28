@@ -15,8 +15,7 @@ Lekka aplikacja dla Windows do ciągłego nagrywania powtórek z gier i pulpitu 
 4. Kliknij dwukrotnie **`Start_ClipThat.bat`**.
    - Jeśli Windows wyświetli filtr SmartScreen, kliknij **Więcej informacji → Uruchom mimo to**.
    - Przy pierwszym uruchomieniu skrypt automatycznie doinstaluje `.NET 8 SDK` (jeśli nie ma go w systemie), pobierze `ffmpeg.exe`, skompiluje wersję `Release` i uruchomi **ClipThat**.
-   - Windows może zapytać o instalację lokalnego certyfikatu podpisu kodu (`ClipThat Local`) — kliknij **Tak**.
-5. W oknie aplikacji wejdź w **Ustawienia** i włącz **„Uruchamiaj z systemem Windows”** oraz **„Rozpocznij nagrywanie po uruchomieniu”** — od tej pory ClipThat będzie startować automatycznie w tle obok zegara (w zasobniku systemowym), bez potrzeby ponownego klikania skryptów.
+5. W oknie aplikacji wejdź w **Ustawienia** i włącz **„Uruchamiaj ClipThat po starcie systemu Windows (w ukrytym zasobniku)”** (opcja **„Rozpocznij nagrywanie od razu po uruchomieniu aplikacji”** jest domyślnie włączona) — od tej pory ClipThat będzie startować automatycznie w tle obok zegara (w zasobniku systemowym), bez potrzeby ponownego klikania skryptów.
 
 ## Aktualizacja do nowej wersji
 

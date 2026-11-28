@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
@@ -30,13 +31,13 @@ public partial class MonitorLayoutControl : UserControl
     private const int MdtEffectiveDpi = 0;
     private static readonly nint HwndTopMost = new(-1);
 
-    private static readonly Brush DefaultFillBrush = CreateFrozenBrush(0x24, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush DefaultBorderBrush = CreateFrozenBrush(0x45, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush HoverFillBrush = CreateFrozenBrush(0x34, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush HoverBorderBrush = CreateFrozenBrush(0x70, 0xFF, 0xFF, 0xFF);
-    private static readonly Brush IdentifyOverlayFillBrush = CreateFrozenBrush(0xDD, 0x18, 0x18, 0x1B);
-    private static readonly Brush PrimaryTextBrush = CreateFrozenBrush(0xFF, 0xF3, 0xF3, 0xF3);
-    private static readonly Brush SecondaryTextBrush = CreateFrozenBrush(0xFF, 0xA8, 0xA8, 0xA8);
+    private static readonly SolidColorBrush DefaultFillBrush = UiBrushHelper.CreateFrozenBrush(0x24, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush DefaultBorderBrush = UiBrushHelper.CreateFrozenBrush(0x45, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush HoverFillBrush = UiBrushHelper.CreateFrozenBrush(0x34, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush HoverBorderBrush = UiBrushHelper.CreateFrozenBrush(0x70, 0xFF, 0xFF, 0xFF);
+    private static readonly SolidColorBrush IdentifyOverlayFillBrush = UiBrushHelper.CreateFrozenBrush(0xDD, 0x18, 0x18, 0x1B);
+    private static readonly SolidColorBrush PrimaryTextBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xF3, 0xF3, 0xF3);
+    private static readonly SolidColorBrush SecondaryTextBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xA8, 0xA8, 0xA8);
 
     private readonly List<Window> _identifyWindows = new();
     private DisplayService? _displayService;
@@ -232,7 +233,7 @@ public partial class MonitorLayoutControl : UserControl
         double indexFontSize = Math.Clamp(tileHeight * 0.28, 16.0, 30.0);
         contentStack.Children.Add(new TextBlock
         {
-            Text = display.DisplayIndex.ToString(),
+            Text = display.DisplayIndex.ToString(CultureInfo.InvariantCulture),
             FontSize = indexFontSize,
             FontWeight = FontWeights.Bold,
             Foreground = PrimaryTextBrush,
@@ -344,7 +345,7 @@ public partial class MonitorLayoutControl : UserControl
 
         stack.Children.Add(new TextBlock
         {
-            Text = display.DisplayIndex.ToString(),
+            Text = display.DisplayIndex.ToString(CultureInfo.InvariantCulture),
             FontSize = 60,
             FontWeight = FontWeights.Bold,
             Foreground = PrimaryTextBrush,
@@ -512,13 +513,6 @@ public partial class MonitorLayoutControl : UserControl
     private void OnSystemDisplaySettingsChanged(object? sender, EventArgs e)
     {
         Dispatcher.InvokeAsync(RefreshDisplays);
-    }
-
-    private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)
-    {
-        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
-        brush.Freeze();
-        return brush;
     }
 
     private static nint GetWindowLongPtrCompat(nint hwnd, int index)

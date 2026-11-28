@@ -149,15 +149,6 @@ internal static class CaptureInterop
     }
 
     /// <summary>
-    /// Resolves the requested display device name and creates a <see cref="GraphicsCaptureItem"/> for it.
-    /// </summary>
-    public static GraphicsCaptureItem CreateCaptureItemForDisplay(string? deviceName)
-    {
-        nint monitorHandle = ResolveMonitorHandle(deviceName);
-        return CreateCaptureItemForMonitor(monitorHandle);
-    }
-
-    /// <summary>
     /// Creates a WinRT <see cref="IDirect3DDevice"/> bound to the supplied Vortice <see cref="ID3D11Device"/>
     /// for use with <see cref="Direct3D11CaptureFramePool"/>.
     /// </summary>

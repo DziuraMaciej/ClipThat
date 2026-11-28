@@ -14,10 +14,6 @@ public interface IVideoEncoder : IDisposable
 
     bool IsHardwareAccelerated { get; }
 
-    bool UsesGpuZeroCopyInput { get; }
-
-    bool IsAsyncMft { get; }
-
     int OutputWidth { get; }
 
     int OutputHeight { get; }

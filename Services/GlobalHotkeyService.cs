@@ -38,13 +38,7 @@ public sealed class GlobalHotkeyService : IDisposable
     /// </summary>
     public event EventHandler? HotkeyPressed;
 
-    public uint CurrentModifiers => _currentModifiers;
-
-    public uint CurrentVirtualKey => _currentVirtualKey;
-
     public bool IsRegistered => _isRegistered;
-
-    public int LastWin32Error { get; private set; }
 
     /// <summary>
     /// Unregisters any previously registered hotkey and registers the supplied Win32 modifier mask
@@ -172,7 +166,6 @@ public sealed class GlobalHotkeyService : IDisposable
         CreateMessageWindow();
 
         uint normalizedModifiers = modifiers & ValidModifierMask;
-        LastWin32Error = 0;
 
         if (_hwndSource is null || _hwndSource.Handle == nint.Zero || virtualKey == 0)
         {
@@ -195,7 +188,6 @@ public sealed class GlobalHotkeyService : IDisposable
         if (!registered)
         {
             int registrationError = Marshal.GetLastWin32Error();
-            LastWin32Error = registrationError;
             EngineLogger.Warn(
                 "GlobalHotkeyService",
                 $"Nie udało się zarejestrować skrótu globalnego {FormatHotkey(normalizedModifiers, virtualKey)} (Win32 error: {registrationError}).");

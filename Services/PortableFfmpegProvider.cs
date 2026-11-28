@@ -182,16 +182,12 @@ public static class PortableFfmpegProvider
 
     private static void ExtractAtomically(Assembly assembly, string resourceName, string targetPath)
     {
-        string directory = Path.GetDirectoryName(targetPath) ?? BinDirectory;
-        Directory.CreateDirectory(directory);
-
-        string tempPath = Path.Combine(directory, $"ffmpeg.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+        string tempPath = CreateTempExtractionPath(targetPath);
         try
         {
-            using Stream resourceStream = assembly.GetManifestResourceStream(resourceName)
-                ?? throw new InvalidOperationException($"Nie znaleziono osadzonego zasobu '{resourceName}'.");
-
+            using Stream resourceStream = OpenEmbeddedResourceStream(assembly, resourceName);
             long expectedLength = resourceStream.Length;
+
             using (var fileStream = new FileStream(
                        tempPath,
                        FileMode.Create,
@@ -204,8 +200,7 @@ public static class PortableFfmpegProvider
                 fileStream.Flush();
             }
 
-            CommitExtractedFile(tempPath, targetPath, expectedLength);
-            EngineLogger.Info("PortableFfmpegProvider", $"Extracted embedded ffmpeg.exe ({expectedLength:N0} B) to \"{targetPath}\".");
+            FinalizeExtraction(tempPath, targetPath, expectedLength);
         }
         catch
         {
@@ -220,16 +215,12 @@ public static class PortableFfmpegProvider
         string targetPath,
         CancellationToken cancellationToken)
     {
-        string directory = Path.GetDirectoryName(targetPath) ?? BinDirectory;
-        Directory.CreateDirectory(directory);
-
-        string tempPath = Path.Combine(directory, $"ffmpeg.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+        string tempPath = CreateTempExtractionPath(targetPath);
         try
         {
-            await using Stream resourceStream = assembly.GetManifestResourceStream(resourceName)
-                ?? throw new InvalidOperationException($"Nie znaleziono osadzonego zasobu '{resourceName}'.");
-
+            await using Stream resourceStream = OpenEmbeddedResourceStream(assembly, resourceName);
             long expectedLength = resourceStream.Length;
+
             await using (var fileStream = new FileStream(
                              tempPath,
                              FileMode.Create,
@@ -242,14 +233,30 @@ public static class PortableFfmpegProvider
                 await fileStream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            CommitExtractedFile(tempPath, targetPath, expectedLength);
-            EngineLogger.Info("PortableFfmpegProvider", $"Extracted embedded ffmpeg.exe ({expectedLength:N0} B) to \"{targetPath}\".");
+            FinalizeExtraction(tempPath, targetPath, expectedLength);
         }
         catch
         {
             TryDeleteFile(tempPath);
             throw;
         }
+    }
+
+    private static string CreateTempExtractionPath(string targetPath)
+    {
+        string directory = Path.GetDirectoryName(targetPath) ?? BinDirectory;
+        Directory.CreateDirectory(directory);
+        return Path.Combine(directory, $"ffmpeg.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+    }
+
+    private static Stream OpenEmbeddedResourceStream(Assembly assembly, string resourceName)
+        => assembly.GetManifestResourceStream(resourceName)
+           ?? throw new InvalidOperationException($"Nie znaleziono osadzonego zasobu '{resourceName}'.");
+
+    private static void FinalizeExtraction(string tempPath, string targetPath, long expectedLength)
+    {
+        CommitExtractedFile(tempPath, targetPath, expectedLength);
+        EngineLogger.Info("PortableFfmpegProvider", $"Extracted embedded ffmpeg.exe ({expectedLength:N0} B) to \"{targetPath}\".");
     }
 
     private static void CommitExtractedFile(string tempPath, string targetPath, long expectedLength)

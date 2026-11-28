@@ -676,15 +676,15 @@ public partial class App : Application
             Color secondaryAccent = ApplicationAccentColorManager.TertiaryAccent;
             Color tertiaryAccent = BlendWithWhite(secondaryAccent, 0.35);
 
-            resources["SystemAccentColorBrush"] = CreateFrozenBrush(systemAccent);
-            resources["SystemAccentColorPrimaryBrush"] = CreateFrozenBrush(primaryAccent);
-            resources["SystemAccentColorSecondaryBrush"] = CreateFrozenBrush(secondaryAccent);
-            resources["SystemAccentColorTertiaryBrush"] = CreateFrozenBrush(tertiaryAccent);
-            resources["SystemAccentTintBrush"] = CreateFrozenBrush(
+            resources["SystemAccentColorBrush"] = UiBrushHelper.CreateFrozenBrush(systemAccent);
+            resources["SystemAccentColorPrimaryBrush"] = UiBrushHelper.CreateFrozenBrush(primaryAccent);
+            resources["SystemAccentColorSecondaryBrush"] = UiBrushHelper.CreateFrozenBrush(secondaryAccent);
+            resources["SystemAccentColorTertiaryBrush"] = UiBrushHelper.CreateFrozenBrush(tertiaryAccent);
+            resources["SystemAccentTintBrush"] = UiBrushHelper.CreateFrozenBrush(
                 Color.FromArgb(0x26, primaryAccent.R, primaryAccent.G, primaryAccent.B));
-            resources["SystemAccentTintStrongBrush"] = CreateFrozenBrush(
+            resources["SystemAccentTintStrongBrush"] = UiBrushHelper.CreateFrozenBrush(
                 Color.FromArgb(0x3D, primaryAccent.R, primaryAccent.G, primaryAccent.B));
-            resources["SystemAccentBorderSubtleBrush"] = CreateFrozenBrush(
+            resources["SystemAccentBorderSubtleBrush"] = UiBrushHelper.CreateFrozenBrush(
                 Color.FromArgb(0x7A, primaryAccent.R, primaryAccent.G, primaryAccent.B));
         }
         catch (Exception ex)
@@ -806,13 +806,6 @@ public partial class App : Application
         }
     }
 
-    private static SolidColorBrush CreateFrozenBrush(Color color)
-    {
-        var brush = new SolidColorBrush(color);
-        brush.Freeze();
-        return brush;
-    }
-
     private static Color BlendWithWhite(Color color, double ratio)
     {
         byte r = (byte)Math.Clamp(Math.Round(color.R + ((255 - color.R) * ratio)), 0, 255);
@@ -888,6 +881,7 @@ public partial class App : Application
             _pausedTrayIcon = null;
 
             _audioDeviceService.Dispose();
+            _clipEditorService.Dispose();
 
             Shutdown();
         }

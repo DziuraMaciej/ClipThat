@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 
@@ -31,7 +32,7 @@ public static class EngineLogger
 
     private static void WriteEntry(string level, string component, string message, Exception? exception)
     {
-        string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+        string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
         var builder = new StringBuilder(256);
         builder.Append('[').Append(timestamp).Append("] [").Append(level).Append("] [")
             .Append(component).Append("] ").AppendLine(message);

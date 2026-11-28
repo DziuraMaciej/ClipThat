@@ -1,4 +1,9 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using ClipThat.Models;
 using ClipThat.Services;
 using Xunit;
 
@@ -23,11 +28,18 @@ public sealed class ClipEditorServiceTests
             hardwareVideoEncoder: null);
 
         List<string> args = psi.ArgumentList.ToList();
-        Assert.Contains("-ss", args);
-        Assert.Contains("00:00:12.500", args);
-        Assert.Contains("-t", args);
-        Assert.Contains("00:00:30.000", args);
-        Assert.Contains("copy", args);
+        int ssIndex = args.IndexOf("-ss");
+        int inputIndex = args.IndexOf("-i");
+        int durationIndex = args.IndexOf("-t");
+        int videoCodecIndex = args.IndexOf("-c:v");
+        int audioCodecIndex = args.IndexOf("-c:a");
+
+        Assert.True(ssIndex >= 0 && inputIndex > ssIndex, "-ss should precede -i for fast input seeking");
+        Assert.Equal("00:00:12.500", args[ssIndex + 1]);
+        Assert.True(durationIndex > inputIndex, "-t should follow -i");
+        Assert.Equal("00:00:30.000", args[durationIndex + 1]);
+        Assert.True(videoCodecIndex >= 0 && args[videoCodecIndex + 1] == "copy");
+        Assert.True(audioCodecIndex >= 0 && args[audioCodecIndex + 1] == "aac");
         Assert.Contains(args, a => a.Contains("amix=inputs=2:duration=longest:normalize=0[aout]", StringComparison.Ordinal) &&
                                    a.Contains("volume=0.75", StringComparison.Ordinal));
         Assert.Contains("[aout]", args);
@@ -138,5 +150,146 @@ public sealed class ClipEditorServiceTests
         Assert.False(ClipEditorService.TryParseSha256Text("too-short", out _));
         Assert.False(ClipEditorService.TryParseSha256Text(new string('g', 64), out _));
         Assert.False(ClipEditorService.TryParseSha256Text(null, out _));
+    }
+
+    [Fact]
+    public void BuildFfmpegStartInfo_UsesInvariantDecimalSeparatorUnderPolishCulture()
+    {
+        CultureInfo previousCulture = Thread.CurrentThread.CurrentCulture;
+        try
+        {
+            Thread.CurrentThread.CurrentCulture = CultureInfo.GetCultureInfo("pl-PL");
+            ProcessStartInfo psi = ClipEditorService.BuildFfmpegStartInfo(
+                "ffmpeg.exe", @"C:\Videos\clip.mp4", @"C:\Videos\out.tmp",
+                TimeSpan.FromSeconds(1.5), TimeSpan.FromSeconds(5.25),
+                systemVolume: 1.25, microphoneVolume: 0.75,
+                ClipExportMode.MixSingleTrackForDiscord, audioTrackCount: 2,
+                reencodeVideo: false, hardwareVideoEncoder: null);
+
+            string filterArg = Assert.Single(psi.ArgumentList, a => a.Contains("amix=", StringComparison.Ordinal));
+            Assert.Contains("volume=1.25", filterArg, StringComparison.Ordinal);
+            Assert.Contains("volume=0.75", filterArg, StringComparison.Ordinal);
+            Assert.DoesNotContain("1,25", filterArg, StringComparison.Ordinal);
+            Assert.DoesNotContain("0,75", filterArg, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Thread.CurrentThread.CurrentCulture = previousCulture;
+        }
+    }
+
+    [Fact]
+    public async Task ScanClipsAsync_SortsNewestFirstAndRefreshesMetadataWhenFileChanges()
+    {
+        string tempDir = Path.Combine(Path.GetTempPath(), "ClipEditorScanTests_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        try
+        {
+            string olderPath = Path.Combine(tempDir, "00001028112026.mp4");
+            string newerPath = Path.Combine(tempDir, "30001028112026.mp4");
+            File.WriteAllBytes(olderPath, CreateMinimalMp4(durationMs: 5_000, audioTracks: 1));
+            File.WriteAllBytes(newerPath, CreateMinimalMp4(durationMs: 12_000, audioTracks: 3));
+
+            using var service = new ClipEditorService();
+            IReadOnlyList<ClipItem> firstScan = await service.ScanClipsAsync(tempDir);
+
+            Assert.Equal(2, firstScan.Count);
+            Assert.Equal("30001028112026.mp4", firstScan[0].FileName);
+            Assert.Equal(TimeSpan.FromSeconds(12), firstScan[0].Duration);
+            Assert.Equal(3, firstScan[0].AudioTrackCount);
+            Assert.Equal("00001028112026.mp4", firstScan[1].FileName);
+            Assert.Equal(TimeSpan.FromSeconds(5), firstScan[1].Duration);
+            Assert.Equal(1, firstScan[1].AudioTrackCount);
+
+            // Modify the older file (different length + timestamp) and delete the newer file.
+            File.WriteAllBytes(olderPath, CreateMinimalMp4(durationMs: 25_000, audioTracks: 2));
+            File.SetLastWriteTimeUtc(olderPath, DateTime.UtcNow.AddSeconds(5));
+            File.Delete(newerPath);
+
+            IReadOnlyList<ClipItem> secondScan = await service.ScanClipsAsync(tempDir);
+            ClipItem updated = Assert.Single(secondScan);
+            Assert.Equal("00001028112026.mp4", updated.FileName);
+            Assert.Equal(TimeSpan.FromSeconds(25), updated.Duration);
+            Assert.Equal(2, updated.AudioTrackCount);
+        }
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public async Task ExportTrimmedClipAsync_ValidatesArgumentsBeforeLaunchingFfmpeg()
+    {
+        using var service = new ClipEditorService();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            service.ExportTrimmedClipAsync(null!, TimeSpan.Zero, TimeSpan.FromSeconds(5)));
+
+        var missingInput = new ClipExportOptions { InputFilePath = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".mp4") };
+        await Assert.ThrowsAsync<FileNotFoundException>(() =>
+            service.ExportTrimmedClipAsync(missingInput, TimeSpan.Zero, TimeSpan.FromSeconds(5)));
+
+        string tempFile = Path.Combine(Path.GetTempPath(), "clip_validate_" + Guid.NewGuid().ToString("N") + ".mp4");
+        File.WriteAllBytes(tempFile, Array.Empty<byte>());
+        try
+        {
+            var validPath = new ClipExportOptions { InputFilePath = tempFile };
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                service.ExportTrimmedClipAsync(validPath, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5)));
+            await Assert.ThrowsAsync<ArgumentException>(() =>
+                service.ExportTrimmedClipAsync(validPath, TimeSpan.FromSeconds(6), TimeSpan.FromSeconds(2)));
+        }
+        finally
+        {
+            try { File.Delete(tempFile); } catch { /* ignore */ }
+        }
+    }
+
+    private static byte[] CreateMinimalMp4(uint durationMs, int audioTracks)
+    {
+        var mvhdPayload = new byte[24];
+        BinaryPrimitives.WriteUInt32BigEndian(mvhdPayload.AsSpan(12, 4), 1000u);
+        BinaryPrimitives.WriteUInt32BigEndian(mvhdPayload.AsSpan(16, 4), durationMs);
+
+        var children = new List<byte[]>
+        {
+            WrapBox("mvhd", mvhdPayload),
+            CreateTrakBox("vide")
+        };
+        for (int i = 0; i < audioTracks; i++)
+        {
+            children.Add(CreateTrakBox("soun"));
+        }
+
+        byte[] ftyp = WrapBox("ftyp", new byte[8]);
+        byte[] moov = WrapBox("moov", children.ToArray());
+        var result = new byte[ftyp.Length + moov.Length];
+        Buffer.BlockCopy(ftyp, 0, result, 0, ftyp.Length);
+        Buffer.BlockCopy(moov, 0, result, ftyp.Length, moov.Length);
+        return result;
+    }
+
+    private static byte[] CreateTrakBox(string handler)
+    {
+        var hdlrPayload = new byte[24];
+        Encoding.ASCII.GetBytes(handler, hdlrPayload.AsSpan(8, 4));
+        return WrapBox("trak", WrapBox("mdia", WrapBox("hdlr", hdlrPayload)));
+    }
+
+    private static byte[] WrapBox(string fourCc, params byte[][] children)
+    {
+        int payloadLen = children.Sum(c => c.Length);
+        var box = new byte[8 + payloadLen];
+        BinaryPrimitives.WriteUInt32BigEndian(box.AsSpan(0, 4), (uint)box.Length);
+        Encoding.ASCII.GetBytes(fourCc, box.AsSpan(4, 4));
+        int offset = 8;
+        foreach (byte[] child in children)
+        {
+            Buffer.BlockCopy(child, 0, box, offset, child.Length);
+            offset += child.Length;
+        }
+
+        return box;
     }
 }

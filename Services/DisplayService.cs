@@ -53,31 +53,6 @@ public sealed class DisplayService
         return results;
     }
 
-    /// <summary>
-    /// Finds a display by device name, falling back to the primary or first available display.
-    /// </summary>
-    public DisplayDeviceInfo? GetDisplayByDeviceName(string? deviceName)
-    {
-        IReadOnlyList<DisplayDeviceInfo> displays = GetDisplays();
-        if (displays.Count == 0)
-        {
-            return null;
-        }
-
-        if (!string.IsNullOrWhiteSpace(deviceName))
-        {
-            DisplayDeviceInfo? match = displays.FirstOrDefault(d =>
-                string.Equals(d.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase));
-
-            if (match is not null)
-            {
-                return match;
-            }
-        }
-
-        return displays.FirstOrDefault(d => d.IsPrimary) ?? displays[0];
-    }
-
     private static string ResolveFriendlyName(string deviceName, int displayIndex)
     {
         var displayDevice = new DisplayDeviceW

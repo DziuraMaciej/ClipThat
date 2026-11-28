@@ -21,9 +21,9 @@ namespace ClipThat.UI.Pages;
 public partial class SettingsPage : Page
 {
     private static readonly CultureInfo PolishCulture = CultureInfo.GetCultureInfo("pl-PL");
-    private static readonly Brush RecordingDotBrush = CreateFrozenBrush(0xFF, 0x22, 0xC5, 0x5E);
-    private static readonly Brush PausedDotBrush = CreateFrozenBrush(0xFF, 0x71, 0x71, 0x7A);
-    private static readonly Brush ErrorDotBrush = CreateFrozenBrush(0xFF, 0xEF, 0x44, 0x44);
+    private static readonly SolidColorBrush RecordingDotBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0x22, 0xC5, 0x5E);
+    private static readonly SolidColorBrush PausedDotBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0x71, 0x71, 0x7A);
+    private static readonly SolidColorBrush ErrorDotBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xEF, 0x44, 0x44);
 
     private readonly SettingsService _settingsService;
     private readonly DisplayService _displayService;
@@ -838,12 +838,5 @@ public partial class SettingsPage : Page
         {
             StatusDot.Fill = ErrorDotBrush;
         }
-    }
-
-    private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)
-    {
-        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
-        brush.Freeze();
-        return brush;
     }
 }

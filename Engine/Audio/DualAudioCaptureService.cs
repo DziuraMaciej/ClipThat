@@ -2,9 +2,9 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using ClipThat.Engine.Buffer;
 using ClipThat.Engine.Diagnostics;
+using ClipThat.Engine.Interop;
 using ClipThat.Services;
 using NAudio.CoreAudioApi;
-using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using SharpGen.Runtime;
@@ -88,12 +88,6 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         _microphoneDeviceId = string.IsNullOrWhiteSpace(microphoneDeviceId) ? null : microphoneDeviceId.Trim();
         _onStatusChanged = onStatusChanged;
     }
-
-    public bool IsSystemAudioActive => Volatile.Read(ref _systemAudioTrack) is not null;
-
-    public bool IsMicrophoneActive => Volatile.Read(ref _microphoneTrack) is not null;
-
-    public bool IsCombinedMixActive => Volatile.Read(ref _combinedMixPipeline) is not null;
 
     public string? SystemAudioError => Volatile.Read(ref _systemAudioError);
 
@@ -1084,21 +1078,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
              / TimeSpan.TicksPerSecond;
 
     private static void SafeDispose(IDisposable? disposable)
-    {
-        if (disposable is null)
-        {
-            return;
-        }
-
-        try
-        {
-            disposable.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Błąd zwalniania ścieżki audio: {ex.Message}");
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(disposable, "Błąd zwalniania ścieżki audio");
 
     /// <summary>
     /// Shared-mode WASAPI loopback capture configured with a 20 ms buffer (10 ms polling cadence)
@@ -1840,11 +1820,6 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             }
         }
 
-        public void ResetPendingPcm()
-        {
-            _pcmAccumulatedBytes = 0;
-        }
-
         /// <summary>
         /// Flushes the AAC MFT state and marks the next input sample as a timeline discontinuity so
         /// Microsoft's AAC Encoder MFT re-anchors its output timestamps after a sleep/resume or large gap.
@@ -2009,13 +1984,8 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 return false;
             }
 
-            return QueryComRefCount(samplePtr) == 1 && QueryComRefCount(bufferPtr) == 2;
-        }
-
-        private static int QueryComRefCount(nint comPtr)
-        {
-            Marshal.AddRef(comPtr);
-            return Marshal.Release(comPtr);
+            return MediaFoundationMftHelper.QueryComRefCount(samplePtr) == 1 &&
+                   MediaFoundationMftHelper.QueryComRefCount(bufferPtr) == 2;
         }
 
         private void ReleaseReusableInputSample()
@@ -2153,32 +2123,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             IMFSample? reusableSample,
             nint reusableSamplePtr,
             IMFSample? returnedSample)
-        {
-            if (returnedSample is null || ReferenceEquals(returnedSample, reusableSample))
-            {
-                return;
-            }
-
-            if (reusableSamplePtr != nint.Zero && returnedSample.NativePointer == reusableSamplePtr)
-            {
-                try
-                {
-                    returnedSample.NativePointer = nint.Zero;
-                }
-                catch
-                {
-                    // Best-effort pointer detachment.
-                }
-                finally
-                {
-                    GC.SuppressFinalize(returnedSample);
-                }
-            }
-            else
-            {
-                SafeDisposeComObject(returnedSample);
-            }
-        }
+            => MediaFoundationMftHelper.CleanupReusableOutputAlias(reusableSample, reusableSamplePtr, returnedSample);
 
         private void EmitEncodedSample(IMFSample sample)
         {
@@ -2227,67 +2172,10 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             IMFSample? callerAllocatedSample,
             nint callerSamplePtr,
             IMFSample? returnedSample)
-        {
-            if (returnedSample is not null)
-            {
-                if (callerAllocatedSample is not null)
-                {
-                    if (ReferenceEquals(returnedSample, callerAllocatedSample))
-                    {
-                        SafeDisposeComObject(callerAllocatedSample);
-                    }
-                    else if (callerSamplePtr != nint.Zero && returnedSample.NativePointer == callerSamplePtr)
-                    {
-                        // Vortice OutputDataBuffer.__MarshalFrom wraps the same native IMFSample* in a second
-                        // managed wrapper without AddRef(). Detach the alias and dispose the caller wrapper once.
-                        try
-                        {
-                            returnedSample.NativePointer = nint.Zero;
-                        }
-                        catch
-                        {
-                            // Best-effort pointer detachment.
-                        }
-                        finally
-                        {
-                            GC.SuppressFinalize(returnedSample);
-                        }
-
-                        SafeDisposeComObject(callerAllocatedSample);
-                    }
-                    else
-                    {
-                        SafeDisposeComObject(returnedSample);
-                        SafeDisposeComObject(callerAllocatedSample);
-                    }
-                }
-                else
-                {
-                    SafeDisposeComObject(returnedSample);
-                }
-            }
-            else if (callerAllocatedSample is not null)
-            {
-                SafeDisposeComObject(callerAllocatedSample);
-            }
-        }
+            => MediaFoundationMftHelper.DisposeProcessOutputSamples(callerAllocatedSample, callerSamplePtr, returnedSample);
 
         private static void SafeDisposeComObject(IDisposable? disposable)
-        {
-            if (disposable is null)
-            {
-                return;
-            }
-
-            try
-            {
-                disposable.Dispose();
-            }
-            catch
-            {
-                // Ignore COM disposal errors during AAC encoding/teardown.
-            }
-        }
+            => EngineDisposeHelper.SafeDispose(disposable);
 
         private long TryGetSampleTime(IMFSample sample, long fallbackDuration100Ns)
         {
@@ -2358,50 +2246,10 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                     outputTypeInfo,
                     out activatesPtr,
                     out count);
-
-                if (activatesPtr != nint.Zero && count > 0)
-                {
-                    int wrappedCount = 0;
-                    try
-                    {
-                        for (int i = 0; i < count; i++)
-                        {
-                            nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                            if (itemPtr != nint.Zero)
-                            {
-                                candidates.Add(new IMFActivate(itemPtr));
-                            }
-
-                            wrappedCount = i + 1;
-                        }
-                    }
-                    catch
-                    {
-                        for (int i = 0; i < candidates.Count; i++)
-                        {
-                            SafeDisposeComObject(candidates[i]);
-                        }
-
-                        candidates.Clear();
-                        for (int i = wrappedCount; i < count; i++)
-                        {
-                            nint remainingPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                            if (remainingPtr != nint.Zero)
-                            {
-                                Marshal.Release(remainingPtr);
-                            }
-                        }
-
-                        throw;
-                    }
-                }
             }
             finally
             {
-                if (activatesPtr != nint.Zero)
-                {
-                    Marshal.FreeCoTaskMem(activatesPtr);
-                }
+                MediaFoundationMftHelper.UnwrapActivatePointerArray(activatesPtr, count, candidates);
             }
 
             int winningIndex = -1;
@@ -2418,13 +2266,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             }
             finally
             {
-                for (int i = 0; i < candidates.Count; i++)
-                {
-                    if (i != winningIndex)
-                    {
-                        SafeDisposeComObject(candidates[i]);
-                    }
-                }
+                MediaFoundationMftHelper.DisposeCandidateList(candidates, excludeIndex: winningIndex);
             }
 
             throw new InvalidOperationException(
@@ -2642,19 +2484,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         }
 
         private static (int InputStreamId, int OutputStreamId) ResolveStreamIds(IMFTransform transform)
-        {
-            int[] inputIds = new int[1];
-            int[] outputIds = new int[1];
-            try
-            {
-                transform.GetStreamIDs(1, inputIds, 1, outputIds);
-                return (inputIds[0], outputIds[0]);
-            }
-            catch (SharpGenException)
-            {
-                return (0, 0);
-            }
-        }
+            => MediaFoundationMftHelper.ResolveStreamIds(transform);
 
         public void Dispose()
         {

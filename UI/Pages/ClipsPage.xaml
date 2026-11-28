@@ -134,8 +134,7 @@
                 </Grid.RowDefinitions>
 
                 <!-- Top Header aligned horizontally with main NavigationView hamburger button -->
-                <Grid x:Name="ClipsListHeaderGrid"
-                      Grid.Row="0"
+                <Grid Grid.Row="0"
                       Margin="0,0,0,6">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="48" />
@@ -335,8 +334,7 @@
                       VerticalScrollBarVisibility="Auto"
                       HorizontalScrollBarVisibility="Disabled"
                       SizeChanged="EditorScrollViewer_SizeChanged">
-            <StackPanel x:Name="EditorContentPanel"
-                        Background="Transparent"
+            <StackPanel Background="Transparent"
                         Margin="20,14,20,18">
 
                 <!-- Header -->

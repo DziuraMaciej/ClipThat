@@ -364,7 +364,6 @@ public sealed class MfTrackAudioWaveStream : WaveStream
     public static bool TryOpenAudioTracks(
         string filePath,
         TimeSpan knownDuration,
-        int expectedTrackCount,
         out MfTrackAudioWaveStream? systemStream,
         out MfTrackAudioWaveStream? micStream)
     {
@@ -375,8 +374,7 @@ public sealed class MfTrackAudioWaveStream : WaveStream
         {
             systemStream = new MfTrackAudioWaveStream(filePath, audioTrackOrdinal: 0, knownDuration);
 
-            bool shouldOpenMic = expectedTrackCount >= 2 || systemStream.FileAudioStreamCount >= 2;
-            if (shouldOpenMic && systemStream.FileAudioStreamCount >= 2)
+            if (systemStream.FileAudioStreamCount >= 2)
             {
                 try
                 {

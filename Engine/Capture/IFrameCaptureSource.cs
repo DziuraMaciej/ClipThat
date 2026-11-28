@@ -1,4 +1,5 @@
 using ClipThat.Engine.Diagnostics;
+using ClipThat.Engine.Interop;
 using SharpGen.Runtime;
 using Vortice;
 using Vortice.Direct3D;
@@ -17,17 +18,9 @@ public interface IFrameCaptureSource : IDisposable
 
     ID3D11DeviceContext ImmediateContext { get; }
 
-    nint MonitorHandle { get; }
-
     string AdapterName { get; }
 
-    uint AdapterVendorId { get; }
-
-    uint AdapterDeviceId { get; }
-
     Luid AdapterLuid { get; }
-
-    bool MatchedMonitorAdapter { get; }
 
     string CaptureBackendName { get; }
 
@@ -55,22 +48,6 @@ internal static class MonitorDeviceFactory
         FeatureLevel.Level_10_1,
         FeatureLevel.Level_10_0
     };
-
-    /// <summary>
-    /// Enumerates DXGI adapters via <see cref="IDXGIFactory1.EnumAdapters1"/> and each adapter's
-    /// <see cref="IDXGIAdapter.EnumOutputs"/> to locate the exact <see cref="IDXGIAdapter1"/> whose
-    /// output <c>HMONITOR</c> matches <paramref name="targetMonitorHandle"/>.
-    /// </summary>
-    public static IDXGIAdapter1? FindAdapterForMonitor(nint targetMonitorHandle, string logTag)
-    {
-        if (!TryFindAdapterAndOutput(targetMonitorHandle, logTag, out IDXGIAdapter1? adapter, out IDXGIOutput? output))
-        {
-            return null;
-        }
-
-        output?.Dispose();
-        return adapter;
-    }
 
     /// <summary>
     /// Locates both the exact <see cref="IDXGIAdapter1"/> and <see cref="IDXGIOutput"/> driving
@@ -381,21 +358,7 @@ internal static class MonitorDeviceFactory
     }
 
     private static void SafeDispose(IDisposable? disposable)
-    {
-        if (disposable is null)
-        {
-            return;
-        }
-
-        try
-        {
-            disposable.Dispose();
-        }
-        catch
-        {
-            // Ignore best-effort cleanup errors.
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(disposable);
 
     internal readonly record struct MatchedDeviceInfo(
         ID3D11Device Device,

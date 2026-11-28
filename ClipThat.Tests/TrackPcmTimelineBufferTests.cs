@@ -130,4 +130,47 @@ public sealed class TrackPcmTimelineBufferTests
         Assert.Equal(0, timeline.StartFrame);
         Assert.Equal(0, timeline.EndFrame);
     }
+
+    [Fact]
+    public void CircularWrapAroundPreservesSamplesBeyondCapacity()
+    {
+        var timeline = new DualAudioCaptureService.CombinedAudioMixPipeline.TrackPcmTimelineBuffer();
+        const int block = 1024;
+        var readBuf = new short[block * Channels];
+
+        // 120 * 1024 = 122,880 frames (> 96,000-frame 2-second ring capacity)
+        for (int i = 0; i < 120; i++)
+        {
+            short expectedLeft = (short)(100 + i);
+            short expectedRight = (short)(-100 - i);
+            long frameStart = (long)i * block;
+
+            timeline.Write(CreateConstantPcm(block, expectedLeft, expectedRight), FramesToTicks100Ns(frameStart));
+            timeline.ReadOrZero(frameStart, block, readBuf);
+
+            Assert.Equal(expectedLeft, readBuf[0]);
+            Assert.Equal(expectedRight, readBuf[1]);
+            Assert.Equal(expectedLeft, readBuf[(block - 1) * 2]);
+            Assert.Equal(expectedRight, readBuf[(block - 1) * 2 + 1]);
+        }
+    }
+
+    [Fact]
+    public void SlightlyBackwardTimestampSnapsWithoutCorruptingTimeline()
+    {
+        var timeline = new DualAudioCaptureService.CombinedAudioMixPipeline.TrackPcmTimelineBuffer();
+        const int block = 1024;
+
+        timeline.Write(CreateConstantPcm(block, 111, 222), FramesToTicks100Ns(0));
+        // -2 frames jitter (within +-4 frame snap threshold)
+        timeline.Write(CreateConstantPcm(block, 333, 444), FramesToTicks100Ns(block - 2));
+
+        Assert.Equal(0, timeline.StartFrame);
+        Assert.Equal(block * 2, timeline.EndFrame);
+
+        var outSecond = new short[block * Channels];
+        timeline.ReadOrZero(block, block, outSecond);
+        Assert.Equal((short)333, outSecond[0]);
+        Assert.Equal((short)444, outSecond[1]);
+    }
 }

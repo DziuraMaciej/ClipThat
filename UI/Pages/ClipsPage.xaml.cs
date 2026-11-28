@@ -37,9 +37,9 @@ public partial class ClipsPage : Page
     private static readonly Duration SidebarContentFadeInDuration = new(TimeSpan.FromMilliseconds(180));
     private static readonly CubicEase SidebarEaseOut = CreateFrozenEaseOut();
 
-    private static readonly Brush NeutralStatusBrush = CreateFrozenBrush(0xFF, 0xA8, 0xA8, 0xA8);
-    private static readonly Brush SuccessStatusBrush = CreateFrozenBrush(0xFF, 0x4A, 0xDE, 0x80);
-    private static readonly Brush ErrorStatusBrush = CreateFrozenBrush(0xFF, 0xF8, 0x71, 0x71);
+    private static readonly SolidColorBrush NeutralStatusBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xA8, 0xA8, 0xA8);
+    private static readonly SolidColorBrush SuccessStatusBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0x4A, 0xDE, 0x80);
+    private static readonly SolidColorBrush ErrorStatusBrush = UiBrushHelper.CreateFrozenBrush(0xFF, 0xF8, 0x71, 0x71);
 
     private readonly SettingsService _settingsService;
     private readonly IReplayEngine _replayEngine;
@@ -56,7 +56,6 @@ public partial class ClipsPage : Page
     private CancellationTokenSource? _audioExtractionCts;
 
     private WaveOutEvent? _waveOut;
-    private MixingSampleProvider? _audioMixer;
     private WaveStream? _systemWaveStream;
     private WaveStream? _micWaveStream;
     private LockedSampleProvider? _systemSampleProvider;
@@ -604,7 +603,6 @@ public partial class ClipsPage : Page
                 bool ok = MfTrackAudioWaveStream.TryOpenAudioTracks(
                     clip.FilePath,
                     clip.Duration,
-                    clip.AudioTrackCount,
                     out MfTrackAudioWaveStream? sys,
                     out MfTrackAudioWaveStream? mic);
                 return (ok, sys, mic);
@@ -779,7 +777,6 @@ public partial class ClipsPage : Page
                 _micSampleProvider = micProvider;
                 _systemVolumeProvider = sysVolumeProvider;
                 _micVolumeProvider = micVolumeProvider;
-                _audioMixer = mixer;
                 _waveOut = waveOut;
                 _tempSystemWavPath = tempSysWavPath;
                 _tempMicWavPath = tempMicWavPath;
@@ -897,7 +894,6 @@ public partial class ClipsPage : Page
             _micSampleProvider = null;
             _systemVolumeProvider = null;
             _micVolumeProvider = null;
-            _audioMixer = null;
             _tempSystemWavPath = null;
             _tempMicWavPath = null;
         }
@@ -1705,42 +1701,24 @@ public partial class ClipsPage : Page
     }
 
     private void SystemMuteButton_Click(object sender, RoutedEventArgs e)
-    {
-        _isUpdatingVolumeSliders = true;
-        try
-        {
-            if (SystemVolumeSlider.Value > 0.5)
-            {
-                _lastNonZeroSystemVolume = SystemVolumeSlider.Value;
-                SystemVolumeSlider.Value = 0.0;
-            }
-            else
-            {
-                SystemVolumeSlider.Value = _lastNonZeroSystemVolume > 0.5 ? _lastNonZeroSystemVolume : 100.0;
-            }
-
-            UpdateVolumeReadoutsAndIcons();
-            ApplyLiveAudioVolumes();
-        }
-        finally
-        {
-            _isUpdatingVolumeSliders = false;
-        }
-    }
+        => ToggleTrackMute(SystemVolumeSlider, ref _lastNonZeroSystemVolume);
 
     private void MicMuteButton_Click(object sender, RoutedEventArgs e)
+        => ToggleTrackMute(MicVolumeSlider, ref _lastNonZeroMicVolume);
+
+    private void ToggleTrackMute(Slider slider, ref double lastNonZeroVolume)
     {
         _isUpdatingVolumeSliders = true;
         try
         {
-            if (MicVolumeSlider.Value > 0.5)
+            if (slider.Value > 0.5)
             {
-                _lastNonZeroMicVolume = MicVolumeSlider.Value;
-                MicVolumeSlider.Value = 0.0;
+                lastNonZeroVolume = slider.Value;
+                slider.Value = 0.0;
             }
             else
             {
-                MicVolumeSlider.Value = _lastNonZeroMicVolume > 0.5 ? _lastNonZeroMicVolume : 100.0;
+                slider.Value = lastNonZeroVolume > 0.5 ? lastNonZeroVolume : 100.0;
             }
 
             UpdateVolumeReadoutsAndIcons();
@@ -1836,8 +1814,6 @@ public partial class ClipsPage : Page
         {
             InputFilePath = clipToExport.FilePath,
             OutputFileName = ExportFileNameTextBox.Text,
-            StartTime = startTime,
-            EndTime = endTime,
             SystemVolume = Math.Round(SystemVolumeSlider.Value) / 100.0,
             MicrophoneVolume = Math.Round(MicVolumeSlider.Value) / 100.0,
             ExportMode = exportMode
@@ -2218,13 +2194,6 @@ public partial class ClipsPage : Page
         {
             existing.Dispose();
         }
-    }
-
-    private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)
-    {
-        var brush = new SolidColorBrush(Color.FromArgb(a, r, g, b));
-        brush.Freeze();
-        return brush;
     }
 
     private static CubicEase CreateFrozenEaseOut()

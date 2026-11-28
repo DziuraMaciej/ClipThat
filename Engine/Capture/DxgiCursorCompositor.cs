@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using System.Text;
 using ClipThat.Engine.Diagnostics;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -719,7 +718,7 @@ float4 PSMain(VSOut input) : SV_Target
         public uint HdrMode;
     }
 
-    [DllImport("d3dcompiler_47.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]
+    [DllImport("d3dcompiler_47.dll", CallingConvention = CallingConvention.StdCall, ExactSpelling = true, BestFitMapping = false, ThrowOnUnmappableChar = true)]
     private static extern int D3DCompile(
         nint pSrcData,
         nuint srcDataSize,

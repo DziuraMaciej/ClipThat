@@ -452,20 +452,6 @@ public sealed class EncodedPacketSnapshot : IReadOnlyList<EncodedPacket>, IDispo
 
     public long TotalBytes { get; }
 
-    public TimeSpan Duration
-    {
-        get
-        {
-            if (_packets.Count < 2)
-            {
-                return TimeSpan.Zero;
-            }
-
-            long spanTicks = _packets[^1].Timestamp100Ns - _packets[0].Timestamp100Ns;
-            return spanTicks > 0 ? TimeSpan.FromTicks(spanTicks) : TimeSpan.Zero;
-        }
-    }
-
     public int Count => _packets.Count;
 
     public EncodedPacket this[int index]
@@ -553,28 +539,6 @@ public sealed class MediaRingBuffer : IDisposable
             lock (_syncLock)
             {
                 return Volatile.Read(ref _disposed) != 0 ? 0 : _packets.Count;
-            }
-        }
-    }
-
-    public TimeSpan BufferedDuration
-    {
-        get
-        {
-            if (Volatile.Read(ref _disposed) != 0)
-            {
-                return TimeSpan.Zero;
-            }
-
-            lock (_syncLock)
-            {
-                if (Volatile.Read(ref _disposed) != 0 || _packets.First is null || _packets.Last is null)
-                {
-                    return TimeSpan.Zero;
-                }
-
-                long span = _latestTimestamp100Ns - _packets.First.Value.Timestamp100Ns;
-                return span > 0 ? TimeSpan.FromTicks(span) : TimeSpan.Zero;
             }
         }
     }

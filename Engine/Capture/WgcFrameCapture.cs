@@ -1,9 +1,7 @@
 using System.Diagnostics;
 using ClipThat.Engine.Diagnostics;
 using ClipThat.Engine.Interop;
-using SharpGen.Runtime;
 using Vortice;
-using Vortice.Direct3D;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 using Windows.Foundation.Metadata;
@@ -92,7 +90,6 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
         try
         {
             nint monitorHandle = CaptureInterop.ResolveMonitorHandle(monitorDeviceName);
-            MonitorHandle = monitorHandle;
 
             MonitorDeviceFactory.MatchedDeviceInfo deviceInfo = MonitorDeviceFactory.CreateD3D11DeviceForMonitor(
                 monitorHandle,
@@ -104,10 +101,7 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
             device = deviceInfo.Device;
             immediateContext = deviceInfo.ImmediateContext;
             AdapterName = deviceInfo.AdapterName;
-            AdapterVendorId = deviceInfo.VendorId;
-            AdapterDeviceId = deviceInfo.DeviceId;
             AdapterLuid = deviceInfo.Luid;
-            MatchedMonitorAdapter = deviceInfo.MatchedMonitorOutput;
 
             direct3DDevice = CaptureInterop.CreateDirect3DDevice(device);
             captureItem = CaptureInterop.CreateCaptureItemForMonitor(monitorHandle);
@@ -139,8 +133,8 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
                 "WgcFrameCapture",
                 $"Initialized WGC capture: Monitor={monitorDeviceName ?? "(Primary)"} (HMONITOR=0x{monitorHandle:X}), " +
                 $"Size={initialSize.Width}x{initialSize.Height}, ActiveGPU=\"{AdapterName}\" " +
-                $"(VendorId=0x{AdapterVendorId:X4}, DeviceId=0x{AdapterDeviceId:X4}, LUID={AdapterLuid.HighPart:X8}:{AdapterLuid.LowPart:X8}, " +
-                $"ExactMonitorMatch={MatchedMonitorAdapter})");
+                $"(VendorId=0x{deviceInfo.VendorId:X4}, DeviceId=0x{deviceInfo.DeviceId:X4}, LUID={AdapterLuid.HighPart:X8}:{AdapterLuid.LowPart:X8}, " +
+                $"ExactMonitorMatch={deviceInfo.MatchedMonitorOutput})");
         }
         catch (Exception ex)
         {
@@ -163,25 +157,15 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
 
     public ID3D11DeviceContext ImmediateContext => _immediateContext;
 
-    public nint MonitorHandle { get; }
-
     public string AdapterName { get; }
 
-    public uint AdapterVendorId { get; }
-
-    public uint AdapterDeviceId { get; }
-
     public Luid AdapterLuid { get; }
-
-    public bool MatchedMonitorAdapter { get; }
 
     public string CaptureBackendName => "WGC";
 
     public int CaptureWidth => _lastContentSize.Width;
 
     public int CaptureHeight => _lastContentSize.Height;
-
-    public SizeInt32 ContentSize => _lastContentSize;
 
     public int CapturedFrameCount => Volatile.Read(ref _capturedFrameCount);
 
@@ -491,19 +475,5 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
     }
 
     private static void SafeDispose(IDisposable? disposable)
-    {
-        if (disposable is null)
-        {
-            return;
-        }
-
-        try
-        {
-            disposable.Dispose();
-        }
-        catch (Exception ex)
-        {
-            Debug.WriteLine($"Błąd zwalniania zasobu WGC/D3D11: {ex.Message}");
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(disposable, "Błąd zwalniania zasobu WGC/D3D11");
 }

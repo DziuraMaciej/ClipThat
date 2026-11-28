@@ -81,7 +81,6 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
     private int _encodedPacketCount;
     private int _encodedKeyframeCount;
     private byte[]? _sequenceHeader;
-    private int _stopping;
     private int _disposed;
 
     public AmfH264Encoder(
@@ -143,10 +142,6 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
     public EncoderNegotiationTier ActiveTier => EncoderNegotiationTier.HardwareGpuZeroCopy;
 
     public bool IsHardwareAccelerated => true;
-
-    public bool UsesGpuZeroCopyInput => true;
-
-    public bool IsAsyncMft => true;
 
     public int OutputWidth => _width;
 
@@ -226,7 +221,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
     {
         ArgumentNullException.ThrowIfNull(frameTexture);
 
-        if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _stopping) != 0)
+        if (Volatile.Read(ref _disposed) != 0)
         {
             return false;
         }
@@ -240,7 +235,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
 
         lock (_submitLock)
         {
-            if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _stopping) != 0 || _context == 0 || _encoder == 0)
+            if (Volatile.Read(ref _disposed) != 0 || _context == 0 || _encoder == 0)
             {
                 return false;
             }
@@ -494,7 +489,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
                 }
                 catch (Exception ex)
                 {
-                    if (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
+                    if (Volatile.Read(ref _disposed) == 0)
                     {
                         EngineLogger.Error("AmfH264Encoder", $"Failed processing AMF output buffer: {ex.Message}", ex);
                         _onEncoderError?.Invoke(ex);
@@ -513,13 +508,6 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
 
             if (qRes == AmfRepeat)
             {
-                if (Volatile.Read(ref _stopping) != 0)
-                {
-                    // Allow remaining drained frames to exit promptly while shutting down.
-                    Thread.Sleep(2);
-                    continue;
-                }
-
                 // Older drivers that ignore QueryTimeout return AMF_REPEAT immediately; avoid CPU spin.
                 if (Stopwatch.GetElapsedTime(beforeQuery).TotalMilliseconds < 2.0)
                 {
@@ -529,7 +517,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
                 continue;
             }
 
-            if (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
+            if (Volatile.Read(ref _disposed) == 0)
             {
                 var ex = new InvalidOperationException($"AMF QueryOutput zakończyło się błędem ({qRes}).");
                 EngineLogger.Error("AmfH264Encoder", ex.Message, ex);
@@ -582,7 +570,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
             }
 
             var nativeSpan = new ReadOnlySpan<byte>((void*)nativePtr, length);
-            bool hasAnnexBIdr = MfH264Encoder.ContainsAnnexBKeyframeNal(nativeSpan);
+            bool hasAnnexBIdr = AnnexBHelper.ContainsKeyframeNal(nativeSpan);
             bool isKeyframe = isIdrProperty || hasAnnexBIdr;
 
             packet = EncodedPacket.CreateFromNativeMemory(
@@ -607,7 +595,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
         {
             if (packet.IsKeyframe && _sequenceHeader is null)
             {
-                byte[]? extracted = MfH264Encoder.TryExtractAnnexBSpsPps(packet.Data);
+                byte[]? extracted = AnnexBHelper.TryExtractSpsPps(packet.Data);
                 if (extracted is not null)
                 {
                     _sequenceHeader = extracted;
@@ -663,8 +651,6 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
         {
             return;
         }
-
-        Interlocked.Exchange(ref _stopping, 1);
 
         bool lockAcquired = Monitor.TryEnter(_submitLock, 1500);
         try

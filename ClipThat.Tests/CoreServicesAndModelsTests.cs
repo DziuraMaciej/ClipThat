@@ -10,9 +10,14 @@ public sealed class CoreServicesAndModelsTests
     [Theory]
     [InlineData("my_clip", "C:\\Videos\\orig.mp4", "my_clip")]
     [InlineData("my_clip.mp4", "C:\\Videos\\orig.mp4", "my_clip")]
+    [InlineData("clip.mp4.mp4", "C:\\Videos\\orig.mp4", "clip")]
     [InlineData("bad:name*with?chars<>|", "C:\\Videos\\orig.mp4", "badnamewithchars")]
     [InlineData("CON", "C:\\Videos\\orig.mp4", "orig_edited")]
+    [InlineData("CON.mp4", "C:\\Videos\\orig.mp4", "orig_edited")]
+    [InlineData("CON.txt", "C:\\Videos\\orig.mp4", "orig_edited")]
+    [InlineData("C:O*N", "C:\\Videos\\orig.mp4", "orig_edited")]
     [InlineData("nul", "C:\\Videos\\orig.mp4", "orig_edited")]
+    [InlineData("...", "C:\\Videos\\orig.mp4", "orig_edited")]
     [InlineData("   ", "C:\\Videos\\Replay_01.mp4", "Replay_01_edited")]
     [InlineData(null, "C:\\Videos\\Replay_01.mp4", "Replay_01_edited")]
     public void SanitizeOutputBaseName_ProducesSafeFileName(string? customName, string inputPath, string expected)
@@ -49,6 +54,23 @@ public sealed class CoreServicesAndModelsTests
         };
         ResourceEstimate fromSettings = estimator.Estimate(settingsNoMic);
         Assert.Equal(noMic.EstimatedDiskSizeMb, fromSettings.EstimatedDiskSizeMb, precision: 6);
+
+        // Verify clamping and monotonic bitrate scaling across presets and 30 vs 60 FPS.
+        Assert.Equal(
+            estimator.Estimate(1, ResolutionPreset.P720, 30, includeMicrophone: true).EstimatedDiskSizeMb,
+            estimator.Estimate(0, ResolutionPreset.P720, 30, includeMicrophone: true).EstimatedDiskSizeMb,
+            precision: 6);
+        Assert.Equal(
+            estimator.Estimate(10, ResolutionPreset.P720, 30, includeMicrophone: true).EstimatedDiskSizeMb,
+            estimator.Estimate(99, ResolutionPreset.P720, 30, includeMicrophone: true).EstimatedDiskSizeMb,
+            precision: 6);
+
+        foreach (ResolutionPreset preset in Enum.GetValues<ResolutionPreset>())
+        {
+            double fps30 = estimator.GetVideoBitrateMbps(preset, 30);
+            double fps60 = estimator.GetVideoBitrateMbps(preset, 60);
+            Assert.True(fps60 > fps30 && fps30 > 0);
+        }
     }
 
     [Fact]
@@ -95,6 +117,23 @@ public sealed class CoreServicesAndModelsTests
         Assert.Equal(30, settings.Fps);
         Assert.Equal(0x0003u, settings.HotkeyModifiers);
         Assert.Equal(0x78u, settings.HotkeyVirtualKey);
+
+        // Virtual keys above 0xFF must reset to defaults.
+        var outOfRangeKey = new AppSettings { HotkeyModifiers = 0x0002u, HotkeyVirtualKey = 0x100u };
+        outOfRangeKey.Normalize();
+        Assert.Equal(AppSettings.DefaultHotkeyModifiers, outOfRangeKey.HotkeyModifiers);
+        Assert.Equal(AppSettings.DefaultHotkeyVirtualKey, outOfRangeKey.HotkeyVirtualKey);
+
+        // Clone produces an independent copy of every field.
+        settings.SelectedMonitorDeviceName = @"\\.\DISPLAY1";
+        settings.StartWithWindows = true;
+        AppSettings clone = settings.Clone();
+        Assert.Equal(settings.SelectedMonitorDeviceName, clone.SelectedMonitorDeviceName);
+        Assert.Equal(settings.BufferDurationMinutes, clone.BufferDurationMinutes);
+        Assert.Equal(settings.Fps, clone.Fps);
+        Assert.Equal(settings.StartWithWindows, clone.StartWithWindows);
+        clone.BufferDurationMinutes = 9;
+        Assert.Equal(1, settings.BufferDurationMinutes);
     }
 
     [Theory]

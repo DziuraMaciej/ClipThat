@@ -81,6 +81,38 @@ public sealed class SettingsAndModelsTests : IDisposable
     }
 
     [Fact]
+    public void SettingsService_LoadAndSave_ReturnIsolatedClonesAndAreThreadSafe()
+    {
+        string path = Path.Combine(_tempDir, "isolated_settings.json");
+        var service = new SettingsService(path);
+
+        AppSettings first = service.Load();
+        first.BufferDurationMinutes = 10;
+        first.Fps = 30;
+
+        AppSettings second = service.Load();
+        Assert.Equal(5, second.BufferDurationMinutes);
+        Assert.Equal(60, second.Fps);
+
+        second.BufferDurationMinutes = 7;
+        service.Save(second);
+        second.BufferDurationMinutes = 1;
+
+        AppSettings third = service.Load();
+        Assert.Equal(7, third.BufferDurationMinutes);
+
+        Parallel.For(0, 16, i =>
+        {
+            AppSettings snapshot = service.Load();
+            snapshot.BufferDurationMinutes = (i % 10) + 1;
+            service.Save(snapshot);
+        });
+
+        AppSettings finalLoaded = service.Load();
+        Assert.InRange(finalLoaded.BufferDurationMinutes, 1, 10);
+    }
+
+    [Fact]
     public void AppSettingsNormalize_RejectsUnmodifiedNonFunctionKeyAndAllowsFunctionKeys()
     {
         var bareLetter = new AppSettings
@@ -137,10 +169,15 @@ public sealed class SettingsAndModelsTests : IDisposable
     [Fact]
     public void ClipItem_FormatFileSizeAndAudioTrackBadges_AreConsistent()
     {
-        Assert.Contains("KB", ClipItem.FormatFileSize(0));
-        Assert.Contains("KB", ClipItem.FormatFileSize(512 * 1024));
-        Assert.Contains("MB", ClipItem.FormatFileSize(25L * 1024L * 1024L));
-        Assert.Contains("GB", ClipItem.FormatFileSize(2L * 1024L * 1024L * 1024L));
+        Assert.Equal("0 KB", ClipItem.FormatFileSize(0));
+        Assert.Equal("512 KB", ClipItem.FormatFileSize(512 * 1024));
+        Assert.Equal("25,0 MB", ClipItem.FormatFileSize(25L * 1024L * 1024L));
+        Assert.Equal("2,00 GB", ClipItem.FormatFileSize(2L * 1024L * 1024L * 1024L));
+
+        var negative = new ClipItem("neg.mp4", "neg.mp4", DateTime.Now, TimeSpan.FromSeconds(-10), -500, audioTrackCount: -2);
+        Assert.Equal(TimeSpan.Zero, negative.Duration);
+        Assert.Equal(0L, negative.FileSizeBytes);
+        Assert.Equal(0, negative.AudioTrackCount);
 
         var noAudio = new ClipItem("a.mp4", "a.mp4", DateTime.Now, TimeSpan.FromSeconds(10), 1024, audioTrackCount: 0);
         var single = new ClipItem("b.mp4", "b.mp4", DateTime.Now, TimeSpan.FromSeconds(10), 1024, audioTrackCount: 1);

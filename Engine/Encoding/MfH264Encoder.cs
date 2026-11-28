@@ -624,46 +624,10 @@ public sealed class MfH264Encoder : IVideoEncoder
                 outputType: outputTypeInfo,
                 out activatesPtr,
                 out count);
-
-            if (activatesPtr != nint.Zero && count > 0)
-            {
-                int wrappedCount = 0;
-                try
-                {
-                    for (int i = 0; i < count; i++)
-                    {
-                        nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                        if (itemPtr != nint.Zero)
-                        {
-                            results.Add(new IMFActivate(itemPtr));
-                        }
-
-                        wrappedCount = i + 1;
-                    }
-                }
-                catch
-                {
-                    DisposeCandidateList(results, excludeIndex: -1);
-                    results.Clear();
-                    for (int i = wrappedCount; i < count; i++)
-                    {
-                        nint remainingPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                        if (remainingPtr != nint.Zero)
-                        {
-                            Marshal.Release(remainingPtr);
-                        }
-                    }
-
-                    throw;
-                }
-            }
         }
         finally
         {
-            if (activatesPtr != nint.Zero)
-            {
-                Marshal.FreeCoTaskMem(activatesPtr);
-            }
+            MediaFoundationMftHelper.UnwrapActivatePointerArray(activatesPtr, count, results);
         }
 
         return results;
@@ -726,46 +690,10 @@ public sealed class MfH264Encoder : IVideoEncoder
                 enumAttributes,
                 out activatesPtr,
                 out count);
-
-            if (activatesPtr != nint.Zero && count > 0)
-            {
-                int wrappedCount = 0;
-                try
-                {
-                    for (int i = 0; i < count; i++)
-                    {
-                        nint itemPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                        if (itemPtr != nint.Zero)
-                        {
-                            results.Add(new IMFActivate(itemPtr));
-                        }
-
-                        wrappedCount = i + 1;
-                    }
-                }
-                catch
-                {
-                    DisposeCandidateList(results, excludeIndex: -1);
-                    results.Clear();
-                    for (int i = wrappedCount; i < count; i++)
-                    {
-                        nint remainingPtr = Marshal.ReadIntPtr(activatesPtr, i * IntPtr.Size);
-                        if (remainingPtr != nint.Zero)
-                        {
-                            Marshal.Release(remainingPtr);
-                        }
-                    }
-
-                    throw;
-                }
-            }
         }
         finally
         {
-            if (activatesPtr != nint.Zero)
-            {
-                Marshal.FreeCoTaskMem(activatesPtr);
-            }
+            MediaFoundationMftHelper.UnwrapActivatePointerArray(activatesPtr, count, results);
         }
 
         return results;
@@ -1230,7 +1158,7 @@ public sealed class MfH264Encoder : IVideoEncoder
         }
         catch
         {
-            // ForceKeyFrame is best-effort; GOP size is also configured to 1s.
+            // ForceKeyFrame is best-effort; GOP size is also configured to 2s.
         }
         finally
         {
@@ -1338,15 +1266,9 @@ public sealed class MfH264Encoder : IVideoEncoder
         }
 
         // Sample refcount == 1 (only our wrapper) and buffer refcount == 2 (our wrapper + sample).
-        int sampleRefs = QueryComRefCount(samplePtr);
-        int bufferRefs = QueryComRefCount(bufferPtr);
+        int sampleRefs = MediaFoundationMftHelper.QueryComRefCount(samplePtr);
+        int bufferRefs = MediaFoundationMftHelper.QueryComRefCount(bufferPtr);
         return sampleRefs == 1 && bufferRefs == 2;
-    }
-
-    private static int QueryComRefCount(nint comPtr)
-    {
-        Marshal.AddRef(comPtr);
-        return Marshal.Release(comPtr);
     }
 
     private void ReleaseReusableSyncInputSampleLocked()
@@ -1874,21 +1796,7 @@ public sealed class MfH264Encoder : IVideoEncoder
         IMFSample? reusableSample,
         nint reusableSamplePtr,
         IMFSample? returnedSample)
-    {
-        if (returnedSample is null || ReferenceEquals(returnedSample, reusableSample))
-        {
-            return;
-        }
-
-        if (reusableSamplePtr != nint.Zero && returnedSample.NativePointer == reusableSamplePtr)
-        {
-            DetachComAliasWithoutRelease(returnedSample);
-        }
-        else
-        {
-            SafeDisposeSample(returnedSample);
-        }
-    }
+        => MediaFoundationMftHelper.CleanupReusableOutputAlias(reusableSample, reusableSamplePtr, returnedSample);
 
     private void HandleOutputStreamChangeLocked()
     {
@@ -2106,91 +2014,13 @@ public sealed class MfH264Encoder : IVideoEncoder
         IMFSample? callerAllocatedSample,
         nint callerSamplePtr,
         IMFSample? returnedSample)
-    {
-        if (returnedSample is not null)
-        {
-            if (callerAllocatedSample is not null)
-            {
-                if (ReferenceEquals(returnedSample, callerAllocatedSample))
-                {
-                    SafeDisposeSample(callerAllocatedSample);
-                }
-                else if (callerSamplePtr != nint.Zero && returnedSample.NativePointer == callerSamplePtr)
-                {
-                    // Vortice OutputDataBuffer.__MarshalFrom wraps the existing native IMFSample* in a second
-                    // managed IMFSample instance without AddRef(). Detach the alias without calling Release()
-                    // and dispose the caller-allocated wrapper once to release the single COM reference and
-                    // suppress finalizers on both managed wrappers.
-                    DetachComAliasWithoutRelease(returnedSample);
-                    SafeDisposeSample(callerAllocatedSample);
-                }
-                else
-                {
-                    // MFT replaced OutputDataBuffer.Sample with a distinct native sample: dispose both.
-                    SafeDisposeSample(returnedSample);
-                    SafeDisposeSample(callerAllocatedSample);
-                }
-            }
-            else
-            {
-                SafeDisposeSample(returnedSample);
-            }
-        }
-        else if (callerAllocatedSample is not null)
-        {
-            SafeDisposeSample(callerAllocatedSample);
-        }
-    }
-
-    private static void DetachComAliasWithoutRelease(ComObject alias)
-    {
-        try
-        {
-            alias.NativePointer = nint.Zero;
-        }
-        catch
-        {
-            // Best-effort pointer detachment.
-        }
-        finally
-        {
-            GC.SuppressFinalize(alias);
-        }
-    }
+        => MediaFoundationMftHelper.DisposeProcessOutputSamples(callerAllocatedSample, callerSamplePtr, returnedSample);
 
     private static void SafeDisposeSample(IMFSample? sample)
-    {
-        if (sample is null)
-        {
-            return;
-        }
-
-        try
-        {
-            sample.Dispose();
-        }
-        catch
-        {
-            // Ignore sample disposal errors during teardown.
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(sample);
 
     private static void SafeDisposeComObject(IDisposable? disposable)
-    {
-        if (disposable is null)
-        {
-            return;
-        }
-
-        try
-        {
-            disposable.Dispose();
-        }
-        catch
-        {
-            // Ignore COM disposal errors on rejected/closing candidates.
-        }
-    }
+        => EngineDisposeHelper.SafeDispose(disposable);
 
     private static void TryShutdownActivate(IMFActivate? activate)
     {
@@ -2210,32 +2040,10 @@ public sealed class MfH264Encoder : IVideoEncoder
     }
 
     private static void DisposeCandidateList(List<IMFActivate> candidates, int excludeIndex)
-    {
-        for (int i = 0; i < candidates.Count; i++)
-        {
-            if (i != excludeIndex)
-            {
-                SafeDisposeComObject(candidates[i]);
-            }
-        }
-    }
+        => MediaFoundationMftHelper.DisposeCandidateList(candidates, excludeIndex);
 
     private static (int InputStreamId, int OutputStreamId) ResolveStreamIds(IMFTransform transform)
-    {
-        int[] inputIds = new int[1];
-        int[] outputIds = new int[1];
-
-        try
-        {
-            transform.GetStreamIDs(1, inputIds, 1, outputIds);
-            return (inputIds[0], outputIds[0]);
-        }
-        catch (SharpGenException)
-        {
-            // E_NOTIMPL is standard for fixed-stream MFTs, meaning stream IDs default to 0.
-            return (0, 0);
-        }
-    }
+        => MediaFoundationMftHelper.ResolveStreamIds(transform);
 
     private static IMFAttributes? TryGetTransformAttributes(IMFTransform transform)
     {
@@ -2284,97 +2092,10 @@ public sealed class MfH264Encoder : IVideoEncoder
     /// when a true H.264 IDR slice (<c>nalUnitType == 5</c>) is present.
     /// </summary>
     internal static bool ContainsAnnexBKeyframeNal(ReadOnlySpan<byte> data)
-    {
-        int i = 0;
-        while (i + 3 < data.Length)
-        {
-            int startCodeLength = 0;
-            if (data[i] == 0 && data[i + 1] == 0)
-            {
-                if (data[i + 2] == 1)
-                {
-                    startCodeLength = 3;
-                }
-                else if (i + 4 < data.Length && data[i + 2] == 0 && data[i + 3] == 1)
-                {
-                    startCodeLength = 4;
-                }
-            }
-
-            if (startCodeLength > 0)
-            {
-                int nalOffset = i + startCodeLength;
-                if (nalOffset < data.Length)
-                {
-                    int nalType = data[nalOffset] & 0x1F;
-                    if (nalType == 5) // True H.264 IDR slice (never treat standalone SPS/PPS as a keyframe)
-                    {
-                        return true;
-                    }
-                }
-
-                i = nalOffset + 1;
-            }
-            else
-            {
-                i++;
-            }
-        }
-
-        return false;
-    }
+        => AnnexBHelper.ContainsKeyframeNal(data);
 
     internal static byte[]? TryExtractAnnexBSpsPps(ReadOnlySpan<byte> data)
-    {
-        using var stream = new MemoryStream();
-        int pos = FindNextStartCode(data, 0, out int startCodeLen);
-        bool hasSps = false;
-        bool hasPps = false;
-
-        while (pos >= 0 && pos + startCodeLen < data.Length)
-        {
-            int nalStart = pos + startCodeLen;
-            int nextPos = FindNextStartCode(data, nalStart, out int nextStartCodeLen);
-            int nalEnd = nextPos >= 0 ? nextPos : data.Length;
-
-            int nalType = data[nalStart] & 0x1F;
-            if (nalType is 7 or 8) // SPS (7) or PPS (8)
-            {
-                if (nalType == 7) hasSps = true;
-                else hasPps = true;
-                stream.Write(data.Slice(pos, nalEnd - pos));
-            }
-
-            pos = nextPos;
-            startCodeLen = nextStartCodeLen;
-        }
-
-        return (hasSps && hasPps && stream.Length > 0) ? stream.ToArray() : null;
-    }
-
-    private static int FindNextStartCode(ReadOnlySpan<byte> data, int startIndex, out int startCodeLength)
-    {
-        for (int i = startIndex; i + 2 < data.Length; i++)
-        {
-            if (data[i] == 0 && data[i + 1] == 0)
-            {
-                if (data[i + 2] == 1)
-                {
-                    startCodeLength = 3;
-                    return i;
-                }
-
-                if (i + 3 < data.Length && data[i + 2] == 0 && data[i + 3] == 1)
-                {
-                    startCodeLength = 4;
-                    return i;
-                }
-            }
-        }
-
-        startCodeLength = 0;
-        return -1;
-    }
+        => AnnexBHelper.TryExtractSpsPps(data);
 
     public void Dispose()
     {

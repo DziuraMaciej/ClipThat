@@ -135,6 +135,7 @@ public sealed class MediaRingBufferTests
     {
         var buffer = new MediaRingBuffer(bufferDurationMinutes: 1);
         using var startGate = new ManualResetEventSlim(false);
+        using var writersActive = new CountdownEvent(4);
         Exception? workerException = null;
 
         Task[] writers = Enumerable.Range(0, 4).Select(workerId => Task.Run(() =>
@@ -142,8 +143,13 @@ public sealed class MediaRingBufferTests
             startGate.Wait();
             try
             {
-                for (int i = 0; i < 400; i++)
+                for (int i = 0; i < 600; i++)
                 {
+                    if (i == 1)
+                    {
+                        writersActive.Signal();
+                    }
+
                     buffer.AddPacket(CreateVideoPacket(i, isKeyframe: i % 10 == 0, size: 64));
                     buffer.AddPacket(CreateAudioPacket(i, MediaTrackType.SystemAudio, size: 32));
                 }
@@ -155,7 +161,7 @@ public sealed class MediaRingBufferTests
         })).ToArray();
 
         startGate.Set();
-        await Task.Delay(5);
+        Assert.True(writersActive.Wait(TimeSpan.FromSeconds(5)));
         buffer.Dispose();
 
         await Task.WhenAll(writers);
@@ -240,5 +246,12 @@ public sealed class MediaRingBufferTests
         byte[] rented2 = ArrayPool<byte>.Shared.Rent(64);
         Assert.Throws<ArgumentOutOfRangeException>(() =>
             buffer.AddAudioPacket(MediaTrackType.SystemAudio, rented2, rented2.Length + 10, 0, 213_333));
+
+        byte[] rented3 = ArrayPool<byte>.Shared.Rent(64);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            buffer.AddAudioPacket(MediaTrackType.SystemAudio, rented3, -1, 0, 213_333));
+
+        Assert.Equal(0, buffer.PacketCount);
+        Assert.Equal(0, buffer.BufferedBytes);
     }
 }

@@ -1,4 +1,5 @@
 using System.IO;
+using ClipThat.Services;
 
 namespace ClipThat.Models;
 
@@ -31,7 +32,7 @@ public sealed class AppSettings
 
     public string? MicrophoneDeviceId { get; set; }
 
-    public bool StartWithWindows { get; set; } = false;
+    public bool StartWithWindows { get; set; }
 
     public bool StartRecordingOnLaunch { get; set; } = true;
 
@@ -86,9 +87,9 @@ public sealed class AppSettings
         {
             MicrophoneDeviceId = null;
         }
-        else if (string.Equals(MicrophoneDeviceId.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        else if (string.Equals(MicrophoneDeviceId.Trim(), AudioDeviceService.DisabledDeviceId, StringComparison.OrdinalIgnoreCase))
         {
-            MicrophoneDeviceId = "none";
+            MicrophoneDeviceId = AudioDeviceService.DisabledDeviceId;
         }
         else
         {
