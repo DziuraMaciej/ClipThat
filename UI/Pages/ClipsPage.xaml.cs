@@ -93,6 +93,8 @@ public partial class ClipsPage : Page
     private bool _isDeletingClip;
     private bool _isDetached;
 
+    public bool IsExporting => _isExporting;
+
     public ClipsPage(
         SettingsService settingsService,
         IReplayEngine replayEngine,

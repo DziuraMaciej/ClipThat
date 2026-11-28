@@ -29,11 +29,12 @@ public sealed class CoreServicesAndModelsTests
         ResourceEstimate withMic = estimator.Estimate(5, ResolutionPreset.P1080, 60, includeMicrophone: true);
         ResourceEstimate noMic = estimator.Estimate(5, ResolutionPreset.P1080, 60, includeMicrophone: false);
 
-        // 1080p60 = 16 Mbps video; 5 min = 300 s; MiB divisor = 8.388608
-        double expectedWithMicDiskMb = ((16.0 + ResourceEstimatorService.AudioBitrateMbps) * 300.0) / 8.388608;
-        double expectedNoMicDiskMb = ((16.0 + ResourceEstimatorService.SingleTrackAudioBitrateMbps) * 300.0) / 8.388608;
+        // 1080p60 = 12.0 Mbps target VBR (16.2 Mbps peak); 5 min = 300 s; MiB divisor = 8.388608
+        double expectedWithMicDiskMb = ((12.0 + ResourceEstimatorService.AudioBitrateMbps) * 300.0) / 8.388608;
+        double expectedNoMicDiskMb = ((12.0 + ResourceEstimatorService.SingleTrackAudioBitrateMbps) * 300.0) / 8.388608;
 
-        Assert.Equal(16.0, withMic.VideoBitrateMbps);
+        Assert.Equal(12.0, withMic.VideoBitrateMbps);
+        Assert.Equal(12.0 * ResourceEstimatorService.PeakBitrateMultiplier, estimator.GetPeakVideoBitrateMbps(ResolutionPreset.P1080, 60), precision: 6);
         Assert.Equal(expectedWithMicDiskMb, withMic.EstimatedDiskSizeMb, precision: 6);
         Assert.Equal(expectedNoMicDiskMb, noMic.EstimatedDiskSizeMb, precision: 6);
         Assert.True(noMic.EstimatedDiskSizeMb < withMic.EstimatedDiskSizeMb);

@@ -33,13 +33,14 @@ public enum EncoderNegotiationTier
 /// continuous async <see cref="IMFMediaEventGenerator"/> draining, atomic input-slot tracking,
 /// explicit initial keyframe forcing, and dual <c>MFSampleExtension_CleanPoint</c> + Annex-B IDR/SPS detection.
 /// </summary>
-public sealed class MfH264Encoder : IDisposable
+public sealed class MfH264Encoder : IVideoEncoder
 {
     private const uint ClsCtxInprocServer = 0x1u;
     private const uint H264ProfileHigh = 100u;
     private const uint H264ProfileMain = 77u;
     private const uint H264ProfileBase = 66u;
     private const uint RateControlModeCbr = 0u;
+    private const uint RateControlModePeakConstrainedVbr = 1u;
     private const uint RateControlModeUnconstrainedVbr = 2u;
     private const int DefaultOutputBufferBytes = 512 * 1024;
     private const int MaxPendingAsyncInputSamples = 3;
@@ -53,6 +54,8 @@ public sealed class MfH264Encoder : IDisposable
     private static readonly Guid CodecApiIid = new("901DB4C7-31CE-41A2-85DC-8FA0BF41B8DA");
     private static readonly Guid CodecApiAvEncCommonRateControlMode = new("1C0608E9-370C-4710-8A58-CB6181C42423");
     private static readonly Guid CodecApiAvEncCommonMeanBitRate = new("F7222374-2144-4815-B550-A37F8E12EE52");
+    private static readonly Guid CodecApiAvEncCommonMaxBitRate = new("9651EAE4-39B9-4EBF-85EF-D7F444EC7465");
+    private static readonly Guid CodecApiAvEncCommonQualityVsSpeed = new("98332DF8-03CD-476B-89FA-3F9E442DEC9F");
     private static readonly Guid CodecApiAvEncMpvGopSize = new("95F31B26-95A4-41AA-9303-246A7FC6EEF1");
     private static readonly Guid CodecApiAvEncMpvDefaultBPictureCount = new("8D390AAC-DC5C-4200-B57F-BE7D96342F2D");
     private static readonly Guid CodecApiAvEncVideoForceKeyFrame = new("398C1B98-8353-475A-9EF2-8F265D260345");
@@ -65,7 +68,7 @@ public sealed class MfH264Encoder : IDisposable
     private readonly object _mftLock = new();
     private readonly object _queueLock = new();
     private readonly Queue<QueuedInputItem> _pendingInputQueue = new(MaxPendingAsyncInputSamples + 1);
-    private readonly nint[] _recentInFlightGpuTextures = new nint[6];
+    private readonly nint[] _recentInFlightGpuTextures = new nint[4];
     private int _recentGpuTextureCursor;
     private readonly AutoResetEvent _inputWorkSignal = new(false);
     private readonly ManualResetEventSlim _drainCompleteEvent = new(false);
@@ -74,6 +77,7 @@ public sealed class MfH264Encoder : IDisposable
     private readonly int _height;
     private readonly int _fps;
     private readonly uint _targetBitrateBps;
+    private readonly uint _peakBitrateBps;
     private readonly long _defaultFrameDuration100Ns;
     private readonly EncoderNegotiationTier _minimumTier;
 
@@ -136,7 +140,9 @@ public sealed class MfH264Encoder : IDisposable
         _defaultFrameDuration100Ns = TimeSpan.TicksPerSecond / _fps;
 
         double bitrateMbps = resourceEstimator.GetVideoBitrateMbps(resolutionPreset, _fps);
+        double peakBitrateMbps = resourceEstimator.GetPeakVideoBitrateMbps(resolutionPreset, _fps);
         _targetBitrateBps = (uint)Math.Clamp((long)Math.Round(bitrateMbps * 1_000_000.0), 250_000L, 100_000_000L);
+        _peakBitrateBps = (uint)Math.Clamp((long)Math.Round(peakBitrateMbps * 1_000_000.0), _targetBitrateBps, 100_000_000L);
 
         try
         {
@@ -885,7 +891,7 @@ public sealed class MfH264Encoder : IDisposable
             (int inputStreamId, int outputStreamId) = ResolveStreamIds(transform);
 
             // Apply CodecAPI rate-control/GOP/low-latency hints prior to SetOutputType (required by QSV/AMF).
-            ConfigureCodecApi(transform);
+            ConfigureCodecApi(transform, isSoftwareFallback: tier == EncoderNegotiationTier.SoftwareFallback);
 
             // Strict Media Foundation H.264 MFT contract: SetOutputType MUST be called BEFORE SetInputType.
             ConfigureOutputMediaType(transform, outputStreamId);
@@ -895,7 +901,7 @@ public sealed class MfH264Encoder : IDisposable
             ConfigureInputMediaType(transform, inputStreamId);
 
             // Re-apply CodecAPI hints after media types are negotiated for MFTs that validate post-SetOutputType.
-            ConfigureCodecApi(transform);
+            ConfigureCodecApi(transform, isSoftwareFallback: tier == EncoderNegotiationTier.SoftwareFallback);
 
             OutputStreamInfo outputStreamInfo = transform.GetOutputStreamInfo(outputStreamId);
             OutputStreamInfoFlags streamFlags = (OutputStreamInfoFlags)outputStreamInfo.Flags;
@@ -996,7 +1002,7 @@ public sealed class MfH264Encoder : IDisposable
                 outputType.Set(MediaTypeAttributeKeys.FrameSize, PackUInt64((uint)_width, (uint)_height)).CheckError();
                 outputType.Set(MediaTypeAttributeKeys.FrameRate, PackUInt64((uint)_fps, 1u)).CheckError();
                 outputType.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUInt64(1u, 1u)).CheckError();
-                outputType.Set(MediaTypeAttributeKeys.MaxKeyframeSpacing, (uint)_fps);
+                outputType.Set(MediaTypeAttributeKeys.MaxKeyframeSpacing, (uint)(_fps * 2));
 
                 if (colorPass == 0)
                 {
@@ -1127,7 +1133,7 @@ public sealed class MfH264Encoder : IDisposable
         throw lastError ?? new InvalidOperationException("Koder H.264 nie zaakceptował wejściowego formatu NV12.");
     }
 
-    private void ConfigureCodecApi(IMFTransform transform)
+    private void ConfigureCodecApi(IMFTransform transform, bool isSoftwareFallback)
     {
         if (transform is null || transform.NativePointer == nint.Zero)
         {
@@ -1150,20 +1156,30 @@ public sealed class MfH264Encoder : IDisposable
                 return;
             }
 
-            // Enable low-latency mode if supported so AMD AMF / NVENC / QSV emit the initial IDR keyframe
+            // Enable low-latency mode if supported so NVENC / QSV / AMF emit the initial IDR keyframe
             // without multi-frame lookahead buffering.
             TrySetCodecApiBool(codecApi, CodecApiAvLowLatencyMode, true);
 
-            // Prefer CBR for deterministic RAM ring-buffer sizing; fall back to Unconstrained VBR if unsupported.
-            if (!TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonRateControlMode, RateControlModeCbr))
+            // Prefer Peak-Constrained VBR so calm desktop/menu scenes consume a fraction of RAM while
+            // fast gameplay scenes burst cleanly up to PeakBitrate; fall back to Unconstrained VBR, then CBR.
+            if (!TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonRateControlMode, RateControlModePeakConstrainedVbr) &&
+                !TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonRateControlMode, RateControlModeUnconstrainedVbr))
             {
-                TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonRateControlMode, RateControlModeUnconstrainedVbr);
+                TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonRateControlMode, RateControlModeCbr);
             }
 
             TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonMeanBitRate, _targetBitrateBps);
-            // 1 keyframe per second (GOP size == FPS).
-            TrySetCodecApiUInt32(codecApi, CodecApiAvEncMpvGopSize, (uint)_fps);
+            TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonMaxBitRate, _peakBitrateBps);
+
+            // 2-second GOP (2 * FPS): better quality per megabyte and fewer heavy IDR frames than 1s GOP.
+            TrySetCodecApiUInt32(codecApi, CodecApiAvEncMpvGopSize, (uint)(_fps * 2));
             TrySetCodecApiUInt32(codecApi, CodecApiAvEncMpvDefaultBPictureCount, 0u);
+
+            if (isSoftwareFallback)
+            {
+                // Favor faster real-time encoding on CPU fallback to keep background CPU impact low.
+                TrySetCodecApiUInt32(codecApi, CodecApiAvEncCommonQualityVsSpeed, 33u);
+            }
         }
         catch (Exception ex)
         {

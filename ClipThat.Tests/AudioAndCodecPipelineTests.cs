@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using ClipThat.Engine.Audio;
 using ClipThat.Engine.Encoding;
 using ClipThat.Engine.Muxing;
@@ -117,6 +118,35 @@ public sealed class AudioAndCodecPipelineTests
         Assert.Null(Mp4ReplayMuxer.TryExtractAnnexBSpsPps(spsOnly));
         Assert.Null(MfH264Encoder.TryExtractAnnexBSpsPps(pSliceOnly));
         Assert.Null(Mp4ReplayMuxer.TryExtractAnnexBSpsPps(pSliceOnly));
+    }
+
+    [Fact]
+    public void AmfH264Encoder_AmfVariantMatchesX64AbiAndAdapterFilterRejectsNonAmd()
+    {
+        Assert.Equal(24, Marshal.SizeOf<AmfH264Encoder.AmfVariant>());
+
+        var boolVar = AmfH264Encoder.AmfVariant.FromBool(true);
+        Assert.Equal(AmfH264Encoder.AmfVariant.TypeBool, boolVar.Type);
+        Assert.Equal((byte)1, boolVar.BoolValue);
+
+        var intVar = AmfH264Encoder.AmfVariant.FromInt64(12_000_000);
+        Assert.Equal(AmfH264Encoder.AmfVariant.TypeInt64, intVar.Type);
+        Assert.Equal(12_000_000, intVar.Int64Value);
+
+        var sizeVar = AmfH264Encoder.AmfVariant.FromSize(1920, 1080);
+        Assert.Equal(AmfH264Encoder.AmfVariant.TypeSize, sizeVar.Type);
+        Assert.Equal(1920, sizeVar.Width);
+        Assert.Equal(1080, sizeVar.Height);
+
+        var rateVar = AmfH264Encoder.AmfVariant.FromRate(60, 1);
+        Assert.Equal(AmfH264Encoder.AmfVariant.TypeRate, rateVar.Type);
+        Assert.Equal(60u, rateVar.Num);
+        Assert.Equal(1u, rateVar.Den);
+
+        Assert.False(AmfH264Encoder.ShouldTryForAdapter(null));
+        Assert.False(AmfH264Encoder.ShouldTryForAdapter(""));
+        Assert.False(AmfH264Encoder.ShouldTryForAdapter("NVIDIA GeForce RTX 4090"));
+        Assert.False(AmfH264Encoder.ShouldTryForAdapter("Intel(R) Arc(TM) A770 Graphics"));
     }
 
     private sealed class StaticFloatSampleProvider : ISampleProvider

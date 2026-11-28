@@ -165,13 +165,16 @@ public partial class MainWindow : FluentWindow
 
     protected override void OnClosing(CancelEventArgs e)
     {
-        if (!_allowClose)
+        if (!_allowClose && _pageProvider.IsExporting)
         {
+            // Keep the window alive while a background clip export is actively reporting progress.
             e.Cancel = true;
             Hide();
             return;
         }
 
+        // Otherwise allow MainWindow to close cleanly when sent to tray so WPF visual trees,
+        // Mica backdrops, and pages release ~60-110 MB RAM while background capture continues.
         base.OnClosing(e);
     }
 
@@ -197,6 +200,8 @@ public partial class MainWindow : FluentWindow
     {
         private SettingsPage? _settingsPage;
         private ClipsPage? _clipsPage;
+
+        public bool IsExporting => _clipsPage?.IsExporting == true;
 
         public object? GetPage(Type pageType)
         {

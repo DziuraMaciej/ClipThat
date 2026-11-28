@@ -16,7 +16,7 @@ namespace ClipThat.Engine.Video;
 /// </summary>
 public sealed class GpuVideoProcessor : IDisposable
 {
-    private const int OutputSurfacePoolSize = 16;
+    private const int OutputSurfacePoolSize = 8;
 
     private readonly ID3D11Device _device;
     private readonly ID3D11DeviceContext _immediateContext;

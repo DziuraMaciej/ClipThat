@@ -75,7 +75,7 @@ public sealed class ReplayEngine : IReplayEngine
         string? statusMessage = null;
         string? startupError = null;
         CapturePipelineSession? startedSession = null;
-        MfH264Encoder? startedEncoder = null;
+        IVideoEncoder? startedEncoder = null;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -99,7 +99,7 @@ public sealed class ReplayEngine : IReplayEngine
             _activeSession = StartCapturePipelineLocked(normalized, EncoderNegotiationTier.HardwareGpuZeroCopy, preferDxgiDuplication: true);
             _isRecording = true;
 
-            MfH264Encoder activeEncoder = _activeSession.Encoder
+            IVideoEncoder activeEncoder = _activeSession.Encoder
                 ?? throw new InvalidOperationException("Koder wideo nie został zainicjalizowany.");
 
             statusMessage = BuildActiveStatusMessage(
@@ -193,7 +193,7 @@ public sealed class ReplayEngine : IReplayEngine
         string? statusMessage = null;
         string? updateError = null;
         CapturePipelineSession? restartedSession = null;
-        MfH264Encoder? restartedEncoder = null;
+        IVideoEncoder? restartedEncoder = null;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -243,7 +243,7 @@ public sealed class ReplayEngine : IReplayEngine
                 restartedEncoder = _activeSession.Encoder;
             }
 
-            MfH264Encoder? currentEncoder = _activeSession.Encoder;
+            IVideoEncoder? currentEncoder = _activeSession.Encoder;
             if (currentEncoder is not null)
             {
                 statusMessage = BuildActiveStatusMessage(
@@ -323,7 +323,7 @@ public sealed class ReplayEngine : IReplayEngine
 
             if (isRecordingSnapshot && !string.IsNullOrWhiteSpace(outputDirectory))
             {
-                MfH264Encoder? activeEncoder = _activeSession?.Encoder;
+                IVideoEncoder? activeEncoder = _activeSession?.Encoder;
                 if (activeEncoder is not null)
                 {
                     targetWidth = activeEncoder.OutputWidth;
@@ -414,7 +414,7 @@ public sealed class ReplayEngine : IReplayEngine
     {
         IFrameCaptureSource? captureSource = null;
         GpuVideoProcessor? gpuProcessor = null;
-        MfH264Encoder? encoder = null;
+        IVideoEncoder? encoder = null;
         DualAudioCaptureService? audioCapture = null;
 
         try
@@ -539,12 +539,37 @@ public sealed class ReplayEngine : IReplayEngine
         }
     }
 
-    private MfH264Encoder CreateEncoder(
+    private IVideoEncoder CreateEncoder(
         GpuVideoProcessor gpuProcessor,
         AppSettings settings,
         EncoderNegotiationTier minimumTier,
         Action<Exception> onEncoderError)
     {
+        // On AMD GPUs, prefer direct AMD AMF runtime (amfrt64.dll) zero-copy D3D11 encoding over
+        // Media Foundation's AMDh264Encoder MFT, which stalls on newer Adrenalin/RDNA4 drivers.
+        if (minimumTier == EncoderNegotiationTier.HardwareGpuZeroCopy &&
+            gpuProcessor.SupportsHardwareVideoProcessor &&
+            AmfH264Encoder.ShouldTryForAdapter(gpuProcessor.AdapterName))
+        {
+            try
+            {
+                return new AmfH264Encoder(
+                    gpuProcessor,
+                    settings.Resolution,
+                    settings.Fps,
+                    _resourceEstimatorService,
+                    onPacketEncoded: _ringBuffer.AddPacket,
+                    onSequenceHeader: header => _ringBuffer.SetVideoSequenceHeader(header.Span),
+                    onEncoderError: onEncoderError);
+            }
+            catch (Exception ex)
+            {
+                EngineLogger.Warn(
+                    "ReplayEngine",
+                    $"Native AMD AMF encoder failed to start ({ex.Message}); falling back to Media Foundation MFT.");
+            }
+        }
+
         return new MfH264Encoder(
             gpuProcessor,
             settings.Resolution,
@@ -563,7 +588,7 @@ public sealed class ReplayEngine : IReplayEngine
     /// </summary>
     private void ArmKeyframeWatchdog(
         CapturePipelineSession session,
-        MfH264Encoder monitoredEncoder,
+        IVideoEncoder monitoredEncoder,
         int idleDeferralsRemaining = MaxIdleWatchdogDeferrals)
     {
         _ = Task.Run(async () =>
@@ -582,7 +607,7 @@ public sealed class ReplayEngine : IReplayEngine
 
     private async Task CheckKeyframeWatchdogAsync(
         CapturePipelineSession session,
-        MfH264Encoder monitoredEncoder,
+        IVideoEncoder monitoredEncoder,
         int idleDeferralsRemaining)
     {
         if (Volatile.Read(ref _disposed) != 0 || monitoredEncoder.HasEmittedKeyframe)
@@ -592,7 +617,7 @@ public sealed class ReplayEngine : IReplayEngine
 
         string? updatedStatus = null;
         string? fatalError = null;
-        MfH264Encoder? nextEncoderToMonitor = null;
+        IVideoEncoder? nextEncoderToMonitor = null;
         bool deferWatchdog = false;
 
         await _gate.WaitAsync().ConfigureAwait(false);
@@ -665,7 +690,7 @@ public sealed class ReplayEngine : IReplayEngine
                 _ringBuffer.Clear();
 
                 Action<Exception> sessionEncoderError = ex => OnActivePipelineFault(session, ex, isEncoderFault: true);
-                MfH264Encoder replacement;
+                IVideoEncoder replacement;
                 try
                 {
                     replacement = session.ReplaceEncoder(
@@ -761,7 +786,7 @@ public sealed class ReplayEngine : IReplayEngine
         bool preferDxgi = faultedSession.Capture is DxgiFrameCapture;
         if (isEncoderFault)
         {
-            MfH264Encoder? currentEncoder = faultedSession.Encoder;
+            IVideoEncoder? currentEncoder = faultedSession.Encoder;
             if (currentEncoder is not null)
             {
                 recoveryTier = GetNextDowngradeTier(currentEncoder.ActiveTier) ?? EncoderNegotiationTier.SoftwareFallback;
@@ -809,7 +834,7 @@ public sealed class ReplayEngine : IReplayEngine
         string? finalStatus = null;
         string? fatalError = null;
         CapturePipelineSession? recoveredSession = null;
-        MfH264Encoder? recoveredEncoder = null;
+        IVideoEncoder? recoveredEncoder = null;
         long expectedGeneration = 0;
 
         await _gate.WaitAsync().ConfigureAwait(false);
@@ -960,7 +985,7 @@ public sealed class ReplayEngine : IReplayEngine
     private static string BuildActiveStatusMessage(
         AppSettings settings,
         IFrameCaptureSource capture,
-        MfH264Encoder encoder,
+        IVideoEncoder encoder,
         DualAudioCaptureService? audioCapture)
     {
         string mode = encoder.IsHardwareAccelerated ? "GPU" : "CPU";
@@ -1016,7 +1041,7 @@ public sealed class ReplayEngine : IReplayEngine
         private readonly object _encodeQueueLock = new();
         private readonly AutoResetEvent _encodeWorkSignal = new(initialState: false);
 
-        private MfH264Encoder? _encoder;
+        private IVideoEncoder? _encoder;
         private Func<ID3D11Texture2D, bool>? _encoderTextureBusyCheck;
         private Thread? _encodeWorkerThread;
         private PendingVideoFrame? _pendingEncodeFrame;
@@ -1034,7 +1059,7 @@ public sealed class ReplayEngine : IReplayEngine
             Stopwatch sessionClock,
             IFrameCaptureSource capture,
             GpuVideoProcessor gpuProcessor,
-            MfH264Encoder encoder,
+            IVideoEncoder encoder,
             DualAudioCaptureService? audioCapture,
             Action<Exception> onEncodeError)
         {
@@ -1054,7 +1079,7 @@ public sealed class ReplayEngine : IReplayEngine
 
         public GpuVideoProcessor GpuProcessor => _gpuProcessor;
 
-        public MfH264Encoder? Encoder => Volatile.Read(ref _encoder);
+        public IVideoEncoder? Encoder => Volatile.Read(ref _encoder);
 
         public DualAudioCaptureService? AudioCapture => _audioCapture;
 
@@ -1163,7 +1188,7 @@ public sealed class ReplayEngine : IReplayEngine
                     return;
                 }
 
-                MfH264Encoder? encoder = _encoder;
+                IVideoEncoder? encoder = _encoder;
                 if (encoder is null)
                 {
                     return;
@@ -1218,7 +1243,7 @@ public sealed class ReplayEngine : IReplayEngine
                             break;
                         }
 
-                        MfH264Encoder? encoder = _encoder;
+                        IVideoEncoder? encoder = _encoder;
                         encoder?.EncodeFrame(frame.Texture, frame.Timestamp100Ns, frame.Duration100Ns);
                     }
                 }
@@ -1268,7 +1293,7 @@ public sealed class ReplayEngine : IReplayEngine
         /// Disposes the currently active encoder and swaps in a lower-tier encoder without interrupting
         /// capture or WASAPI audio streams.
         /// </summary>
-        public MfH264Encoder ReplaceEncoder(Func<MfH264Encoder> encoderFactory)
+        public IVideoEncoder ReplaceEncoder(Func<IVideoEncoder> encoderFactory)
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
@@ -1279,7 +1304,7 @@ public sealed class ReplayEngine : IReplayEngine
                 _pendingEncodeFrame = null;
             }
 
-            MfH264Encoder? oldEncoder;
+            IVideoEncoder? oldEncoder;
             lock (_frameSubmitLock)
             {
                 oldEncoder = _encoder;
@@ -1289,7 +1314,7 @@ public sealed class ReplayEngine : IReplayEngine
 
             SafeDispose(oldEncoder);
 
-            MfH264Encoder replacement = encoderFactory();
+            IVideoEncoder replacement = encoderFactory();
             lock (_frameSubmitLock)
             {
                 if (Volatile.Read(ref _disposed) != 0)
@@ -1373,7 +1398,7 @@ public sealed class ReplayEngine : IReplayEngine
             bool shouldStopTimer = false;
             try
             {
-                MfH264Encoder? encoder = _encoder;
+                IVideoEncoder? encoder = _encoder;
                 if (Volatile.Read(ref _disposed) != 0 || encoder is null || encoder.HasEmittedKeyframe)
                 {
                     shouldStopTimer = true;
@@ -1477,7 +1502,7 @@ public sealed class ReplayEngine : IReplayEngine
 
             try
             {
-                MfH264Encoder? encoder = _encoder;
+                IVideoEncoder? encoder = _encoder;
                 if (Volatile.Read(ref _disposed) != 0 || encoder is null || !encoder.HasEmittedKeyframe)
                 {
                     return;
@@ -1627,7 +1652,7 @@ public sealed class ReplayEngine : IReplayEngine
                 return;
             }
 
-            MfH264Encoder? activeEncoder;
+            IVideoEncoder? activeEncoder;
             lock (_frameSubmitLock)
             {
                 activeEncoder = _encoder;

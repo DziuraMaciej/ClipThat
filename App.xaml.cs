@@ -486,6 +486,19 @@ public partial class App : Application
             _mainWindow.Closed -= OnMainWindowClosed;
             _mainWindow = null;
         }
+
+        if (!IsShuttingDown)
+        {
+            // Gently reclaim WPF UI memory after closing to tray without stalling active background capture.
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(1500).ConfigureAwait(false);
+                if (!IsShuttingDown && Volatile.Read(ref _mainWindow) is null)
+                {
+                    GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
+                }
+            });
+        }
     }
 
     private async Task SaveReplayFromTrayAsync()
