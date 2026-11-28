@@ -16,7 +16,7 @@ namespace ClipThat.Engine.Video;
 /// </summary>
 public sealed class GpuVideoProcessor : IDisposable
 {
-    private const int OutputSurfacePoolSize = 8;
+    private const int OutputSurfacePoolSize = 16;
 
     private readonly ID3D11Device _device;
     private readonly ID3D11DeviceContext _immediateContext;
@@ -30,8 +30,16 @@ public sealed class GpuVideoProcessor : IDisposable
     private ID3D11VideoProcessor? _videoProcessor;
     private ID3D11VideoProcessorOutputView?[] _nv12OutputViews;
     private ID3D11Texture2D? _fallbackBgraInputTexture;
+    private ID3D11VideoProcessorInputView? _cachedFallbackInputView;
+    private bool _preferFallbackBgraInput;
     private ID3D11Texture2D? _cpuStagingNv12Texture;
     private ID3D11Texture2D? _cpuStagingBgraTexture;
+    private int[]? _cpuSrcXMap;
+    private int[]? _cpuSrcYMap;
+    private int[]? _cpuUvSrcXMap;
+    private int[]? _cpuUvSrcYMap;
+    private int _cpuMapSrcWidth;
+    private int _cpuMapSrcHeight;
 
     private uint _configuredInputWidth;
     private uint _configuredInputHeight;
@@ -46,12 +54,14 @@ public sealed class GpuVideoProcessor : IDisposable
         int targetFps,
         string? adapterName = null,
         Luid adapterLuid = default,
-        bool ownsDevice = false)
+        bool ownsDevice = false,
+        int sourceWidth = 0,
+        int sourceHeight = 0)
     {
         ArgumentNullException.ThrowIfNull(device);
         ArgumentNullException.ThrowIfNull(immediateContext);
 
-        (int rawWidth, int rawHeight) = GetTargetDimensions(resolutionPreset);
+        (int rawWidth, int rawHeight) = GetTargetDimensions(resolutionPreset, sourceWidth, sourceHeight);
         OutputWidth = Math.Max(2, rawWidth & ~1);
         OutputHeight = Math.Max(2, rawHeight & ~1);
         TargetFps = targetFps == 30 ? 30 : 60;
@@ -151,21 +161,70 @@ public sealed class GpuVideoProcessor : IDisposable
     public int TargetFps { get; }
 
     /// <summary>
-    /// Maps each supported <see cref="ResolutionPreset"/> to guaranteed even NV12/H.264 target dimensions.
+    /// Maps each supported <see cref="ResolutionPreset"/> to guaranteed even NV12/H.264 target dimensions
+    /// using the default 16:9 aspect ratio.
     /// </summary>
     public static (int Width, int Height) GetTargetDimensions(ResolutionPreset preset)
+        => GetTargetDimensions(preset, sourceWidth: 16, sourceHeight: 9);
+
+    /// <summary>
+    /// Maps <paramref name="preset"/> to guaranteed even NV12/H.264 target dimensions while preserving
+    /// the capture monitor's native aspect ratio (including 21:9 ultrawide, 16:10, 4:3, and portrait displays)
+    /// within H.264 encoder limits (4096×2304).
+    /// </summary>
+    public static (int Width, int Height) GetTargetDimensions(ResolutionPreset preset, int sourceWidth, int sourceHeight)
     {
-        (int w, int h) = preset switch
+        const int maxEncoderWidth = 4096;
+        const int maxEncoderHeight = 2304;
+
+        int presetShortEdge = preset switch
         {
-            ResolutionPreset.P240 => (426, 240),
-            ResolutionPreset.P360 => (640, 360),
-            ResolutionPreset.P480 => (854, 480),
-            ResolutionPreset.P720 => (1280, 720),
-            ResolutionPreset.P1080 => (1920, 1080),
-            _ => (1920, 1080)
+            ResolutionPreset.P240 => 240,
+            ResolutionPreset.P360 => 360,
+            ResolutionPreset.P480 => 480,
+            ResolutionPreset.P720 => 720,
+            ResolutionPreset.P1080 => 1080,
+            _ => 1080
         };
 
-        return (w & ~1, h & ~1);
+        if (sourceWidth <= 0 || sourceHeight <= 0)
+        {
+            sourceWidth = 16;
+            sourceHeight = 9;
+        }
+
+        double width;
+        double height;
+
+        if (sourceWidth >= sourceHeight)
+        {
+            height = presetShortEdge;
+            width = height * ((double)sourceWidth / sourceHeight);
+        }
+        else
+        {
+            // Portrait monitor: anchor width to the preset short edge so 1080p portrait records 1080x1920.
+            width = presetShortEdge;
+            height = width * ((double)sourceHeight / sourceWidth);
+        }
+
+        if (width > maxEncoderWidth)
+        {
+            double scale = maxEncoderWidth / width;
+            width = maxEncoderWidth;
+            height *= scale;
+        }
+
+        if (height > maxEncoderHeight)
+        {
+            double scale = maxEncoderHeight / height;
+            height = maxEncoderHeight;
+            width *= scale;
+        }
+
+        int evenWidth = Math.Clamp((int)(Math.Round(width / 2.0) * 2.0), 2, maxEncoderWidth);
+        int evenHeight = Math.Clamp((int)(Math.Round(height / 2.0) * 2.0), 2, maxEncoderHeight);
+        return (evenWidth, evenHeight);
     }
 
     /// <summary>
@@ -177,7 +236,8 @@ public sealed class GpuVideoProcessor : IDisposable
     public ID3D11Texture2D ProcessFrame(
         ID3D11Texture2D inputBgraTexture,
         ID3D11Texture2D? busyTexture1 = null,
-        ID3D11Texture2D? busyTexture2 = null)
+        ID3D11Texture2D? busyTexture2 = null,
+        Func<ID3D11Texture2D, bool>? isTextureBusy = null)
     {
         ArgumentNullException.ThrowIfNull(inputBgraTexture);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -193,37 +253,59 @@ public sealed class GpuVideoProcessor : IDisposable
             return inputBgraTexture;
         }
 
-        EnsureVideoProcessor(inputDesc.Width, inputDesc.Height);
+        try
+        {
+            EnsureVideoProcessor(inputDesc.Width, inputDesc.Height);
+        }
+        catch (Exception ex)
+        {
+            EngineLogger.Warn(
+                "GpuVideoProcessor",
+                $"Runtime ID3D11VideoProcessor initialization failed ({inputDesc.Width}x{inputDesc.Height} -> {OutputWidth}x{OutputHeight}): {ex.Message}; falling back to CPU BGRA->NV12 conversion.",
+                ex);
+            ReleaseVideoProcessorResources();
+            SupportsHardwareVideoProcessor = false;
+            return inputBgraTexture;
+        }
 
-        int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2);
+        int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2, isTextureBusy);
 
         ID3D11Texture2D outputTexture = _nv12OutputTextures[poolIndex];
         ID3D11VideoProcessorOutputView outputView = _nv12OutputViews[poolIndex]
             ?? throw new InvalidOperationException("Widok wyjściowy procesora wideo (VPOV) nie został zainicjalizowany.");
 
-        using ID3D11VideoProcessorInputView inputView = CreateInputView(inputBgraTexture, inputDesc);
-
-        _streams[0] = new VideoProcessorStream
-        {
-            Enable = true,
-            OutputIndex = 0,
-            InputFrameOrField = 0,
-            PastFrames = 0,
-            FutureFrames = 0,
-            InputSurface = inputView
-        };
-
+        ID3D11VideoProcessorInputView inputView = AcquireInputView(inputBgraTexture, inputDesc, out bool ownsInputView);
         try
         {
-            _videoContext.VideoProcessorBlt(_videoProcessor!, outputView, _outputFrameIndex++, 1, _streams).CheckError();
-            // Flush queued D3D11 video blit commands so async hardware encoders (AMD AMF / NVENC / QSV)
-            // immediately observe the completed NV12 surface on their video encode engine queue.
-            _immediateContext.Flush();
+            _streams[0] = new VideoProcessorStream
+            {
+                Enable = true,
+                OutputIndex = 0,
+                InputFrameOrField = 0,
+                PastFrames = 0,
+                FutureFrames = 0,
+                InputSurface = inputView
+            };
+
+            try
+            {
+                _videoContext.VideoProcessorBlt(_videoProcessor!, outputView, _outputFrameIndex++, 1, _streams).CheckError();
+                // Flush queued D3D11 video blit commands so async hardware encoders (AMD AMF / NVENC / QSV)
+                // immediately observe the completed NV12 surface on their video encode engine queue.
+                _immediateContext.Flush();
+            }
+            finally
+            {
+                // Clear the COM reference from the reusable stream struct before inputView is disposed.
+                _streams[0].InputSurface = null;
+            }
         }
         finally
         {
-            // Clear the COM reference from the reusable stream struct before inputView is disposed.
-            _streams[0].InputSurface = null;
+            if (ownsInputView)
+            {
+                inputView.Dispose();
+            }
         }
 
         return outputTexture;
@@ -322,8 +404,9 @@ public sealed class GpuVideoProcessor : IDisposable
     {
         ID3D11Texture2D staging = EnsureCpuStagingBgraTexture(srcDesc.Width, srcDesc.Height, srcDesc.Format);
         _immediateContext.CopyResource(staging, bgraTexture);
+        _immediateContext.Flush();
 
-        MappedSubresource mapped = _immediateContext.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+        MappedSubresource mapped = MapStagingReadNonStalling(staging);
         try
         {
             int srcW = (int)srcDesc.Width;
@@ -331,6 +414,12 @@ public sealed class GpuVideoProcessor : IDisposable
             int dstW = OutputWidth;
             int dstH = OutputHeight;
             int requiredBytes = dstW * dstH * 3 / 2;
+
+            EnsureCpuScaleMaps(srcW, srcH, dstW, dstH);
+            int[] srcXMap = _cpuSrcXMap!;
+            int[] srcYMap = _cpuSrcYMap!;
+            int[] uvSrcXMap = _cpuUvSrcXMap!;
+            int[] uvSrcYMap = _cpuUvSrcYMap!;
 
             destinationBuffer.Lock(out nint dstPtr, out int maxLength, out _);
             try
@@ -341,22 +430,23 @@ public sealed class GpuVideoProcessor : IDisposable
                         $"Bufor wyjściowy NV12 ({maxLength} B) jest mniejszy niż wymagane {requiredBytes} B.");
                 }
 
-                byte* srcBase = (byte*)mapped.DataPointer;
+                nint srcBasePtr = mapped.DataPointer;
                 int srcPitch = (int)mapped.RowPitch;
-                byte* yPlane = (byte*)dstPtr;
-                byte* uvPlane = yPlane + (dstW * dstH);
+                nint yPlanePtr = dstPtr;
+                nint uvPlanePtr = dstPtr + (dstW * dstH);
+                int uvH = dstH / 2;
+                int uvW = dstW / 2;
 
-                // Fixed-point BT.709 studio-range (16..235 / 16..240) BGRA -> NV12 conversion with nearest scaling.
-                for (int dy = 0; dy < dstH; dy++)
+                // Fixed-point BT.709 studio-range (16..235 / 16..240) BGRA -> NV12 conversion
+                // using precomputed scale lookup tables (avoiding per-pixel 64-bit divisions) and parallel rows.
+                void ConvertYRow(int dy)
                 {
-                    int sy = (int)((long)dy * srcH / dstH);
-                    byte* srcRow = srcBase + ((long)sy * srcPitch);
-                    byte* yRow = yPlane + ((long)dy * dstW);
+                    byte* srcRow = (byte*)srcBasePtr + ((long)srcYMap[dy] * srcPitch);
+                    byte* yRow = (byte*)yPlanePtr + ((long)dy * dstW);
 
                     for (int dx = 0; dx < dstW; dx++)
                     {
-                        int sx = (int)((long)dx * srcW / dstW);
-                        byte* px = srcRow + (sx * 4);
+                        byte* px = srcRow + srcXMap[dx];
                         int b = px[0];
                         int g = px[1];
                         int r = px[2];
@@ -364,26 +454,34 @@ public sealed class GpuVideoProcessor : IDisposable
                     }
                 }
 
-                int uvH = dstH / 2;
-                int uvW = dstW / 2;
-                for (int uy = 0; uy < uvH; uy++)
+                void ConvertUvRow(int uy)
                 {
-                    int sy = (int)((long)(uy * 2) * srcH / dstH);
-                    byte* srcRow = srcBase + ((long)sy * srcPitch);
-                    byte* uvRow = uvPlane + ((long)uy * dstW);
+                    byte* srcRow = (byte*)srcBasePtr + ((long)uvSrcYMap[uy] * srcPitch);
+                    byte* uvRow = (byte*)uvPlanePtr + ((long)uy * dstW);
 
                     for (int ux = 0; ux < uvW; ux++)
                     {
-                        int sx = (int)((long)(ux * 2) * srcW / dstW);
-                        byte* px = srcRow + (sx * 4);
+                        byte* px = srcRow + uvSrcXMap[ux];
                         int b = px[0];
                         int g = px[1];
                         int r = px[2];
-                        int u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+                        // Zero-sum BT.709 chroma coefficients (-26 - 86 + 112 == 0; 112 - 102 - 10 == 0).
+                        int u = ((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128;
                         int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
                         uvRow[ux * 2] = (byte)Math.Clamp(u, 16, 240);
                         uvRow[ux * 2 + 1] = (byte)Math.Clamp(v, 16, 240);
                     }
+                }
+
+                if (dstH >= 360)
+                {
+                    Parallel.For(0, dstH, ConvertYRow);
+                    Parallel.For(0, uvH, ConvertUvRow);
+                }
+                else
+                {
+                    for (int dy = 0; dy < dstH; dy++) ConvertYRow(dy);
+                    for (int uy = 0; uy < uvH; uy++) ConvertUvRow(uy);
                 }
             }
             finally
@@ -397,6 +495,49 @@ public sealed class GpuVideoProcessor : IDisposable
         {
             _immediateContext.Unmap(staging, 0);
         }
+    }
+
+    private void EnsureCpuScaleMaps(int srcW, int srcH, int dstW, int dstH)
+    {
+        if (_cpuSrcXMap is not null &&
+            _cpuMapSrcWidth == srcW &&
+            _cpuMapSrcHeight == srcH)
+        {
+            return;
+        }
+
+        int[] srcX = new int[dstW];
+        for (int dx = 0; dx < dstW; dx++)
+        {
+            srcX[dx] = (int)((long)dx * srcW / dstW) * 4;
+        }
+
+        int[] srcY = new int[dstH];
+        for (int dy = 0; dy < dstH; dy++)
+        {
+            srcY[dy] = (int)((long)dy * srcH / dstH);
+        }
+
+        int uvW = dstW / 2;
+        int uvH = dstH / 2;
+        int[] uvX = new int[uvW];
+        for (int ux = 0; ux < uvW; ux++)
+        {
+            uvX[ux] = (int)((long)(ux * 2) * srcW / dstW) * 4;
+        }
+
+        int[] uvY = new int[uvH];
+        for (int uy = 0; uy < uvH; uy++)
+        {
+            uvY[uy] = (int)((long)(uy * 2) * srcH / dstH);
+        }
+
+        _cpuSrcXMap = srcX;
+        _cpuSrcYMap = srcY;
+        _cpuUvSrcXMap = uvX;
+        _cpuUvSrcYMap = uvY;
+        _cpuMapSrcWidth = srcW;
+        _cpuMapSrcHeight = srcH;
     }
 
     private ID3D11Texture2D EnsureCpuStagingBgraTexture(uint width, uint height, Format format)
@@ -431,7 +572,10 @@ public sealed class GpuVideoProcessor : IDisposable
         return _cpuStagingBgraTexture;
     }
 
-    private int SelectAvailablePoolIndex(ID3D11Texture2D? busyTexture1, ID3D11Texture2D? busyTexture2)
+    private int SelectAvailablePoolIndex(
+        ID3D11Texture2D? busyTexture1,
+        ID3D11Texture2D? busyTexture2,
+        Func<ID3D11Texture2D, bool>? isTextureBusy)
     {
         for (int attempt = 0; attempt < OutputSurfacePoolSize; attempt++)
         {
@@ -439,7 +583,9 @@ public sealed class GpuVideoProcessor : IDisposable
             _nextPoolIndex = (_nextPoolIndex + 1) % OutputSurfacePoolSize;
 
             ID3D11Texture2D candidate = _nv12OutputTextures[candidateIndex];
-            if (!ReferenceEquals(candidate, busyTexture1) && !ReferenceEquals(candidate, busyTexture2))
+            if (!ReferenceEquals(candidate, busyTexture1) &&
+                !ReferenceEquals(candidate, busyTexture2) &&
+                (isTextureBusy is null || !isTextureBusy(candidate)))
             {
                 return candidateIndex;
             }
@@ -482,7 +628,10 @@ public sealed class GpuVideoProcessor : IDisposable
         return _immediateContext.Map(stagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
     }
 
-    private ID3D11VideoProcessorInputView CreateInputView(ID3D11Texture2D inputTexture, Texture2DDescription inputDesc)
+    private ID3D11VideoProcessorInputView AcquireInputView(
+        ID3D11Texture2D inputTexture,
+        Texture2DDescription inputDesc,
+        out bool ownsInputView)
     {
         var inputViewDesc = new VideoProcessorInputViewDescription
         {
@@ -495,18 +644,27 @@ public sealed class GpuVideoProcessor : IDisposable
             }
         };
 
-        try
+        if (!_preferFallbackBgraInput)
         {
-            return _videoDevice!.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
+            try
+            {
+                ownsInputView = true;
+                return _videoDevice!.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
+            }
+            catch (SharpGenException)
+            {
+                // Remember that this GPU driver rejects direct VPIV on shared capture textures so
+                // we do not throw and catch 60 SharpGenExceptions per second on subsequent frames.
+                _preferFallbackBgraInput = true;
+            }
         }
-        catch (SharpGenException)
-        {
-            // Some GPU drivers disallow creating a VideoProcessorInputView directly on a WGC shared texture.
-            // Fall back to a GPU-only copy into a cached D3D11 texture on the same adapter (still zero CPU copy).
-            ID3D11Texture2D gpuCopy = EnsureFallbackBgraTexture(inputDesc.Width, inputDesc.Height, inputDesc.Format);
-            _immediateContext.CopyResource(gpuCopy, inputTexture);
-            return _videoDevice!.CreateVideoProcessorInputView(gpuCopy, _enumerator!, inputViewDesc);
-        }
+
+        ID3D11Texture2D gpuCopy = EnsureFallbackBgraTexture(inputDesc.Width, inputDesc.Height, inputDesc.Format);
+        _immediateContext.CopyResource(gpuCopy, inputTexture);
+
+        _cachedFallbackInputView ??= _videoDevice!.CreateVideoProcessorInputView(gpuCopy, _enumerator!, inputViewDesc);
+        ownsInputView = false;
+        return _cachedFallbackInputView;
     }
 
     private ID3D11Texture2D EnsureFallbackBgraTexture(uint width, uint height, Format format)
@@ -520,6 +678,8 @@ public sealed class GpuVideoProcessor : IDisposable
                 return _fallbackBgraInputTexture;
             }
 
+            _cachedFallbackInputView?.Dispose();
+            _cachedFallbackInputView = null;
             _fallbackBgraInputTexture.Dispose();
             _fallbackBgraInputTexture = null;
         }
@@ -627,6 +787,9 @@ public sealed class GpuVideoProcessor : IDisposable
 
     private void ReleaseVideoProcessorResources()
     {
+        _cachedFallbackInputView?.Dispose();
+        _cachedFallbackInputView = null;
+
         if (_nv12OutputViews is not null)
         {
             for (int i = 0; i < _nv12OutputViews.Length; i++)

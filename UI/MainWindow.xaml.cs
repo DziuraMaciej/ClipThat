@@ -62,6 +62,13 @@ public partial class MainWindow : FluentWindow
         Loaded += MainWindow_Loaded;
         Activated += MainWindow_Activated;
         Deactivated += MainWindow_Deactivated;
+        IsVisibleChanged += MainWindow_IsVisibleChanged;
+    }
+
+    private void MainWindow_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        bool isVisible = e.NewValue is true;
+        _pageProvider.NotifyHostWindowVisibilityChanged(isVisible);
     }
 
     private void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -173,6 +180,7 @@ public partial class MainWindow : FluentWindow
         Loaded -= MainWindow_Loaded;
         Activated -= MainWindow_Activated;
         Deactivated -= MainWindow_Deactivated;
+        IsVisibleChanged -= MainWindow_IsVisibleChanged;
         _pageProvider.DetachAll();
         base.OnClosed(e);
     }
@@ -210,6 +218,12 @@ public partial class MainWindow : FluentWindow
             }
 
             return null;
+        }
+
+        public void NotifyHostWindowVisibilityChanged(bool isVisible)
+        {
+            _settingsPage?.OnHostWindowVisibilityChanged(isVisible);
+            _clipsPage?.OnHostWindowVisibilityChanged(isVisible);
         }
 
         public void DetachAll()

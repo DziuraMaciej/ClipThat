@@ -384,11 +384,13 @@ public sealed class MediaRingBuffer : IDisposable
     public const ulong MinimumFreePhysicalMemoryBytes = 1024UL * 1024UL * 1024UL;
     private const long MemoryCheckIntervalMs = 250;
 
-    private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
+    private readonly object _syncLock = new();
     private readonly LinkedList<EncodedPacket> _packets = new();
+    private readonly LinkedList<LinkedListNode<EncodedPacket>> _videoKeyframes = new();
 
     private long _maxDuration100Ns;
     private long _bufferedBytes;
+    private long _latestTimestamp100Ns = long.MinValue;
     private long _lastMemoryCheckTickMs;
     private byte[]? _videoSequenceHeader;
     private byte[]? _combinedMixAudioUserData;
@@ -422,14 +424,9 @@ public sealed class MediaRingBuffer : IDisposable
                 return 0;
             }
 
-            _lock.EnterReadLock();
-            try
+            lock (_syncLock)
             {
-                return _packets.Count;
-            }
-            finally
-            {
-                _lock.ExitReadLock();
+                return Volatile.Read(ref _disposed) != 0 ? 0 : _packets.Count;
             }
         }
     }
@@ -443,20 +440,15 @@ public sealed class MediaRingBuffer : IDisposable
                 return TimeSpan.Zero;
             }
 
-            _lock.EnterReadLock();
-            try
+            lock (_syncLock)
             {
-                if (_packets.First is null || _packets.Last is null)
+                if (Volatile.Read(ref _disposed) != 0 || _packets.First is null || _packets.Last is null)
                 {
                     return TimeSpan.Zero;
                 }
 
-                long span = _packets.Last.Value.Timestamp100Ns - _packets.First.Value.Timestamp100Ns;
+                long span = _latestTimestamp100Ns - _packets.First.Value.Timestamp100Ns;
                 return span > 0 ? TimeSpan.FromTicks(span) : TimeSpan.Zero;
-            }
-            finally
-            {
-                _lock.ExitReadLock();
             }
         }
     }
@@ -472,8 +464,7 @@ public sealed class MediaRingBuffer : IDisposable
         }
 
         byte[] copy = headerBytes.ToArray();
-        _lock.EnterWriteLock();
-        try
+        lock (_syncLock)
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
@@ -481,10 +472,6 @@ public sealed class MediaRingBuffer : IDisposable
             }
 
             _videoSequenceHeader = copy;
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
         }
     }
 
@@ -505,8 +492,7 @@ public sealed class MediaRingBuffer : IDisposable
         }
 
         byte[] copy = userData.ToArray();
-        _lock.EnterWriteLock();
-        try
+        lock (_syncLock)
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
@@ -526,10 +512,6 @@ public sealed class MediaRingBuffer : IDisposable
                     break;
             }
         }
-        finally
-        {
-            _lock.ExitWriteLock();
-        }
     }
 
     /// <summary>
@@ -545,8 +527,7 @@ public sealed class MediaRingBuffer : IDisposable
         int clamped = Math.Clamp(bufferDurationMinutes, 1, 10);
         long newMaxTicks = TimeSpan.FromMinutes(clamped).Ticks;
 
-        _lock.EnterWriteLock();
-        try
+        lock (_syncLock)
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
@@ -555,10 +536,6 @@ public sealed class MediaRingBuffer : IDisposable
 
             Volatile.Write(ref _maxDuration100Ns, newMaxTicks);
             EvictExpiredPacketsLocked();
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
         }
     }
 
@@ -590,8 +567,7 @@ public sealed class MediaRingBuffer : IDisposable
             isMemoryLow = IsPhysicalMemoryBelowThreshold();
         }
 
-        _lock.EnterWriteLock();
-        try
+        lock (_syncLock)
         {
             if (Volatile.Read(ref _disposed) != 0)
             {
@@ -599,20 +575,31 @@ public sealed class MediaRingBuffer : IDisposable
                 return;
             }
 
-            _packets.AddLast(packet);
-            _bufferedBytes += packet.Length;
+            // Drop non-keyframe leading video packets immediately in O(1) when no keyframe exists yet.
+            if (packet.TrackType == MediaTrackType.Video && !packet.IsKeyframe && _videoKeyframes.Count == 0)
+            {
+                packet.Dispose();
+                return;
+            }
 
-            EnsureLeadingVideoKeyframeLocked();
+            LinkedListNode<EncodedPacket> node = _packets.AddLast(packet);
+            if (packet.TrackType == MediaTrackType.Video && packet.IsKeyframe)
+            {
+                _videoKeyframes.AddLast(node);
+            }
+
+            Volatile.Write(ref _bufferedBytes, _bufferedBytes + packet.Length);
+            if (packet.Timestamp100Ns > _latestTimestamp100Ns)
+            {
+                _latestTimestamp100Ns = packet.Timestamp100Ns;
+            }
+
             EvictExpiredPacketsLocked();
 
             if (isMemoryLow)
             {
                 TrimOldestGopsForMemoryPressureLocked();
             }
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
         }
     }
 
@@ -654,8 +641,7 @@ public sealed class MediaRingBuffer : IDisposable
             return new EncodedPacketSnapshot(new List<EncodedPacket>(), null);
         }
 
-        _lock.EnterReadLock();
-        try
+        lock (_syncLock)
         {
             if (Volatile.Read(ref _disposed) != 0 || _packets.Count == 0)
             {
@@ -721,14 +707,10 @@ public sealed class MediaRingBuffer : IDisposable
                 throw;
             }
         }
-        finally
-        {
-            _lock.ExitReadLock();
-        }
     }
 
     /// <summary>
-    /// Disposes and removes all currently buffered packets, returning all buffers to <see cref="ArrayPool{T}.Shared"/>.
+    /// Disposes and removes all currently buffered packets, freeing native buffers and returning pooled arrays.
     /// </summary>
     public void Clear()
     {
@@ -737,18 +719,13 @@ public sealed class MediaRingBuffer : IDisposable
             return;
         }
 
-        _lock.EnterWriteLock();
-        try
+        lock (_syncLock)
         {
             ClearLocked();
             _videoSequenceHeader = null;
             _combinedMixAudioUserData = null;
             _systemAudioUserData = null;
             _microphoneAudioUserData = null;
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
         }
     }
 
@@ -759,19 +736,13 @@ public sealed class MediaRingBuffer : IDisposable
             return;
         }
 
-        _lock.EnterWriteLock();
-        try
+        lock (_syncLock)
         {
             ClearLocked();
             _videoSequenceHeader = null;
             _combinedMixAudioUserData = null;
             _systemAudioUserData = null;
             _microphoneAudioUserData = null;
-        }
-        finally
-        {
-            _lock.ExitWriteLock();
-            _lock.Dispose();
         }
     }
 
@@ -782,6 +753,8 @@ public sealed class MediaRingBuffer : IDisposable
             RemoveFirstLocked();
         }
 
+        _videoKeyframes.Clear();
+        _latestTimestamp100Ns = long.MinValue;
         Volatile.Write(ref _bufferedBytes, 0);
     }
 
@@ -793,39 +766,20 @@ public sealed class MediaRingBuffer : IDisposable
             return;
         }
 
-        EncodedPacket packet = first.Value;
-        _packets.RemoveFirst();
-        _bufferedBytes = Math.Max(0, _bufferedBytes - packet.Length);
-        packet.Dispose();
+        RemoveNodeLocked(first);
     }
 
-    /// <summary>
-    /// Drops any leading non-keyframe video packets so the oldest video packet in the buffer
-    /// is always a decodable IDR keyframe.
-    /// </summary>
-    private void EnsureLeadingVideoKeyframeLocked()
+    private void RemoveNodeLocked(LinkedListNode<EncodedPacket> node)
     {
-        LinkedListNode<EncodedPacket>? node = _packets.First;
-        while (node is not null)
+        if (_videoKeyframes.First is not null && ReferenceEquals(_videoKeyframes.First.Value, node))
         {
-            EncodedPacket packet = node.Value;
-            if (packet.TrackType == MediaTrackType.Video)
-            {
-                if (packet.IsKeyframe)
-                {
-                    return;
-                }
-
-                LinkedListNode<EncodedPacket>? next = node.Next;
-                _packets.Remove(node);
-                _bufferedBytes = Math.Max(0, _bufferedBytes - packet.Length);
-                packet.Dispose();
-                node = next;
-                continue;
-            }
-
-            node = node.Next;
+            _videoKeyframes.RemoveFirst();
         }
+
+        EncodedPacket packet = node.Value;
+        _packets.Remove(node);
+        Volatile.Write(ref _bufferedBytes, Math.Max(0, _bufferedBytes - packet.Length));
+        packet.Dispose();
     }
 
     private void EvictExpiredPacketsLocked()
@@ -836,7 +790,9 @@ public sealed class MediaRingBuffer : IDisposable
         }
 
         long maxDuration100Ns = Volatile.Read(ref _maxDuration100Ns);
-        long latestTimestamp = _packets.Last.Value.Timestamp100Ns;
+        long latestTimestamp = _latestTimestamp100Ns != long.MinValue
+            ? _latestTimestamp100Ns
+            : _packets.Last.Value.Timestamp100Ns;
 
         // If no video packets are present yet (audio-only startup window), trim old audio packets directly.
         LinkedListNode<EncodedPacket>? firstVideoKeyframe = FindFirstVideoKeyframeLocked();
@@ -851,7 +807,7 @@ public sealed class MediaRingBuffer : IDisposable
             return;
         }
 
-        // Trim any stray audio packets significantly older than the first video keyframe.
+        // Trim any stray audio packets older than the first video keyframe.
         while (_packets.First is not null &&
                _packets.First != firstVideoKeyframe &&
                _packets.First.Value.Timestamp100Ns < firstVideoKeyframe.Value.Timestamp100Ns)
@@ -859,29 +815,31 @@ public sealed class MediaRingBuffer : IDisposable
             RemoveFirstLocked();
         }
 
-        // Evict whole oldest GOP segments whenever buffered timespan exceeds BufferDurationMinutes,
+        // Evict whole oldest GOP segments in O(1) per GOP whenever buffered timespan exceeds BufferDurationMinutes,
         // preserving the invariant that the oldest remaining video packet is always a keyframe.
-        while (_packets.First is not null && _packets.Last is not null)
+        while (_videoKeyframes.Count >= 2)
         {
-            firstVideoKeyframe = FindFirstVideoKeyframeLocked();
-            if (firstVideoKeyframe is null)
-            {
-                break;
-            }
-
+            firstVideoKeyframe = _videoKeyframes.First!.Value;
             long oldestTimestamp = firstVideoKeyframe.Value.Timestamp100Ns;
             if (latestTimestamp - oldestTimestamp <= maxDuration100Ns)
             {
                 break;
             }
 
-            LinkedListNode<EncodedPacket>? nextVideoKeyframe = FindNextVideoKeyframeLocked(firstVideoKeyframe);
-            if (nextVideoKeyframe is null)
-            {
-                break;
-            }
-
+            LinkedListNode<EncodedPacket> nextVideoKeyframe = _videoKeyframes.First.Next!.Value;
             RemoveUntilNodeLocked(nextVideoKeyframe);
+        }
+
+        // Static-desktop safeguard: when only a single video keyframe exists and audio keeps arriving
+        // beyond maxDuration100Ns, evict expired audio packets after that keyframe so RAM stays bounded.
+        if (_videoKeyframes.Count == 1)
+        {
+            firstVideoKeyframe = _videoKeyframes.First!.Value;
+            long audioCutoff = latestTimestamp - maxDuration100Ns;
+            if (audioCutoff > firstVideoKeyframe.Value.Timestamp100Ns)
+            {
+                TrimExpiredAudioAfterNodeLocked(firstVideoKeyframe, audioCutoff, maxPacketsToRemove: int.MaxValue);
+            }
         }
     }
 
@@ -893,24 +851,58 @@ public sealed class MediaRingBuffer : IDisposable
 
         for (int trimmed = 0; trimmed < maxGopsToTrimPerPass; trimmed++)
         {
-            LinkedListNode<EncodedPacket>? firstKeyframe = FindFirstVideoKeyframeLocked();
-            if (firstKeyframe is null)
+            if (_videoKeyframes.Count < 2)
             {
                 break;
             }
 
-            LinkedListNode<EncodedPacket>? nextKeyframe = FindNextVideoKeyframeLocked(firstKeyframe);
-            if (nextKeyframe is null)
-            {
-                break;
-            }
-
+            LinkedListNode<EncodedPacket> nextKeyframe = _videoKeyframes.First!.Next!.Value;
             RemoveUntilNodeLocked(nextKeyframe);
 
             if (!IsPhysicalMemoryBelowThreshold())
             {
-                break;
+                return;
             }
+        }
+
+        // If only one (or zero) video keyframes remain under memory pressure (e.g. long static screen),
+        // trim oldest audio packets so the memory guard can still free RAM.
+        if (_videoKeyframes.Count == 1)
+        {
+            TrimExpiredAudioAfterNodeLocked(_videoKeyframes.First!.Value, long.MaxValue, maxPacketsToRemove: 256);
+        }
+        else if (_videoKeyframes.Count == 0)
+        {
+            for (int i = 0; i < 256 && _packets.Count > 1; i++)
+            {
+                RemoveFirstLocked();
+            }
+        }
+    }
+
+    private void TrimExpiredAudioAfterNodeLocked(
+        LinkedListNode<EncodedPacket> anchorNode,
+        long audioCutoff100Ns,
+        int maxPacketsToRemove)
+    {
+        int removed = 0;
+        LinkedListNode<EncodedPacket>? node = anchorNode.Next;
+        while (node is not null && removed < maxPacketsToRemove)
+        {
+            LinkedListNode<EncodedPacket>? next = node.Next;
+            EncodedPacket packet = node.Value;
+            if (packet.TrackType != MediaTrackType.Video)
+            {
+                if (packet.Timestamp100Ns >= audioCutoff100Ns)
+                {
+                    break;
+                }
+
+                RemoveNodeLocked(node);
+                removed++;
+            }
+
+            node = next;
         }
     }
 
@@ -923,30 +915,7 @@ public sealed class MediaRingBuffer : IDisposable
     }
 
     private LinkedListNode<EncodedPacket>? FindFirstVideoKeyframeLocked()
-    {
-        for (LinkedListNode<EncodedPacket>? node = _packets.First; node is not null; node = node.Next)
-        {
-            if (node.Value.TrackType == MediaTrackType.Video && node.Value.IsKeyframe)
-            {
-                return node;
-            }
-        }
-
-        return null;
-    }
-
-    private static LinkedListNode<EncodedPacket>? FindNextVideoKeyframeLocked(LinkedListNode<EncodedPacket> currentKeyframe)
-    {
-        for (LinkedListNode<EncodedPacket>? node = currentKeyframe.Next; node is not null; node = node.Next)
-        {
-            if (node.Value.TrackType == MediaTrackType.Video && node.Value.IsKeyframe)
-            {
-                return node;
-            }
-        }
-
-        return null;
-    }
+        => _videoKeyframes.First?.Value;
 
     /// <summary>
     /// Queries available physical system RAM via Win32 <c>GlobalMemoryStatusEx</c>.

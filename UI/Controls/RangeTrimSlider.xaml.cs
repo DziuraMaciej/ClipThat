@@ -65,6 +65,7 @@ public partial class RangeTrimSlider : UserControl
     private double _dragEdgeOffsetX;
     private bool _isBatchUpdating;
     private bool _isScrubbingTrack;
+    private bool _isDraggingThumb;
 
     public RangeTrimSlider()
     {
@@ -152,16 +153,20 @@ public partial class RangeTrimSlider : UserControl
         double span = safeMax - safeMin;
         double minGap = Math.Min(MinimumGapSeconds, span);
 
+        double finiteStart = double.IsFinite(startValue) ? startValue : safeMin;
+        double finiteEnd = double.IsFinite(endValue) ? endValue : safeMax;
+        double finitePos = double.IsFinite(currentPosition) ? currentPosition : safeMin;
+
         double clampedStart = span > 0.0
-            ? Math.Clamp(startValue, safeMin, Math.Max(safeMin, safeMax - minGap))
+            ? Math.Clamp(finiteStart, safeMin, Math.Max(safeMin, safeMax - minGap))
             : safeMin;
 
         double clampedEnd = span > 0.0
-            ? Math.Clamp(endValue, Math.Min(safeMax, clampedStart + minGap), safeMax)
+            ? Math.Clamp(finiteEnd, Math.Min(safeMax, clampedStart + minGap), safeMax)
             : safeMax;
 
         double clampedPos = span > 0.0
-            ? Math.Clamp(currentPosition, safeMin, safeMax)
+            ? Math.Clamp(finitePos, safeMin, safeMax)
             : safeMin;
 
         _isBatchUpdating = true;
@@ -204,6 +209,7 @@ public partial class RangeTrimSlider : UserControl
         // StartThumb's right edge aligns with startX, so preserve the pointer offset from that edge.
         double pointerInThumbX = Mouse.GetPosition(StartThumb).X;
         _dragEdgeOffsetX = HandleWidth - pointerInThumbX;
+        _isDraggingThumb = true;
         ThumbDragStarted?.Invoke(this, EventArgs.Empty);
     }
 
@@ -253,6 +259,7 @@ public partial class RangeTrimSlider : UserControl
 
         // EndThumb's left edge aligns with endX, so preserve the pointer offset from that edge.
         _dragEdgeOffsetX = Mouse.GetPosition(EndThumb).X;
+        _isDraggingThumb = true;
         ThumbDragStarted?.Invoke(this, EventArgs.Empty);
     }
 
@@ -295,6 +302,12 @@ public partial class RangeTrimSlider : UserControl
 
     private void Thumb_DragCompleted(object sender, DragCompletedEventArgs e)
     {
+        if (!_isDraggingThumb)
+        {
+            return;
+        }
+
+        _isDraggingThumb = false;
         ThumbDragCompleted?.Invoke(this, EventArgs.Empty);
     }
 

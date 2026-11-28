@@ -21,6 +21,8 @@ namespace ClipThat;
 public partial class App : Application
 {
     private const long HotkeyDebounceMs = 1500;
+    private const string SingleInstanceMutexName = "Local\\ClipThat_SingleInstance_Mutex";
+    private const string ShowWindowEventName = "Local\\ClipThat_ShowWindow_Event";
 
     private readonly SettingsService _settingsService = new();
     private readonly DisplayService _displayService = new();
@@ -35,6 +37,9 @@ public partial class App : Application
         _replayEngine = new ReplayEngine(_resourceEstimatorService);
     }
 
+    private Mutex? _singleInstanceMutex;
+    private EventWaitHandle? _showWindowEvent;
+    private RegisteredWaitHandle? _showWindowWaitRegistration;
     private MainWindow? _mainWindow;
     private GlobalHotkeyService? _globalHotkeyService;
     private WinForms.NotifyIcon? _notifyIcon;
@@ -46,13 +51,23 @@ public partial class App : Application
     private long _lastHotkeyTriggerTickMs;
     private long _lastTrayErrorTickMs;
     private string? _lastTrayErrorMessage;
-    private int _hotkeySaveInProgress;
+    private int _saveReplayInProgress;
+    private int _toggleRecordingInProgress;
     private bool _isShuttingDown;
     private bool _userPreferenceEventsSubscribed;
+    private bool _globalExceptionHandlersSubscribed;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        if (!TryAcquireSingleInstance())
+        {
+            Shutdown();
+            return;
+        }
+
+        SubscribeGlobalExceptionHandlers();
 
         try
         {
@@ -88,7 +103,6 @@ public partial class App : Application
             bool startMinimized = e.Args.Any(arg =>
                 string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
 
-            bool startupRecordingFailed = false;
             if (startMinimized || settings.StartRecordingOnLaunch)
             {
                 try
@@ -97,13 +111,14 @@ public partial class App : Application
                 }
                 catch (Exception ex)
                 {
-                    startupRecordingFailed = true;
                     EngineLogger.Error("App", $"Fatal startup capture failure: {ex.Message}", ex);
                     NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się uruchomić nagrywania: {ex.Message}");
                 }
             }
 
-            if (!startMinimized && (!settings.StartRecordingOnLaunch || startupRecordingFailed))
+            // Always show the main window on explicit manual launch (without --minimized) so
+            // first-time users can configure settings instead of ClipThat vanishing silently to tray.
+            if (!startMinimized)
             {
                 ShowMainWindow();
             }
@@ -121,6 +136,105 @@ public partial class App : Application
                 MessageBoxImage.Error);
             await ExitApplicationAsync();
         }
+    }
+
+    private bool TryAcquireSingleInstance()
+    {
+        try
+        {
+            var mutex = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out bool createdNew);
+            if (!createdNew)
+            {
+                mutex.Dispose();
+                try
+                {
+                    if (EventWaitHandle.TryOpenExisting(ShowWindowEventName, out EventWaitHandle? existingEvent))
+                    {
+                        using (existingEvent)
+                        {
+                            existingEvent.Set();
+                        }
+                    }
+                }
+                catch
+                {
+                    // Ignore cross-process wake signaling errors.
+                }
+
+                return false;
+            }
+
+            _singleInstanceMutex = mutex;
+            _showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowWindowEventName);
+            _showWindowWaitRegistration = ThreadPool.RegisterWaitForSingleObject(
+                _showWindowEvent,
+                static (state, _) =>
+                {
+                    if (state is App app && !app._isShuttingDown)
+                    {
+                        app.Dispatcher.InvokeAsync(app.ShowMainWindow);
+                    }
+                },
+                this,
+                Timeout.Infinite,
+                executeOnlyOnce: false);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            LogUiException("TryAcquireSingleInstance", ex);
+            return true;
+        }
+    }
+
+    private void SubscribeGlobalExceptionHandlers()
+    {
+        if (_globalExceptionHandlersSubscribed)
+        {
+            return;
+        }
+
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += OnDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
+        _globalExceptionHandlersSubscribed = true;
+    }
+
+    private void UnsubscribeGlobalExceptionHandlers()
+    {
+        if (!_globalExceptionHandlersSubscribed)
+        {
+            return;
+        }
+
+        DispatcherUnhandledException -= OnDispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException -= OnDomainUnhandledException;
+        TaskScheduler.UnobservedTaskException -= OnUnobservedTaskException;
+        _globalExceptionHandlersSubscribed = false;
+    }
+
+    private void OnDispatcherUnhandledException(object sender, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e)
+    {
+        EngineLogger.Error("App", $"Unhandled UI dispatcher exception: {e.Exception.Message}", e.Exception);
+        LogUiException("DispatcherUnhandledException", e.Exception);
+        NotifyTrayError($"Nieoczekiwany błąd interfejsu: {e.Exception.Message}");
+        e.Handled = true;
+    }
+
+    private static void OnDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        if (e.ExceptionObject is Exception ex)
+        {
+            EngineLogger.Error("App", $"Unhandled AppDomain exception (terminating={e.IsTerminating}): {ex.Message}", ex);
+            LogUiException("AppDomain.UnhandledException", ex);
+        }
+    }
+
+    private static void OnUnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        EngineLogger.Warn("App", $"Unobserved background task exception: {e.Exception.Message}", e.Exception);
+        e.SetObserved();
     }
 
     private void InitializeTrayIcon()
@@ -155,7 +269,7 @@ public partial class App : Application
         _notifyIcon = new WinForms.NotifyIcon
         {
             Icon = _pausedTrayIcon,
-            Text = "ClipThat ON",
+            Text = "ClipThat OFF",
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
@@ -193,16 +307,16 @@ public partial class App : Application
             return;
         }
 
-        if (Interlocked.CompareExchange(ref _hotkeySaveInProgress, 1, 0) != 0)
+        if (Interlocked.CompareExchange(ref _saveReplayInProgress, 1, 0) != 0)
         {
             return;
         }
 
         Volatile.Write(ref _lastHotkeyTriggerTickMs, nowTickMs);
-        _ = SaveReplayFromHotkeyAsync();
+        _ = SaveReplayCoordinatedAsync("SaveReplayFromHotkeyAsync");
     }
 
-    private async Task SaveReplayFromHotkeyAsync()
+    private async Task SaveReplayCoordinatedAsync(string context)
     {
         try
         {
@@ -210,12 +324,12 @@ public partial class App : Application
         }
         catch (Exception ex)
         {
-            EngineLogger.Error("App", $"SaveReplayFromHotkeyAsync failed: {ex.Message}", ex);
+            EngineLogger.Error("App", $"{context} failed: {ex.Message}", ex);
             NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się zapisać powtórki: {ex.Message}");
         }
         finally
         {
-            Interlocked.Exchange(ref _hotkeySaveInProgress, 0);
+            Interlocked.Exchange(ref _saveReplayInProgress, 0);
         }
     }
 
@@ -301,19 +415,26 @@ public partial class App : Application
 
     private async Task SaveReplayFromTrayAsync()
     {
-        try
+        if (_isShuttingDown || !_replayEngine.IsRecording)
         {
-            await _replayEngine.SaveReplayAsync();
+            return;
         }
-        catch (Exception ex)
+
+        if (Interlocked.CompareExchange(ref _saveReplayInProgress, 1, 0) != 0)
         {
-            EngineLogger.Error("App", $"SaveReplayFromTrayAsync failed: {ex.Message}", ex);
-            NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się zapisać powtórki: {ex.Message}");
+            return;
         }
+
+        await SaveReplayCoordinatedAsync("SaveReplayFromTrayAsync");
     }
 
     private async Task ToggleRecordingAsync()
     {
+        if (_isShuttingDown || Interlocked.CompareExchange(ref _toggleRecordingInProgress, 1, 0) != 0)
+        {
+            return;
+        }
+
         try
         {
             if (_replayEngine.IsRecording)
@@ -333,6 +454,7 @@ public partial class App : Application
         }
         finally
         {
+            Interlocked.Exchange(ref _toggleRecordingInProgress, 0);
             SyncTrayState();
         }
     }
@@ -396,10 +518,20 @@ public partial class App : Application
 
     private void OnEngineReplaySaved(string filePath)
     {
+        if (_isShuttingDown)
+        {
+            return;
+        }
+
         Dispatcher.InvokeAsync(() =>
         {
+            if (_isShuttingDown || _notifyIcon is null)
+            {
+                return;
+            }
+
             string fileName = Path.GetFileName(filePath);
-            _notifyIcon?.ShowBalloonTip(
+            _notifyIcon.ShowBalloonTip(
                 2500,
                 "ClipThat",
                 $"Zapisano powtórkę: {fileName}",
@@ -522,8 +654,44 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        UnsubscribeGlobalExceptionHandlers();
         UnsubscribeUserPreferenceChanged();
+        ReleaseSingleInstanceHandles();
         base.OnExit(e);
+    }
+
+    private void ReleaseSingleInstanceHandles()
+    {
+        RegisteredWaitHandle? waitReg = Interlocked.Exchange(ref _showWindowWaitRegistration, null);
+        if (waitReg is not null)
+        {
+            try
+            {
+                waitReg.Unregister(null);
+            }
+            catch
+            {
+                // Ignore wait handle unregister errors on exit.
+            }
+        }
+
+        EventWaitHandle? showEvent = Interlocked.Exchange(ref _showWindowEvent, null);
+        showEvent?.Dispose();
+
+        Mutex? mutex = Interlocked.Exchange(ref _singleInstanceMutex, null);
+        if (mutex is not null)
+        {
+            try
+            {
+                mutex.ReleaseMutex();
+            }
+            catch
+            {
+                // Mutex may not be owned on this thread during shutdown.
+            }
+
+            mutex.Dispose();
+        }
     }
 
     private static SolidColorBrush CreateFrozenBrush(Color color)
@@ -549,6 +717,7 @@ public partial class App : Application
         }
 
         _isShuttingDown = true;
+        UnsubscribeGlobalExceptionHandlers();
         UnsubscribeUserPreferenceChanged();
 
         try

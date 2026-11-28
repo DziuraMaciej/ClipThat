@@ -89,7 +89,9 @@ public sealed class DisplayService
             !string.IsNullOrWhiteSpace(displayDevice.DeviceString))
         {
             string trimmed = displayDevice.DeviceString.Trim();
-            if (!string.Equals(trimmed, "Generic PnP Monitor", StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(trimmed, "Generic PnP Monitor", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(trimmed, "Generic Monitor", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(trimmed, "Rodzajowy monitor PnP", StringComparison.OrdinalIgnoreCase))
             {
                 return $"Monitor {displayIndex} — {trimmed}";
             }

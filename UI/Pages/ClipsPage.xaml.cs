@@ -68,6 +68,9 @@ public partial class ClipsPage : Page
     private double _clipDurationSeconds;
     private double _lastNonZeroSystemVolume = 100.0;
     private double _lastNonZeroMicVolume = 100.0;
+    private long _lastTrimSeekTimestamp;
+    private double? _pendingTrimSeekSeconds;
+    private double? _lastTrimDragSeconds;
 
     private bool _isClipsListCollapsed;
     private int _sidebarAnimationGeneration;
@@ -160,6 +163,40 @@ public partial class ClipsPage : Page
 
     private void ClipsPage_Unloaded(object sender, RoutedEventArgs e)
     {
+        SuspendPreviewAndWatcher();
+    }
+
+    /// <summary>
+    /// Called by <see cref="MainWindow"/> when the window is hidden to tray or restored,
+    /// releasing file watchers, preview audio streams, and temp WAVs while minimized to tray.
+    /// </summary>
+    public void OnHostWindowVisibilityChanged(bool isVisible)
+    {
+        if (_isDetached)
+        {
+            return;
+        }
+
+        if (!isVisible)
+        {
+            SuspendPreviewAndWatcher();
+            return;
+        }
+
+        if (!IsLoaded)
+        {
+            return;
+        }
+
+        string outputDirectory = GetConfiguredOutputDirectory();
+        FolderPathText.Text = outputDirectory;
+        FolderPathText.ToolTip = outputDirectory;
+        ConfigureDirectoryWatcher(outputDirectory);
+        _ = RefreshClipsAsync(preferredSelectionPath: _selectedClip?.FilePath);
+    }
+
+    private void SuspendPreviewAndWatcher()
+    {
         _playbackTimer.Stop();
         _watcherDebounceTimer.Stop();
         DisposeDirectoryWatcher();
@@ -170,7 +207,7 @@ public partial class ClipsPage : Page
             PausePlayback();
         }
 
-        // Dispose NAudio playback objects and delete temporary preview .wav files when leaving ClipsPage.
+        // Dispose NAudio playback objects and delete temporary preview .wav files when hidden or navigated away.
         DisposeAudioMixerAndDeleteTempFiles();
         HideAudioLoadingOverlay();
     }
@@ -461,6 +498,10 @@ public partial class ClipsPage : Page
         }
     }
 
+    private bool IsCurrentSelectedClip(ClipItem clip)
+        => _selectedClip is not null &&
+           string.Equals(_selectedClip.FilePath, clip.FilePath, StringComparison.OrdinalIgnoreCase);
+
     private async Task PreparePreviewAudioAsync(ClipItem clip)
     {
         DisposeAudioMixerAndDeleteTempFiles();
@@ -470,72 +511,140 @@ public partial class ClipsPage : Page
         _isExtractingPreviewAudio = true;
         _isPreviewAudioReady = false;
 
-        ShowAudioLoadingOverlay("Ładowanie ścieżek audio...");
-
-        var progress = new Progress<ClipExportProgress>(update =>
+        try
         {
-            if (_isDetached || cts.IsCancellationRequested || !ReferenceEquals(_selectedClip, clip))
+            // Fast path: stream decoded PCM directly from the MP4 tracks via Media Foundation (zero temp disk I/O).
+            (bool mfOpened, MfTrackAudioWaveStream? mfSys, MfTrackAudioWaveStream? mfMic) = await Task.Run(() =>
             {
+                if (cts.IsCancellationRequested)
+                {
+                    return (false, (MfTrackAudioWaveStream?)null, (MfTrackAudioWaveStream?)null);
+                }
+
+                bool ok = MfTrackAudioWaveStream.TryOpenAudioTracks(
+                    clip.FilePath,
+                    clip.Duration,
+                    clip.AudioTrackCount,
+                    out MfTrackAudioWaveStream? sys,
+                    out MfTrackAudioWaveStream? mic);
+                return (ok, sys, mic);
+            }, cts.Token);
+
+            if (_isDetached || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
+            {
+                try { mfMic?.Dispose(); } catch { /* ignore */ }
+                try { mfSys?.Dispose(); } catch { /* ignore */ }
                 return;
             }
 
-            if (!string.IsNullOrWhiteSpace(update.StatusMessage))
+            if (mfOpened && (mfSys is not null || mfMic is not null))
             {
-                ShowAudioLoadingOverlay(update.StatusMessage);
+                InitializeAudioMixerFromStreams(mfSys, mfMic, tempSysWavPath: null, tempMicWavPath: null);
+                return;
             }
-        });
 
-        PreviewAudioExtractionResult? extractionResult = null;
-        try
-        {
-            extractionResult = await _clipEditorService.ExtractPreviewAudioTracksAsync(
+            try { mfMic?.Dispose(); } catch { /* ignore */ }
+            try { mfSys?.Dispose(); } catch { /* ignore */ }
+
+            // Fallback path: extract temporary PCM WAV files via FFmpeg when Media Foundation cannot open the file.
+            ShowAudioLoadingOverlay("Ładowanie ścieżek audio...");
+
+            var progress = new Progress<ClipExportProgress>(update =>
+            {
+                if (_isDetached || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
+                {
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(update.StatusMessage))
+                {
+                    ShowAudioLoadingOverlay(update.StatusMessage);
+                }
+            });
+
+            PreviewAudioExtractionResult extractionResult = await _clipEditorService.ExtractPreviewAudioTracksAsync(
                 clip.FilePath,
                 clip.AudioTrackCount,
                 progress,
                 cts.Token);
+
+            if (_isDetached || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
+            {
+                // Clip changed or page unloaded while ffmpeg was running; discard temp WAV files immediately.
+                ClipEditorService.TryDeletePreviewFile(extractionResult.SystemAudioWavPath);
+                ClipEditorService.TryDeletePreviewFile(extractionResult.MicrophoneAudioWavPath);
+                return;
+            }
+
+            if (extractionResult.ExtractedTrackCount <= 0)
+            {
+                _isPreviewAudioReady = true;
+                return;
+            }
+
+            WaveFileReader? sysReader = null;
+            WaveFileReader? micReader = null;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(extractionResult.SystemAudioWavPath) &&
+                    File.Exists(extractionResult.SystemAudioWavPath))
+                {
+                    sysReader = new WaveFileReader(extractionResult.SystemAudioWavPath);
+                }
+
+                if (!string.IsNullOrWhiteSpace(extractionResult.MicrophoneAudioWavPath) &&
+                    File.Exists(extractionResult.MicrophoneAudioWavPath))
+                {
+                    micReader = new WaveFileReader(extractionResult.MicrophoneAudioWavPath);
+                }
+            }
+            catch
+            {
+                try { sysReader?.Dispose(); } catch { /* ignore */ }
+                try { micReader?.Dispose(); } catch { /* ignore */ }
+                ClipEditorService.TryDeletePreviewFile(extractionResult.SystemAudioWavPath);
+                ClipEditorService.TryDeletePreviewFile(extractionResult.MicrophoneAudioWavPath);
+                throw;
+            }
+
+            InitializeAudioMixerFromStreams(
+                sysReader,
+                micReader,
+                extractionResult.SystemAudioWavPath,
+                extractionResult.MicrophoneAudioWavPath);
         }
         catch (OperationCanceledException)
         {
-            return;
+            // Cancelled due to clip switch, hide-to-tray, or unload.
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Błąd ekstrakcji ścieżek audio do podglądu: {ex.Message}");
-            if (!_isDetached && !cts.IsCancellationRequested && ReferenceEquals(_selectedClip, clip))
+            Debug.WriteLine($"Błąd przygotowania ścieżek audio do podglądu: {ex.Message}");
+            if (!_isDetached && !cts.IsCancellationRequested && IsCurrentSelectedClip(clip))
+            {
+                AudioTracksHintText.Text = "Podgląd audio niedostępny";
+            }
+        }
+        finally
+        {
+            if (ReferenceEquals(_audioExtractionCts, cts))
             {
                 _isExtractingPreviewAudio = false;
-                HideAudioLoadingOverlay();
-                AudioTracksHintText.Text = "Podgląd audio niedostępny (brak ffmpeg)";
+                if (!_isDetached)
+                {
+                    HideAudioLoadingOverlay();
+                }
             }
-
-            return;
         }
-
-        if (_isDetached || cts.IsCancellationRequested || !ReferenceEquals(_selectedClip, clip))
-        {
-            // Clip changed or page unloaded while ffmpeg was running; discard temp WAV files immediately.
-            ClipEditorService.TryDeletePreviewFile(extractionResult.SystemAudioWavPath);
-            ClipEditorService.TryDeletePreviewFile(extractionResult.MicrophoneAudioWavPath);
-            return;
-        }
-
-        _isExtractingPreviewAudio = false;
-        HideAudioLoadingOverlay();
-
-        if (extractionResult.ExtractedTrackCount <= 0)
-        {
-            _isPreviewAudioReady = true;
-            return;
-        }
-
-        InitializeAudioMixer(extractionResult);
     }
 
-    private void InitializeAudioMixer(PreviewAudioExtractionResult extraction)
+    private void InitializeAudioMixerFromStreams(
+        WaveStream? sysStream,
+        WaveStream? micStream,
+        string? tempSysWavPath,
+        string? tempMicWavPath)
     {
         WaveOutEvent? waveOut = null;
-        WaveFileReader? sysStream = null;
-        WaveFileReader? micStream = null;
         LockedSampleProvider? sysProvider = null;
         LockedSampleProvider? micProvider = null;
         VolumeSampleProvider? sysVolumeProvider = null;
@@ -555,34 +664,22 @@ public partial class ClipsPage : Page
             int sysPercent = (int)Math.Round(SystemVolumeSlider.Value);
             int micPercent = (int)Math.Round(MicVolumeSlider.Value);
 
-            if (!string.IsNullOrWhiteSpace(extraction.SystemAudioWavPath) &&
-                File.Exists(extraction.SystemAudioWavPath))
+            if (sysStream is not null)
             {
-                sysStream = new WaveFileReader(extraction.SystemAudioWavPath);
-                sysProvider = new LockedSampleProvider(sysStream, _audioSyncLock);
-                sysVolumeProvider = new VolumeSampleProvider(sysProvider)
-                {
-                    Volume = sysPercent / 100f
-                };
+                sysVolumeProvider = WrapStreamForPreviewMixer(sysStream, sysPercent, out sysProvider);
                 mixer.AddMixerInput(sysVolumeProvider);
             }
 
-            if (!string.IsNullOrWhiteSpace(extraction.MicrophoneAudioWavPath) &&
-                File.Exists(extraction.MicrophoneAudioWavPath))
+            if (micStream is not null)
             {
-                micStream = new WaveFileReader(extraction.MicrophoneAudioWavPath);
-                micProvider = new LockedSampleProvider(micStream, _audioSyncLock);
-                micVolumeProvider = new VolumeSampleProvider(micProvider)
-                {
-                    Volume = micPercent / 100f
-                };
+                micVolumeProvider = WrapStreamForPreviewMixer(micStream, micPercent, out micProvider);
                 mixer.AddMixerInput(micVolumeProvider);
             }
 
             if (sysVolumeProvider is null && micVolumeProvider is null)
             {
-                ClipEditorService.TryDeletePreviewFile(extraction.SystemAudioWavPath);
-                ClipEditorService.TryDeletePreviewFile(extraction.MicrophoneAudioWavPath);
+                ClipEditorService.TryDeletePreviewFile(tempSysWavPath);
+                ClipEditorService.TryDeletePreviewFile(tempMicWavPath);
                 _isPreviewAudioReady = true;
                 return;
             }
@@ -604,8 +701,8 @@ public partial class ClipsPage : Page
                 _micVolumeProvider = micVolumeProvider;
                 _audioMixer = mixer;
                 _waveOut = waveOut;
-                _tempSystemWavPath = extraction.SystemAudioWavPath;
-                _tempMicWavPath = extraction.MicrophoneAudioWavPath;
+                _tempSystemWavPath = tempSysWavPath;
+                _tempMicWavPath = tempMicWavPath;
             }
 
             _isPreviewAudioReady = true;
@@ -629,11 +726,42 @@ public partial class ClipsPage : Page
             try { sysStream?.Dispose(); } catch { /* ignore */ }
             try { micStream?.Dispose(); } catch { /* ignore */ }
 
-            ClipEditorService.TryDeletePreviewFile(extraction.SystemAudioWavPath);
-            ClipEditorService.TryDeletePreviewFile(extraction.MicrophoneAudioWavPath);
+            ClipEditorService.TryDeletePreviewFile(tempSysWavPath);
+            ClipEditorService.TryDeletePreviewFile(tempMicWavPath);
 
             AudioTracksHintText.Text = "Nie udało się uruchomić wyjścia audio podglądu";
         }
+    }
+
+    private VolumeSampleProvider WrapStreamForPreviewMixer(
+        WaveStream stream,
+        int volumePercent,
+        out LockedSampleProvider lockedProvider)
+    {
+        lockedProvider = new LockedSampleProvider(stream, _audioSyncLock);
+        ISampleProvider chain = lockedProvider;
+
+        if (chain.WaveFormat.Channels == 1)
+        {
+            chain = new MonoToStereoSampleProvider(chain);
+        }
+        else if (chain.WaveFormat.Channels > PreviewMixerChannels)
+        {
+            var stereoMux = new MultiplexingSampleProvider(new[] { chain }, PreviewMixerChannels);
+            stereoMux.ConnectInputToOutput(0, 0);
+            stereoMux.ConnectInputToOutput(1, 1);
+            chain = stereoMux;
+        }
+
+        if (chain.WaveFormat.SampleRate != PreviewMixerSampleRate)
+        {
+            chain = new WdlResamplingSampleProvider(chain, PreviewMixerSampleRate);
+        }
+
+        return new VolumeSampleProvider(chain)
+        {
+            Volume = volumePercent / 100f
+        };
     }
 
     private void DisposeAudioMixerAndDeleteTempFiles()
@@ -793,6 +921,7 @@ public partial class ClipsPage : Page
 
         OpenExternalPlayerButton.IsEnabled = hasClip;
         PlayPauseButton.IsEnabled = hasClip;
+        ClipsListBox.IsEnabled = !_isExporting;
         TrimRangeSlider.IsEnabled = canInteract && _clipDurationSeconds > 0.0;
 
         SystemVolumeSlider.IsEnabled = canInteract && hasAudio;
@@ -922,19 +1051,18 @@ public partial class ClipsPage : Page
         }
     }
 
-    private void EditorScrollViewer_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    private void EditorScrollViewer_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        if (e.Handled || e.Delta == 0 || EditorScrollViewer is null)
+        if (VideoPreviewBorder is null || EditorScrollViewer is null || EditorScrollViewer.ViewportHeight <= 0.0)
         {
             return;
         }
 
-        double targetOffset = Math.Clamp(
-            EditorScrollViewer.VerticalOffset - e.Delta,
-            0.0,
-            EditorScrollViewer.ScrollableHeight);
-        EditorScrollViewer.ScrollToVerticalOffset(targetOffset);
-        e.Handled = true;
+        double targetHeight = Math.Clamp(EditorScrollViewer.ViewportHeight * 0.50, 260.0, 560.0);
+        if (Math.Abs(VideoPreviewBorder.Height - targetHeight) >= 2.0)
+        {
+            VideoPreviewBorder.Height = targetHeight;
+        }
     }
 
     private void PlayPauseButton_Click(object sender, RoutedEventArgs e)
@@ -1080,13 +1208,18 @@ public partial class ClipsPage : Page
         }
 
         // Re-sync NAudio WaveStreams if MediaElement ever stalls and drifts noticeably.
+        // Skip resync once video approaches or passes the audio stream's end to avoid 30 Hz EOF seek loops.
         if (_isPlaying && _waveOut?.PlaybackState == PlaybackState.Playing)
         {
-            TimeSpan? audioPosition = GetAudioPosition();
-            if (audioPosition.HasValue &&
-                Math.Abs((videoPosition - audioPosition.Value).TotalMilliseconds) > MaxAudioVideoDriftMs)
+            (TimeSpan? audioPosition, TimeSpan? audioTotalTime) = GetAudioTiming();
+            if (audioPosition.HasValue && audioTotalTime.HasValue)
             {
-                SeekAudioStreams(videoPosition);
+                TimeSpan eofGuard = audioTotalTime.Value - TimeSpan.FromMilliseconds(MaxAudioVideoDriftMs);
+                if (videoPosition < eofGuard &&
+                    Math.Abs((videoPosition - audioPosition.Value).TotalMilliseconds) > MaxAudioVideoDriftMs)
+                {
+                    SeekAudioStreams(videoPosition);
+                }
             }
         }
 
@@ -1096,6 +1229,9 @@ public partial class ClipsPage : Page
     private void TrimRangeSlider_ThumbDragStarted(object? sender, EventArgs e)
     {
         _isDraggingTrimHandle = true;
+        _pendingTrimSeekSeconds = null;
+        _lastTrimDragSeconds = null;
+        _lastTrimSeekTimestamp = 0;
         if (_isPlaying)
         {
             PausePlayback();
@@ -1105,6 +1241,14 @@ public partial class ClipsPage : Page
     private void TrimRangeSlider_ThumbDragCompleted(object? sender, EventArgs e)
     {
         _isDraggingTrimHandle = false;
+        double? finalTarget = _pendingTrimSeekSeconds ?? _lastTrimDragSeconds;
+        _pendingTrimSeekSeconds = null;
+        _lastTrimDragSeconds = null;
+
+        if (finalTarget.HasValue && _selectedClip is not null && _clipDurationSeconds > 0.0)
+        {
+            SeekMediaAndAudioToSeconds(finalTarget.Value, syncTrimPlayhead: false);
+        }
     }
 
     private void TrimRangeSlider_StartChanged(object? sender, double newStartSeconds)
@@ -1115,7 +1259,7 @@ public partial class ClipsPage : Page
         }
 
         UpdateTrimDisplay();
-        SeekMediaAndAudioToSeconds(newStartSeconds, syncTrimPlayhead: false);
+        SeekForTrimChange(newStartSeconds);
     }
 
     private void TrimRangeSlider_EndChanged(object? sender, double newEndSeconds)
@@ -1126,7 +1270,30 @@ public partial class ClipsPage : Page
         }
 
         UpdateTrimDisplay();
-        SeekMediaAndAudioToSeconds(newEndSeconds, syncTrimPlayhead: false);
+        SeekForTrimChange(newEndSeconds);
+    }
+
+    private void SeekForTrimChange(double targetSeconds)
+    {
+        if (!_isDraggingTrimHandle)
+        {
+            SeekMediaAndAudioToSeconds(targetSeconds, syncTrimPlayhead: false);
+            return;
+        }
+
+        _lastTrimDragSeconds = targetSeconds;
+        long now = Stopwatch.GetTimestamp();
+        if (_lastTrimSeekTimestamp != 0 &&
+            Stopwatch.GetElapsedTime(_lastTrimSeekTimestamp, now).TotalMilliseconds < 50.0)
+        {
+            _pendingTrimSeekSeconds = targetSeconds;
+            return;
+        }
+
+        _lastTrimSeekTimestamp = now;
+        _pendingTrimSeekSeconds = null;
+        SeekVideoOnlyToSeconds(targetSeconds);
+        SyncPlayheadUi(targetSeconds, syncTrimPlayhead: false);
     }
 
     private void TrimRangeSlider_PositionSeekStarted(object? sender, EventArgs e)
@@ -1248,23 +1415,32 @@ public partial class ClipsPage : Page
         }
     }
 
-    private TimeSpan? GetAudioPosition()
+    private (TimeSpan? CurrentTime, TimeSpan? TotalTime) GetAudioTiming()
     {
         lock (_audioSyncLock)
         {
-            WaveStream? activeStream = _systemWaveStream ?? _micWaveStream;
+            WaveStream? activeStream = _systemWaveStream;
             if (activeStream is null)
             {
-                return null;
+                activeStream = _micWaveStream;
+            }
+            else if (_micWaveStream is not null && _micWaveStream.TotalTime > activeStream.TotalTime)
+            {
+                activeStream = _micWaveStream;
+            }
+
+            if (activeStream is null)
+            {
+                return (null, null);
             }
 
             try
             {
-                return activeStream.CurrentTime;
+                return (activeStream.CurrentTime, activeStream.TotalTime);
             }
             catch
             {
-                return null;
+                return (null, null);
             }
         }
     }
@@ -1510,10 +1686,25 @@ public partial class ClipsPage : Page
         SystemVolumeText.Text = $"{sysPercent}%";
         MicVolumeText.Text = $"{micPercent}%";
 
-        SystemMuteButton.Icon = new SymbolIcon(
-            sysPercent == 0 ? SymbolRegular.SpeakerMute24 : SymbolRegular.Speaker224);
-        MicMuteButton.Icon = new SymbolIcon(
-            micPercent == 0 ? SymbolRegular.MicOff24 : SymbolRegular.Mic24);
+        SymbolRegular sysSymbol = sysPercent == 0 ? SymbolRegular.SpeakerMute24 : SymbolRegular.Speaker224;
+        if (SystemMuteButton.Icon is SymbolIcon sysIcon)
+        {
+            sysIcon.Symbol = sysSymbol;
+        }
+        else
+        {
+            SystemMuteButton.Icon = new SymbolIcon(sysSymbol);
+        }
+
+        SymbolRegular micSymbol = micPercent == 0 ? SymbolRegular.MicOff24 : SymbolRegular.Mic24;
+        if (MicMuteButton.Icon is SymbolIcon micIcon)
+        {
+            micIcon.Symbol = micSymbol;
+        }
+        else
+        {
+            MicMuteButton.Icon = new SymbolIcon(micSymbol);
+        }
     }
 
     private async void ExportButton_Click(object sender, RoutedEventArgs e)
@@ -1745,7 +1936,7 @@ public partial class ClipsPage : Page
         try
         {
             Directory.CreateDirectory(outputDirectory);
-            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{outputDirectory}\"")
+            using Process? _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{outputDirectory}\"")
             {
                 UseShellExecute = true
             });
@@ -1770,7 +1961,7 @@ public partial class ClipsPage : Page
                 PausePlayback();
             }
 
-            Process.Start(new ProcessStartInfo
+            using Process? _ = Process.Start(new ProcessStartInfo
             {
                 FileName = _selectedClip.FilePath,
                 UseShellExecute = true
@@ -1786,7 +1977,7 @@ public partial class ClipsPage : Page
     {
         e.Handled = true;
 
-        if (sender is not FrameworkElement { Tag: ClipItem clip })
+        if (_isExporting || sender is not FrameworkElement { Tag: ClipItem clip })
         {
             return;
         }

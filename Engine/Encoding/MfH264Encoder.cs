@@ -64,7 +64,9 @@ public sealed class MfH264Encoder : IDisposable
     private readonly Action<Exception>? _onEncoderError;
     private readonly object _mftLock = new();
     private readonly object _queueLock = new();
-    private readonly Queue<IMFSample> _pendingInputQueue = new(MaxPendingAsyncInputSamples + 1);
+    private readonly Queue<QueuedInputItem> _pendingInputQueue = new(MaxPendingAsyncInputSamples + 1);
+    private readonly nint[] _recentInFlightGpuTextures = new nint[6];
+    private int _recentGpuTextureCursor;
     private readonly AutoResetEvent _inputWorkSignal = new(false);
     private readonly ManualResetEventSlim _drainCompleteEvent = new(false);
 
@@ -87,6 +89,12 @@ public sealed class MfH264Encoder : IDisposable
     private int _outputStreamId;
     private OutputStreamInfo _outputStreamInfo;
     private bool _mftProvidesOutputSamples;
+    private IMFSample? _reusableOutputSample;
+    private IMFMediaBuffer? _reusableOutputBuffer;
+    private int _reusableOutputCapacity;
+    private IMFSample? _reusableSyncCpuInputSample;
+    private IMFMediaBuffer? _reusableSyncCpuInputBuffer;
+    private long _lastOutputTimestamp100Ns = -1;
     private bool _isAsync;
     private bool _usesGpuInput;
     private int _availableInputSlots;
@@ -185,11 +193,50 @@ public sealed class MfH264Encoder : IDisposable
     public bool HasEmittedKeyframe => Volatile.Read(ref _encodedKeyframeCount) > 0;
 
     /// <summary>
+    /// Returns <see langword="true"/> if <paramref name="texture"/> is currently queued for async input
+    /// or was recently submitted to a zero-copy GPU hardware encoder, preventing pool overwrites.
+    /// </summary>
+    public bool IsTextureInUse(ID3D11Texture2D texture)
+    {
+        if (!_usesGpuInput || texture is null)
+        {
+            return false;
+        }
+
+        nint ptr = texture.NativePointer;
+        if (ptr == nint.Zero)
+        {
+            return false;
+        }
+
+        lock (_queueLock)
+        {
+            foreach (QueuedInputItem item in _pendingInputQueue)
+            {
+                if (item.GpuTexturePtr == ptr)
+                {
+                    return true;
+                }
+            }
+
+            for (int i = 0; i < _recentInFlightGpuTextures.Length; i++)
+            {
+                if (_recentInFlightGpuTextures[i] == ptr)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Submits a single NV12 (or BGRA fallback) texture produced by <see cref="GpuVideoProcessor"/> to the encoder.
-    /// For async MFTs, queues the sample without blocking the WGC callback thread and wakes the dedicated
+    /// For async MFTs, queues the sample without blocking the capture thread and wakes the dedicated
     /// input feeder, which submits via <c>ProcessInput</c> strictly as <c>METransformNeedInput</c> slots arrive.
     /// </summary>
-    public bool EncodeFrame(ID3D11Texture2D frameTexture, long timestamp100Ns, long duration100Ns)
+    public bool EncodeFrame(ID3D11Texture2D frameTexture, long timestamp100Ns, long duration100Ns, bool forceKeyFrame = false)
     {
         ArgumentNullException.ThrowIfNull(frameTexture);
 
@@ -202,13 +249,15 @@ public sealed class MfH264Encoder : IDisposable
         List<EncodedPacket>? syncPackets = null;
         IMFSample? inputSample = null;
         bool sampleOwnershipTransferred = false;
+        bool usingReusableSyncInput = false;
 
         try
         {
-            inputSample = CreateInputSample(frameTexture, timestamp100Ns, effectiveDuration);
-
             if (_isAsync)
             {
+                inputSample = CreateInputSample(frameTexture, timestamp100Ns, effectiveDuration);
+                nint gpuPtr = _usesGpuInput ? frameTexture.NativePointer : nint.Zero;
+
                 lock (_queueLock)
                 {
                     if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _stopping) != 0)
@@ -224,11 +273,11 @@ public sealed class MfH264Encoder : IDisposable
                             return false;
                         }
 
-                        IMFSample droppedOldest = _pendingInputQueue.Dequeue();
-                        SafeDisposeSample(droppedOldest);
+                        QueuedInputItem droppedOldest = _pendingInputQueue.Dequeue();
+                        SafeDisposeSample(droppedOldest.Sample);
                     }
 
-                    _pendingInputQueue.Enqueue(inputSample);
+                    _pendingInputQueue.Enqueue(new QueuedInputItem(inputSample, gpuPtr, forceKeyFrame));
                     sampleOwnershipTransferred = true;
                 }
 
@@ -243,21 +292,33 @@ public sealed class MfH264Encoder : IDisposable
                     return false;
                 }
 
+                inputSample = AcquireSyncInputSampleLocked(frameTexture, timestamp100Ns, effectiveDuration, out usingReusableSyncInput);
+
                 try
                 {
-                    SubmitInputSampleLocked(inputSample);
+                    SubmitInputSampleLocked(inputSample, forceKeyFrame);
                 }
                 catch (SharpGenException ex) when (ex.ResultCode == ResultCode.Notaccepting)
                 {
                     DrainSyncOutputsLocked(ref syncPackets);
-                    SubmitInputSampleLocked(inputSample);
+                    SubmitInputSampleLocked(inputSample, forceKeyFrame);
                 }
 
-                // Release input IMFSample (and its underlying NV12 IMFMediaBuffer) immediately after ProcessInput.
-                SafeDisposeSample(inputSample);
-                inputSample = null;
+                if (!usingReusableSyncInput)
+                {
+                    // Release input IMFSample (and its underlying NV12 IMFMediaBuffer) immediately after ProcessInput.
+                    SafeDisposeSample(inputSample);
+                    inputSample = null;
+                }
 
                 DrainSyncOutputsLocked(ref syncPackets);
+
+                // If the MFT retained a COM reference to our reusable sync input sample/buffer, detach it
+                // so the next frame allocates a fresh buffer without overwriting in-use encoder input.
+                if (usingReusableSyncInput && !IsReusableSyncInputExclusiveLocked())
+                {
+                    ReleaseReusableSyncInputSampleLocked();
+                }
             }
 
             if (syncPackets is not null)
@@ -280,23 +341,23 @@ public sealed class MfH264Encoder : IDisposable
         }
         finally
         {
-            if (!sampleOwnershipTransferred)
+            if (!sampleOwnershipTransferred && !usingReusableSyncInput)
             {
                 SafeDisposeSample(inputSample);
             }
         }
     }
 
-    private void SubmitInputSampleLocked(IMFSample inputSample)
+    private void SubmitInputSampleLocked(IMFSample inputSample, bool forceKeyFrame = false)
     {
         if (_transform is null)
         {
             return;
         }
 
-        // Force an immediate IDR keyframe on the very first submitted frame so MediaRingBuffer
-        // receives a decodable keyframe right away across NVENC, AMF, QuickSync, and Software MFT.
-        if (Volatile.Read(ref _submittedFrameCount) == 0)
+        // Force an immediate IDR keyframe on the very first submitted frame (or explicit keep-alive request)
+        // so MediaRingBuffer receives decodable keyframes promptly across all hardware and software MFTs.
+        if (forceKeyFrame || Volatile.Read(ref _submittedFrameCount) == 0)
         {
             TryForceKeyFrameLocked(_transform);
         }
@@ -1137,7 +1198,9 @@ public sealed class MfH264Encoder : IDisposable
         try
         {
             Guid api = propertyGuid;
-            if (codecApi.IsSupported(ref api) != 0)
+            int supportedHr = codecApi.IsSupported(ref api);
+            // E_NOTIMPL (0x80004001): some MFTs accept SetValue without implementing IsSupported.
+            if (supportedHr != 0 && supportedHr != unchecked((int)0x80004001))
             {
                 return false;
             }
@@ -1156,7 +1219,8 @@ public sealed class MfH264Encoder : IDisposable
         try
         {
             Guid api = propertyGuid;
-            if (codecApi.IsSupported(ref api) != 0)
+            int supportedHr = codecApi.IsSupported(ref api);
+            if (supportedHr != 0 && supportedHr != unchecked((int)0x80004001))
             {
                 return false;
             }
@@ -1168,6 +1232,79 @@ public sealed class MfH264Encoder : IDisposable
         {
             return false;
         }
+    }
+
+    private IMFSample AcquireSyncInputSampleLocked(
+        ID3D11Texture2D frameTexture,
+        long timestamp100Ns,
+        long duration100Ns,
+        out bool usingReusableSample)
+    {
+        if (_usesGpuInput)
+        {
+            usingReusableSample = false;
+            return CreateInputSample(frameTexture, timestamp100Ns, duration100Ns);
+        }
+
+        int nv12Size = _width * _height * 3 / 2;
+        if (_reusableSyncCpuInputSample is null || _reusableSyncCpuInputBuffer is null)
+        {
+            IMFSample sample = MediaFactory.MFCreateSample();
+            IMFMediaBuffer memBuffer = MediaFactory.MFCreateMemoryBuffer(nv12Size);
+            try
+            {
+                sample.AddBuffer(memBuffer);
+                _reusableSyncCpuInputSample = sample;
+                _reusableSyncCpuInputBuffer = memBuffer;
+            }
+            catch
+            {
+                SafeDisposeComObject(memBuffer);
+                SafeDisposeComObject(sample);
+                throw;
+            }
+        }
+
+        _reusableSyncCpuInputSample.SampleTime = timestamp100Ns;
+        _reusableSyncCpuInputSample.SampleDuration = duration100Ns;
+        _reusableSyncCpuInputBuffer.CurrentLength = 0;
+        _gpuProcessor.CopyNv12ToMediaBuffer(frameTexture, _reusableSyncCpuInputBuffer);
+        usingReusableSample = true;
+        return _reusableSyncCpuInputSample;
+    }
+
+    private bool IsReusableSyncInputExclusiveLocked()
+    {
+        if (_reusableSyncCpuInputSample is null || _reusableSyncCpuInputBuffer is null)
+        {
+            return false;
+        }
+
+        nint samplePtr = _reusableSyncCpuInputSample.NativePointer;
+        nint bufferPtr = _reusableSyncCpuInputBuffer.NativePointer;
+        if (samplePtr == nint.Zero || bufferPtr == nint.Zero)
+        {
+            return false;
+        }
+
+        // Sample refcount == 1 (only our wrapper) and buffer refcount == 2 (our wrapper + sample).
+        int sampleRefs = QueryComRefCount(samplePtr);
+        int bufferRefs = QueryComRefCount(bufferPtr);
+        return sampleRefs == 1 && bufferRefs == 2;
+    }
+
+    private static int QueryComRefCount(nint comPtr)
+    {
+        Marshal.AddRef(comPtr);
+        return Marshal.Release(comPtr);
+    }
+
+    private void ReleaseReusableSyncInputSampleLocked()
+    {
+        SafeDisposeComObject(_reusableSyncCpuInputBuffer);
+        _reusableSyncCpuInputBuffer = null;
+        SafeDisposeComObject(_reusableSyncCpuInputSample);
+        _reusableSyncCpuInputSample = null;
     }
 
     private IMFSample CreateInputSample(ID3D11Texture2D frameTexture, long timestamp100Ns, long duration100Ns)
@@ -1340,12 +1477,13 @@ public sealed class MfH264Encoder : IDisposable
         {
             while (Volatile.Read(ref _stopping) == 0 && Volatile.Read(ref _disposed) == 0)
             {
-                IMFSample? nextSample = TryDequeueSampleForAvailableSlot();
-                if (nextSample is null)
+                QueuedInputItem? nextItem = TryDequeueSampleForAvailableSlot();
+                if (!nextItem.HasValue)
                 {
                     break;
                 }
 
+                IMFSample nextSample = nextItem.Value.Sample;
                 try
                 {
                     lock (_mftLock)
@@ -1355,7 +1493,7 @@ public sealed class MfH264Encoder : IDisposable
                             break;
                         }
 
-                        SubmitInputSampleLocked(nextSample);
+                        SubmitInputSampleLocked(nextSample, nextItem.Value.ForceKeyFrame);
                     }
                 }
                 catch (Exception ex)
@@ -1393,7 +1531,7 @@ public sealed class MfH264Encoder : IDisposable
         }
     }
 
-    private IMFSample? TryDequeueSampleForAvailableSlot()
+    private QueuedInputItem? TryDequeueSampleForAvailableSlot()
     {
         if (Volatile.Read(ref _availableInputSlots) <= 0)
         {
@@ -1407,7 +1545,14 @@ public sealed class MfH264Encoder : IDisposable
                 return null;
             }
 
-            return _pendingInputQueue.Dequeue();
+            QueuedInputItem item = _pendingInputQueue.Dequeue();
+            if (item.GpuTexturePtr != nint.Zero)
+            {
+                _recentInFlightGpuTextures[_recentGpuTextureCursor] = item.GpuTexturePtr;
+                _recentGpuTextureCursor = (_recentGpuTextureCursor + 1) % _recentInFlightGpuTextures.Length;
+            }
+
+            return item;
         }
     }
 
@@ -1549,19 +1694,16 @@ public sealed class MfH264Encoder : IDisposable
 
         IMFSample? callerAllocatedSample = null;
         nint callerSamplePtr = nint.Zero;
+        bool usingReusableOutputSample = false;
 
         try
         {
             if (!_mftProvidesOutputSamples)
             {
-                callerAllocatedSample = MediaFactory.MFCreateSample();
-                callerSamplePtr = callerAllocatedSample.NativePointer;
                 int bufferCapacity = Math.Max(_outputStreamInfo.Size, DefaultOutputBufferBytes);
-                using (IMFMediaBuffer memoryBuffer = MediaFactory.MFCreateMemoryBuffer(bufferCapacity))
-                {
-                    callerAllocatedSample.AddBuffer(memoryBuffer);
-                }
-
+                callerAllocatedSample = EnsureReusableOutputSampleLocked(bufferCapacity);
+                callerSamplePtr = callerAllocatedSample.NativePointer;
+                usingReusableOutputSample = true;
                 outputBuffer.Sample = callerAllocatedSample;
             }
 
@@ -1595,7 +1737,8 @@ public sealed class MfH264Encoder : IDisposable
             OutputDataBufferFlags statusFlags = (OutputDataBufferFlags)outputBuffer.Status;
             hasMoreIncompleteOutput = (statusFlags & OutputDataBufferFlags.OutputDataBufferIncomplete) != 0;
 
-            if ((statusFlags & OutputDataBufferFlags.OutputDataBufferFormatChange) != 0)
+            bool formatChanged = (statusFlags & OutputDataBufferFlags.OutputDataBufferFormatChange) != 0;
+            if (formatChanged)
             {
                 HandleOutputStreamChangeLocked();
             }
@@ -1603,7 +1746,9 @@ public sealed class MfH264Encoder : IDisposable
             IMFSample? producedSample = outputBuffer.Sample;
             if (producedSample is null || (statusFlags & OutputDataBufferFlags.OutputDataBufferNoSample) != 0)
             {
-                return ProcessOutputAttemptResult.NoOutput;
+                return formatChanged
+                    ? ProcessOutputAttemptResult.StreamChanged
+                    : ProcessOutputAttemptResult.NoOutput;
             }
 
             packet = ExtractPacketFromSample(producedSample);
@@ -1619,7 +1764,73 @@ public sealed class MfH264Encoder : IDisposable
             IMFSample? returnedSample = outputBuffer.Sample;
             outputBuffer.Sample = null;
 
-            DisposeProcessOutputSamples(callerAllocatedSample, callerSamplePtr, returnedSample);
+            if (usingReusableOutputSample)
+            {
+                CleanupReusableOutputAlias(callerAllocatedSample, callerSamplePtr, returnedSample);
+            }
+            else
+            {
+                DisposeProcessOutputSamples(callerAllocatedSample, callerSamplePtr, returnedSample);
+            }
+        }
+    }
+
+    private IMFSample EnsureReusableOutputSampleLocked(int requiredCapacity)
+    {
+        if (_reusableOutputSample is not null &&
+            _reusableOutputBuffer is not null &&
+            _reusableOutputCapacity >= requiredCapacity)
+        {
+            _reusableOutputBuffer.CurrentLength = 0;
+            return _reusableOutputSample;
+        }
+
+        ReleaseReusableOutputSampleLocked();
+
+        IMFSample sample = MediaFactory.MFCreateSample();
+        IMFMediaBuffer buffer = MediaFactory.MFCreateMemoryBuffer(requiredCapacity);
+        try
+        {
+            sample.AddBuffer(buffer);
+            _reusableOutputSample = sample;
+            _reusableOutputBuffer = buffer;
+            _reusableOutputCapacity = requiredCapacity;
+            return sample;
+        }
+        catch
+        {
+            SafeDisposeComObject(buffer);
+            SafeDisposeComObject(sample);
+            throw;
+        }
+    }
+
+    private void ReleaseReusableOutputSampleLocked()
+    {
+        SafeDisposeComObject(_reusableOutputBuffer);
+        _reusableOutputBuffer = null;
+        SafeDisposeComObject(_reusableOutputSample);
+        _reusableOutputSample = null;
+        _reusableOutputCapacity = 0;
+    }
+
+    private static void CleanupReusableOutputAlias(
+        IMFSample? reusableSample,
+        nint reusableSamplePtr,
+        IMFSample? returnedSample)
+    {
+        if (returnedSample is null || ReferenceEquals(returnedSample, reusableSample))
+        {
+            return;
+        }
+
+        if (reusableSamplePtr != nint.Zero && returnedSample.NativePointer == reusableSamplePtr)
+        {
+            DetachComAliasWithoutRelease(returnedSample);
+        }
+        else
+        {
+            SafeDisposeSample(returnedSample);
         }
     }
 
@@ -1678,8 +1889,8 @@ public sealed class MfH264Encoder : IDisposable
 
     private EncodedPacket? ExtractPacketFromSample(IMFSample sample)
     {
-        long timestamp100Ns = TryGetSampleTime(sample);
         long duration100Ns = TryGetSampleDuration(sample);
+        long timestamp100Ns = TryGetSampleTime(sample, duration100Ns);
         bool isCleanPoint = sample.GetUInt32(SampleAttributeKeys.CleanPoint, out uint cleanPoint).Success &&
                             cleanPoint != 0;
 
@@ -1760,16 +1971,32 @@ public sealed class MfH264Encoder : IDisposable
         }
     }
 
-    private long TryGetSampleTime(IMFSample sample)
+    private long TryGetSampleTime(IMFSample sample, long fallbackDuration100Ns)
     {
+        long candidate;
         try
         {
-            return sample.SampleTime;
+            candidate = sample.SampleTime;
         }
         catch (SharpGenException)
         {
-            return 0L;
+            candidate = _lastOutputTimestamp100Ns >= 0
+                ? _lastOutputTimestamp100Ns + fallbackDuration100Ns
+                : 0L;
         }
+
+        if (candidate < 0)
+        {
+            candidate = 0L;
+        }
+
+        if (_lastOutputTimestamp100Ns >= 0 && candidate <= _lastOutputTimestamp100Ns)
+        {
+            candidate = _lastOutputTimestamp100Ns + 1;
+        }
+
+        _lastOutputTimestamp100Ns = candidate;
+        return candidate;
     }
 
     private long TryGetSampleDuration(IMFSample sample)
@@ -2024,7 +2251,7 @@ public sealed class MfH264Encoder : IDisposable
                 if (nalOffset < data.Length)
                 {
                     int nalType = data[nalOffset] & 0x1F;
-                    if (nalType is 5 or 7) // IDR slice (5) or SPS (7)
+                    if (nalType == 5) // True H.264 IDR slice (never treat standalone SPS/PPS as a keyframe)
                     {
                         return true;
                     }
@@ -2104,13 +2331,16 @@ public sealed class MfH264Encoder : IDisposable
         {
             while (_pendingInputQueue.Count > 0)
             {
-                SafeDisposeSample(_pendingInputQueue.Dequeue());
+                SafeDisposeSample(_pendingInputQueue.Dequeue().Sample);
             }
+
+            Array.Clear(_recentInFlightGpuTextures);
         }
 
+        bool inputFeederExited = true;
         if (_inputFeederThread is not null && _inputFeederThread != Thread.CurrentThread)
         {
-            _inputFeederThread.Join(1000);
+            inputFeederExited = _inputFeederThread.Join(2000);
         }
 
         _inputFeederThread = null;
@@ -2183,9 +2413,10 @@ public sealed class MfH264Encoder : IDisposable
             DisposePacketList(remainingSyncPackets);
         }
 
+        bool eventThreadExited = true;
         if (_eventThread is not null && _eventThread != Thread.CurrentThread)
         {
-            _eventThread.Join(1000);
+            eventThreadExited = _eventThread.Join(2000);
         }
 
         _eventThread = null;
@@ -2194,12 +2425,25 @@ public sealed class MfH264Encoder : IDisposable
         {
             while (_pendingInputQueue.Count > 0)
             {
-                SafeDisposeSample(_pendingInputQueue.Dequeue());
+                SafeDisposeSample(_pendingInputQueue.Dequeue().Sample);
             }
+
+            Array.Clear(_recentInFlightGpuTextures);
+        }
+
+        if (!inputFeederExited || !eventThreadExited)
+        {
+            EngineLogger.Warn(
+                "MfH264Encoder",
+                $"Async encoder threads did not exit cleanly (feederExited={inputFeederExited}, eventExited={eventThreadExited}); skipping unsafe COM/MF teardown.");
+            return;
         }
 
         lock (_mftLock)
         {
+            ReleaseReusableSyncInputSampleLocked();
+            ReleaseReusableOutputSampleLocked();
+
             SafeDisposeComObject(_eventGenerator);
             _eventGenerator = null;
 
@@ -2229,6 +2473,8 @@ public sealed class MfH264Encoder : IDisposable
             }
         }
     }
+
+    private readonly record struct QueuedInputItem(IMFSample Sample, nint GpuTexturePtr, bool ForceKeyFrame);
 
     private enum ProcessOutputAttemptResult
     {

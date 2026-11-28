@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 title ClipThat - Aktualizacja...
 cd /d "%~dp0"
 
@@ -8,8 +8,13 @@ set "APP_DIR=%~dp0"
 
 (
     echo Zamykanie uruchomionej instancji ClipThat...
-    taskkill /F /IM ClipThat.exe >nul 2>&1
-    timeout /t 1 /nobreak >nul 2>&1
+    taskkill /IM ClipThat.exe >nul 2>&1
+    timeout /t 2 /nobreak >nul 2>&1
+    tasklist /FI "IMAGENAME eq ClipThat.exe" 2>nul | find /I "ClipThat.exe" >nul
+    if not errorlevel 1 (
+        taskkill /F /IM ClipThat.exe >nul 2>&1
+        timeout /t 1 /nobreak >nul 2>&1
+    )
 
     if exist "%APP_DIR%.git" (
         where git >nul 2>&1
@@ -31,13 +36,13 @@ set "APP_DIR=%~dp0"
                 exit /b 1
             )
             echo Aktualizacja zakonczona. Uruchamianie ClipThat...
-            call "%APP_DIR%Start_ClipThat.bat"
-            exit /b %errorlevel%
+            call "%APP_DIR%Start_ClipThat.bat" --rebuild
+            exit /b !errorlevel!
         )
     )
 
     echo Pobieranie najnowszej wersji ClipThat z GitHub...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $appDir = (Resolve-Path -LiteralPath $env:APP_DIR).Path; $id = [Guid]::NewGuid().ToString('N'); $zipPath = Join-Path $env:TEMP ('ClipThat-update-' + $id + '.zip'); $extractDir = Join-Path $env:TEMP ('ClipThat-update-' + $id); try { Invoke-WebRequest -Uri $env:REPO_ZIP_URL -OutFile $zipPath -UseBasicParsing; Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force; $srcRoot = Get-ChildItem -Path $extractDir -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'ClipThat.csproj') } | Select-Object -First 1; if (-not $srcRoot) { throw 'Pobrane archiwum nie zawiera pliku ClipThat.csproj.' }; foreach ($dirName in @('Engine', 'Models', 'Services', 'UI')) { $srcSub = Join-Path $srcRoot.FullName $dirName; $dstSub = Join-Path $appDir $dirName; if (Test-Path $srcSub) { if (Test-Path $dstSub) { Remove-Item -Path $dstSub -Recurse -Force }; Copy-Item -Path $srcSub -Destination $dstSub -Recurse -Force } }; $srcAssets = Join-Path $srcRoot.FullName 'Assets'; $dstAssets = Join-Path $appDir 'Assets'; if (Test-Path $srcAssets) { New-Item -ItemType Directory -Force -Path $dstAssets | Out-Null; Get-ChildItem -Path $srcAssets -File | ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path $dstAssets $_.Name) -Force } }; Get-ChildItem -Path $srcRoot.FullName -File | ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path $appDir $_.Name) -Force }; Get-ChildItem -Path $appDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\(bin|obj|ReleaseBuild)\\' } | Unblock-File -ErrorAction SilentlyContinue } finally { Remove-Item -Path $zipPath, $extractDir -Recurse -Force -ErrorAction SilentlyContinue }"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; $appDir = (Resolve-Path -LiteralPath $env:APP_DIR).Path; $id = [Guid]::NewGuid().ToString('N'); $zipPath = Join-Path $env:TEMP ('ClipThat-update-' + $id + '.zip'); $extractDir = Join-Path $env:TEMP ('ClipThat-update-' + $id); $backupDir = Join-Path $env:TEMP ('ClipThat-backup-' + $id); $replacedDirs = @(); try { Invoke-WebRequest -Uri $env:REPO_ZIP_URL -OutFile $zipPath -UseBasicParsing; Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force; $srcRoot = Get-ChildItem -Path $extractDir -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'ClipThat.csproj') } | Select-Object -First 1; if (-not $srcRoot) { throw 'Pobrane archiwum nie zawiera pliku ClipThat.csproj.' }; New-Item -ItemType Directory -Force -Path $backupDir | Out-Null; foreach ($dirName in @('Engine', 'Models', 'Services', 'UI')) { $srcSub = Join-Path $srcRoot.FullName $dirName; $dstSub = Join-Path $appDir $dirName; $bakSub = Join-Path $backupDir $dirName; if (Test-Path $srcSub) { if (Test-Path $dstSub) { Move-Item -Path $dstSub -Destination $bakSub -Force }; $replacedDirs += $dirName; Copy-Item -Path $srcSub -Destination $dstSub -Recurse -Force } }; $srcAssets = Join-Path $srcRoot.FullName 'Assets'; $dstAssets = Join-Path $appDir 'Assets'; if (Test-Path $srcAssets) { New-Item -ItemType Directory -Force -Path $dstAssets | Out-Null; Get-ChildItem -Path $srcAssets -File | ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path $dstAssets $_.Name) -Force } }; Get-ChildItem -Path $srcRoot.FullName -File | ForEach-Object { Copy-Item -Path $_.FullName -Destination (Join-Path $appDir $_.Name) -Force }; Get-ChildItem -Path $appDir -File -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\(bin|obj|ReleaseBuild)\\' } | Unblock-File -ErrorAction SilentlyContinue } catch { foreach ($dirName in $replacedDirs) { $dstSub = Join-Path $appDir $dirName; $bakSub = Join-Path $backupDir $dirName; if (Test-Path $bakSub) { if (Test-Path $dstSub) { Remove-Item -Path $dstSub -Recurse -Force -ErrorAction SilentlyContinue }; Move-Item -Path $bakSub -Destination $dstSub -Force -ErrorAction SilentlyContinue } }; throw } finally { Remove-Item -Path $zipPath, $extractDir, $backupDir -Recurse -Force -ErrorAction SilentlyContinue }"
     if errorlevel 1 (
         echo.
         echo Blad podczas pobierania lub rozpakowywania aktualizacji z GitHub.
@@ -48,6 +53,6 @@ set "APP_DIR=%~dp0"
     )
 
     echo Aktualizacja plikow zakonczona. Budowanie i uruchamianie ClipThat...
-    call "%APP_DIR%Start_ClipThat.bat"
-    exit /b %errorlevel%
+    call "%APP_DIR%Start_ClipThat.bat" --rebuild
+    exit /b !errorlevel!
 )

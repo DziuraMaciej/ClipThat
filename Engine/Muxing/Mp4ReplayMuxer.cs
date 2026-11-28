@@ -142,9 +142,9 @@ public sealed class Mp4ReplayMuxer
             throw new InvalidOperationException("Brak pakietów wideo do zapisania w pliku MP4.");
         }
 
-        // Only include the 3-track layout (System + Mic + CombinedMix last) when microphone packets are present;
-        // otherwise fall back to SystemAudio as Stream 1.
-        bool includeCombinedMix = hasMicrophoneAudio && hasCombinedMixAudio;
+        // Only include the 3-track layout (System + Mic + CombinedMix last) when BOTH system and microphone
+        // audio tracks are present; otherwise write only the single available track.
+        bool includeCombinedMix = hasSystemAudio && hasMicrophoneAudio && hasCombinedMixAudio;
 
         // Stable timestamp ordering ensures smooth MP4 interleaving across video and audio streams
         // while preserving deterministic track priority (Video -> SystemAudio -> MicrophoneAudio -> CombinedMixAudio)
@@ -162,8 +162,10 @@ public sealed class Mp4ReplayMuxer
         });
 
         Directory.CreateDirectory(outputDirectory);
-        string fileName = DateTime.Now.ToString("ssmmHHddMMyyyy") + ".mp4";
-        string outputFilePath = Path.Combine(outputDirectory, fileName);
+        string baseFileName = DateTime.Now.ToString("ssmmHHddMMyyyy", CultureInfo.InvariantCulture);
+        // Write to a non-.mp4 temp file first so FileSystemWatcher("*.mp4") never scans partial files
+        // and concurrent same-second saves never collide or corrupt each other.
+        string tempOutputPath = Path.Combine(outputDirectory, $".clipthat_mux_{Guid.NewGuid():N}.tmp");
 
         byte[]? videoSequenceHeader = snapshot.VideoSequenceHeader is { Length: > 0 }
             ? snapshot.VideoSequenceHeader
@@ -171,58 +173,99 @@ public sealed class Mp4ReplayMuxer
 
         try
         {
-            MuxWithMediaFoundation(
-                snapshot,
-                orderedPackets,
-                baseTimestamp100Ns,
-                outputFilePath,
-                evenWidth,
-                evenHeight,
-                fps,
-                videoBitrateBps,
-                videoSequenceHeader,
-                hasSystemAudio,
-                hasMicrophoneAudio,
-                includeCombinedMix);
-
-            EngineLogger.Info("Mp4ReplayMuxer", $"Saved replay via Media Foundation SinkWriter: \"{outputFilePath}\"");
-            return outputFilePath;
-        }
-        catch (Exception mfEx)
-        {
-            EngineLogger.Warn(
-                "Mp4ReplayMuxer",
-                $"Media Foundation SinkWriter mux failed ({mfEx.Message}); attempting portable embedded FFmpeg fallback.",
-                mfEx);
-
-            TryDeletePartialFile(outputFilePath);
-
             try
             {
-                MuxWithPortableFfmpeg(
+                MuxWithMediaFoundation(
+                    snapshot,
                     orderedPackets,
-                    outputFilePath,
+                    baseTimestamp100Ns,
+                    tempOutputPath,
+                    evenWidth,
+                    evenHeight,
                     fps,
+                    videoBitrateBps,
                     videoSequenceHeader,
                     hasSystemAudio,
                     hasMicrophoneAudio,
                     includeCombinedMix);
 
-                EngineLogger.Info("Mp4ReplayMuxer", $"Saved replay via portable FFmpeg fallback: \"{outputFilePath}\"");
-                return outputFilePath;
+                string finalPath = CommitTempReplayFile(tempOutputPath, outputDirectory, baseFileName);
+                EngineLogger.Info("Mp4ReplayMuxer", $"Saved replay via Media Foundation SinkWriter: \"{finalPath}\"");
+                return finalPath;
             }
-            catch (Exception ffmpegEx)
+            catch (Exception mfEx)
             {
-                EngineLogger.Error(
+                EngineLogger.Warn(
                     "Mp4ReplayMuxer",
-                    $"Portable FFmpeg fallback mux also failed for \"{outputFilePath}\".",
-                    ffmpegEx);
-                TryDeletePartialFile(outputFilePath);
-                throw new InvalidOperationException(
-                    $"Nie udało się zapisać pliku MP4 (Media Foundation: {mfEx.Message}; FFmpeg: {ffmpegEx.Message})",
-                    ffmpegEx);
+                    $"Media Foundation SinkWriter mux failed ({mfEx.Message}); attempting portable embedded FFmpeg fallback.",
+                    mfEx);
+
+                TryDeletePartialFile(tempOutputPath);
+
+                try
+                {
+                    MuxWithPortableFfmpeg(
+                        orderedPackets,
+                        baseTimestamp100Ns,
+                        tempOutputPath,
+                        fps,
+                        videoSequenceHeader,
+                        hasSystemAudio,
+                        hasMicrophoneAudio,
+                        includeCombinedMix);
+
+                    string finalPath = CommitTempReplayFile(tempOutputPath, outputDirectory, baseFileName);
+                    EngineLogger.Info("Mp4ReplayMuxer", $"Saved replay via portable FFmpeg fallback: \"{finalPath}\"");
+                    return finalPath;
+                }
+                catch (Exception ffmpegEx)
+                {
+                    EngineLogger.Error(
+                        "Mp4ReplayMuxer",
+                        $"Portable FFmpeg fallback mux also failed in \"{outputDirectory}\".",
+                        ffmpegEx);
+                    TryDeletePartialFile(tempOutputPath);
+                    throw new InvalidOperationException(
+                        $"Nie udało się zapisać pliku MP4 (Media Foundation: {mfEx.Message}; FFmpeg: {ffmpegEx.Message})",
+                        ffmpegEx);
+                }
             }
         }
+        catch
+        {
+            TryDeletePartialFile(tempOutputPath);
+            throw;
+        }
+    }
+
+    private static string CommitTempReplayFile(string tempFilePath, string outputDirectory, string baseFileName)
+    {
+        for (int suffix = 1; suffix < 10_000; suffix++)
+        {
+            string candidateName = suffix == 1
+                ? $"{baseFileName}.mp4"
+                : $"{baseFileName}_{suffix}.mp4";
+            string candidatePath = Path.Combine(outputDirectory, candidateName);
+
+            if (File.Exists(candidatePath))
+            {
+                continue;
+            }
+
+            try
+            {
+                File.Move(tempFilePath, candidatePath, overwrite: false);
+                return candidatePath;
+            }
+            catch (IOException) when (File.Exists(candidatePath))
+            {
+                // Another concurrent save claimed this exact filename; advance to next suffix.
+            }
+        }
+
+        string uniqueFallback = Path.Combine(outputDirectory, $"{baseFileName}_{Guid.NewGuid():N}.mp4");
+        File.Move(tempFilePath, uniqueFallback, overwrite: false);
+        return uniqueFallback;
     }
 
     private static void MuxWithMediaFoundation(
@@ -432,6 +475,7 @@ public sealed class Mp4ReplayMuxer
 
     private static void MuxWithPortableFfmpeg(
         List<IndexedPacket> orderedPackets,
+        long baseTimestamp100Ns,
         string outputFilePath,
         int fps,
         byte[]? videoSequenceHeader,
@@ -439,6 +483,8 @@ public sealed class Mp4ReplayMuxer
         bool hasMicrophoneAudio,
         bool includeCombinedMix)
     {
+        const int FfmpegFallbackTimeoutMs = 120_000;
+
         string? ffmpegPath = PortableFfmpegProvider.TryEnsureExtracted();
         if (string.IsNullOrWhiteSpace(ffmpegPath) || !File.Exists(ffmpegPath))
         {
@@ -456,6 +502,11 @@ public sealed class Mp4ReplayMuxer
             string? mixAudioPath = includeCombinedMix ? Path.Combine(tempDir, "mix.aac") : null;
 
             bool wroteVideoHeader = false;
+            int videoFrameCount = 0;
+            long lastVideoTimestamp100Ns = baseTimestamp100Ns;
+            long firstSysAudioOffset100Ns = -1;
+            long firstMicAudioOffset100Ns = -1;
+            long firstMixAudioOffset100Ns = -1;
             Span<byte> adtsHeader = stackalloc byte[7];
 
             using (var videoStream = new FileStream(videoPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
@@ -480,20 +531,50 @@ public sealed class Mp4ReplayMuxer
                             }
 
                             videoStream.Write(packet.Data);
+                            videoFrameCount++;
+                            if (packet.Timestamp100Ns > lastVideoTimestamp100Ns)
+                            {
+                                lastVideoTimestamp100Ns = packet.Timestamp100Ns;
+                            }
                             break;
 
                         case MediaTrackType.SystemAudio when sysStream is not null:
+                            if (firstSysAudioOffset100Ns < 0)
+                            {
+                                firstSysAudioOffset100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
+                            }
                             WriteAdtsAacFrame(sysStream, packet.Data, adtsHeader);
                             break;
 
                         case MediaTrackType.MicrophoneAudio when micStream is not null:
+                            if (firstMicAudioOffset100Ns < 0)
+                            {
+                                firstMicAudioOffset100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
+                            }
                             WriteAdtsAacFrame(micStream, packet.Data, adtsHeader);
                             break;
 
                         case MediaTrackType.CombinedMixAudio when mixStream is not null:
+                            if (firstMixAudioOffset100Ns < 0)
+                            {
+                                firstMixAudioOffset100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
+                            }
                             WriteAdtsAacFrame(mixStream, packet.Data, adtsHeader);
                             break;
                     }
+                }
+            }
+
+            // Compute effective average frame rate from actual VFR span so video duration matches audio
+            // instead of fast-forwarding whenever static-desktop gaps or dropped frames occurred.
+            double effectiveFps = fps;
+            double videoSpanSeconds = (lastVideoTimestamp100Ns - baseTimestamp100Ns) / (double)TimeSpan.TicksPerSecond;
+            if (videoFrameCount >= 2 && videoSpanSeconds >= 0.25)
+            {
+                double measuredFps = (videoFrameCount - 1) / videoSpanSeconds;
+                if (measuredFps >= 1.0 && measuredFps <= fps * 1.1)
+                {
+                    effectiveFps = measuredFps;
                 }
             }
 
@@ -510,8 +591,10 @@ public sealed class Mp4ReplayMuxer
             startInfo.ArgumentList.Add("-loglevel");
             startInfo.ArgumentList.Add("error");
             startInfo.ArgumentList.Add("-y");
+            startInfo.ArgumentList.Add("-fflags");
+            startInfo.ArgumentList.Add("+genpts");
             startInfo.ArgumentList.Add("-r");
-            startInfo.ArgumentList.Add(fps.ToString(CultureInfo.InvariantCulture));
+            startInfo.ArgumentList.Add(effectiveFps.ToString("0.###", CultureInfo.InvariantCulture));
             startInfo.ArgumentList.Add("-f");
             startInfo.ArgumentList.Add("h264");
             startInfo.ArgumentList.Add("-i");
@@ -520,10 +603,17 @@ public sealed class Mp4ReplayMuxer
             var audioInputIndices = new List<int>(3);
             int nextInputIndex = 1;
 
-            void AddAudioInputIfValid(string? path)
+            void AddAudioInputIfValid(string? path, long initialOffset100Ns)
             {
                 if (path is not null && File.Exists(path) && new FileInfo(path).Length > 0)
                 {
+                    if (initialOffset100Ns > TimeSpan.TicksPerMillisecond * 20)
+                    {
+                        double offsetSeconds = initialOffset100Ns / (double)TimeSpan.TicksPerSecond;
+                        startInfo.ArgumentList.Add("-itsoffset");
+                        startInfo.ArgumentList.Add(offsetSeconds.ToString("0.###", CultureInfo.InvariantCulture));
+                    }
+
                     startInfo.ArgumentList.Add("-f");
                     startInfo.ArgumentList.Add("aac");
                     startInfo.ArgumentList.Add("-i");
@@ -532,9 +622,9 @@ public sealed class Mp4ReplayMuxer
                 }
             }
 
-            AddAudioInputIfValid(sysAudioPath);
-            AddAudioInputIfValid(micAudioPath);
-            AddAudioInputIfValid(mixAudioPath);
+            AddAudioInputIfValid(sysAudioPath, firstSysAudioOffset100Ns);
+            AddAudioInputIfValid(micAudioPath, firstMicAudioOffset100Ns);
+            AddAudioInputIfValid(mixAudioPath, firstMixAudioOffset100Ns);
 
             startInfo.ArgumentList.Add("-map");
             startInfo.ArgumentList.Add("0:v:0");
@@ -558,8 +648,22 @@ public sealed class Mp4ReplayMuxer
                 throw new InvalidOperationException("Nie udało się uruchomić procesu ffmpeg.exe.");
             }
 
-            string stderr = process.StandardError.ReadToEnd();
-            process.WaitForExit();
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(FfmpegFallbackTimeoutMs))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Process may have already exited.
+                }
+
+                throw new TimeoutException("Zapasowy zapis MP4 przez FFmpeg przekroczył limit czasu.");
+            }
+
+            string stderr = stderrTask.GetAwaiter().GetResult();
 
             if (process.ExitCode != 0 || !File.Exists(outputFilePath))
             {
@@ -968,9 +1072,13 @@ public sealed class Mp4ReplayMuxer
                         {
                             uint timescale = BinaryPrimitives.ReadUInt32BigEndian(buffer12[..4]);
                             uint rawDuration = BinaryPrimitives.ReadUInt32BigEndian(buffer12[4..8]);
-                            if (timescale > 0 && rawDuration > 0)
+                            if (timescale > 0 && rawDuration > 0 && rawDuration != uint.MaxValue)
                             {
-                                duration = TimeSpan.FromSeconds((double)rawDuration / timescale);
+                                double seconds = (double)rawDuration / timescale;
+                                if (double.IsFinite(seconds) && seconds > 0 && seconds < TimeSpan.MaxValue.TotalSeconds)
+                                {
+                                    duration = TimeSpan.FromSeconds(seconds);
+                                }
                             }
                         }
                     }
@@ -981,9 +1089,13 @@ public sealed class Mp4ReplayMuxer
                         {
                             uint timescale = BinaryPrimitives.ReadUInt32BigEndian(buffer12[..4]);
                             ulong rawDuration = BinaryPrimitives.ReadUInt64BigEndian(buffer12[4..12]);
-                            if (timescale > 0 && rawDuration > 0)
+                            if (timescale > 0 && rawDuration > 0 && rawDuration != ulong.MaxValue)
                             {
-                                duration = TimeSpan.FromSeconds((double)rawDuration / timescale);
+                                double seconds = (double)rawDuration / timescale;
+                                if (double.IsFinite(seconds) && seconds > 0 && seconds < TimeSpan.MaxValue.TotalSeconds)
+                                {
+                                    duration = TimeSpan.FromSeconds(seconds);
+                                }
                             }
                         }
                     }

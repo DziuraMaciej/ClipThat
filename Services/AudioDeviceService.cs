@@ -17,7 +17,6 @@ public sealed class AudioDeviceService : IDisposable
     public const string DefaultRenderDeviceLabel = "Domyślne urządzenie systemowe (automatyczne)";
     public const string DefaultCaptureDeviceLabel = "Domyślny mikrofon systemowy (automatyczny)";
     public const string DisabledMicrophoneLabel = "Wyłączony";
-    public const string DefaultDeviceLabel = DefaultRenderDeviceLabel;
 
     private readonly object _watcherLock = new();
     private MMDeviceEnumerator? _notificationEnumerator;
@@ -52,15 +51,6 @@ public sealed class AudioDeviceService : IDisposable
     /// </summary>
     public IReadOnlyList<AudioDeviceInfo> GetCaptureDevices()
         => EnumerateDevices(DataFlow.Capture, includeDisabledOption: true);
-
-    /// <summary>
-    /// Returns <see langword="true"/> when at least one active microphone capture device is available.
-    /// </summary>
-    public bool HasActiveCaptureDevice()
-    {
-        IReadOnlyList<AudioDeviceInfo> devices = GetCaptureDevices();
-        return devices.Any(d => !d.IsDefaultOption && !d.IsDisabledOption);
-    }
 
     /// <summary>
     /// Resolves a concrete active <see cref="MMDevice"/> for the specified <paramref name="dataFlow"/> and optional

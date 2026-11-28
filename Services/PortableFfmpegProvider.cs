@@ -23,11 +23,28 @@ public static class PortableFfmpegProvider
     public static string ExtractedFfmpegPath => Path.Combine(BinDirectory, "ffmpeg.exe");
 
     /// <summary>
+    /// Returns <see langword="true"/> when an embedded <c>ffmpeg.exe</c> resource exists and is already
+    /// validly extracted to <see cref="ExtractedFfmpegPath"/>.
+    /// </summary>
+    public static bool IsAlreadyExtracted()
+    {
+        Assembly assembly = typeof(PortableFfmpegProvider).Assembly;
+        string? resourceName = ResolveEmbeddedResourceName(assembly);
+        return resourceName is not null && IsExtractedFileValid(assembly, resourceName, ExtractedFfmpegPath);
+    }
+
+    /// <summary>
     /// Ensures the embedded <c>ffmpeg.exe</c> is extracted to <c>%LocalAppData%\ClipThat\bin\ffmpeg.exe</c>
     /// and returns its path, or <see langword="null"/> if no embedded resource is present in the assembly.
     /// </summary>
     public static string? TryEnsureExtracted()
     {
+        string? adjacentPath = ResolveAdjacentFfmpegPath();
+        if (adjacentPath is not null)
+        {
+            return adjacentPath;
+        }
+
         Assembly assembly = typeof(PortableFfmpegProvider).Assembly;
         string? resourceName = ResolveEmbeddedResourceName(assembly);
         if (resourceName is null)
@@ -56,6 +73,23 @@ public static class PortableFfmpegProvider
         {
             ExtractionGate.Release();
         }
+    }
+
+    private static string? ResolveAdjacentFfmpegPath()
+    {
+        string baseDirCandidate = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+        if (File.Exists(baseDirCandidate))
+        {
+            return baseDirCandidate;
+        }
+
+        string toolsCandidate = Path.Combine(AppContext.BaseDirectory, "Tools", "ffmpeg.exe");
+        if (File.Exists(toolsCandidate))
+        {
+            return toolsCandidate;
+        }
+
+        return null;
     }
 
     /// <summary>

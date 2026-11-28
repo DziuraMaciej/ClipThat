@@ -31,6 +31,10 @@ public interface IFrameCaptureSource : IDisposable
 
     string CaptureBackendName { get; }
 
+    int CaptureWidth { get; }
+
+    int CaptureHeight { get; }
+
     int CapturedFrameCount { get; }
 
     void Start();

@@ -208,7 +208,7 @@ public sealed class GlobalHotkeyService : IDisposable
 
     private nint WndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
     {
-        if (msg == WmHotkey && wParam.ToInt32() == ReplayHotkeyId && Volatile.Read(ref _disposed) == 0)
+        if (msg == WmHotkey && wParam == (nint)ReplayHotkeyId && Volatile.Read(ref _disposed) == 0)
         {
             handled = true;
             HotkeyPressed?.Invoke(this, EventArgs.Empty);

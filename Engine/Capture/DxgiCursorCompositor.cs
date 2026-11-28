@@ -28,7 +28,7 @@ cbuffer CursorParams : register(b0)
     float4 CursorRectPx;
     float2 ScreenSizePx;
     uint   CursorType;
-    uint   Reserved;
+    uint   IsHdrLinear;
 };
 
 Texture2D<float4> DesktopTex : register(t0);
@@ -63,18 +63,31 @@ VSOut VSMain(uint id : SV_VertexID)
     return o;
 }
 
+float3 SampleDesktopSdr(float2 uv)
+{
+    float4 rawBg = DesktopTex.Sample(PointSampler, uv);
+    if (IsHdrLinear != 0u)
+    {
+        // Windows scRGB HDR (1.0 = 80 nits): soft Reinhard tone-map + linear-to-sRGB gamma.
+        float3 hdr = max(rawBg.rgb, 0.0) * 0.4;
+        float3 mapped = hdr / (1.0 + hdr);
+        return pow(saturate(mapped), 1.0 / 2.2);
+    }
+    return saturate(rawBg.rgb);
+}
+
 float4 PSMain(VSOut input) : SV_Target
 {
-    float4 bg = saturate(DesktopTex.Sample(PointSampler, input.DesktopUv));
+    float3 bgRgb = SampleDesktopSdr(input.DesktopUv);
     if (CursorType == 0u)
     {
-        return float4(bg.rgb, 1.0);
+        return float4(bgRgb, 1.0);
     }
 
     float4 cur = CursorTex.Sample(PointSampler, input.CursorUv);
     if (CursorType == 2u)
     {
-        float3 blended = lerp(bg.rgb, cur.rgb, cur.a);
+        float3 blended = lerp(bgRgb, cur.rgb, cur.a);
         return float4(blended, 1.0);
     }
 
@@ -82,14 +95,14 @@ float4 PSMain(VSOut input) : SV_Target
     {
         if (cur.a > 0.5)
         {
-            uint3 bgU = (uint3)round(bg.rgb * 255.0);
+            uint3 bgU = (uint3)round(bgRgb * 255.0);
             uint3 curU = (uint3)round(cur.rgb * 255.0);
             return float4((float3)(bgU ^ curU) / 255.0, 1.0);
         }
         return float4(cur.rgb, 1.0);
     }
 
-    uint3 bgU = (uint3)round(bg.rgb * 255.0);
+    uint3 bgU = (uint3)round(bgRgb * 255.0);
     uint3 andMask = cur.r > 0.5 ? uint3(255u, 255u, 255u) : uint3(0u, 0u, 0u);
     uint3 xorMask = cur.g > 0.5 ? uint3(255u, 255u, 255u) : uint3(0u, 0u, 0u);
     return float4((float3)((bgU & andMask) ^ xorMask) / 255.0, 1.0);
@@ -234,8 +247,9 @@ float4 PSMain(VSOut input) : SV_Target
                 return;
             }
 
+            uint minPitch = (width + 7u) / 8u;
             long requiredBytes = (long)pitch * height;
-            if (shapeDataLength < requiredBytes)
+            if (pitch < minPitch || shapeDataLength < requiredBytes)
             {
                 return;
             }
@@ -328,6 +342,8 @@ float4 PSMain(VSOut input) : SV_Target
 
         EnsureCompositedTarget();
 
+        uint isHdrLinear = _desktopFormat == Format.R16G16B16A16_Float ? 1u : 0u;
+
         if (isNativeBgra)
         {
             // Fast GPU-to-GPU blit of the clean desktop, followed by a tiny cursor-only quad draw.
@@ -345,7 +361,7 @@ float4 PSMain(VSOut input) : SV_Target
                 ScreenWidth = _desktopWidth,
                 ScreenHeight = _desktopHeight,
                 CursorType = ModeFullscreenCopy,
-                Reserved = 0u
+                IsHdrLinear = isHdrLinear
             }, bindCursorSrv: false);
         }
 
@@ -360,7 +376,7 @@ float4 PSMain(VSOut input) : SV_Target
                 ScreenWidth = _desktopWidth,
                 ScreenHeight = _desktopHeight,
                 CursorType = _cursorShapeType,
-                Reserved = 0u
+                IsHdrLinear = isHdrLinear
             }, bindCursorSrv: true);
         }
 
@@ -413,7 +429,11 @@ float4 PSMain(VSOut input) : SV_Target
 
     private void EnsureDesktopSurfaces(uint width, uint height, Format format)
     {
-        Format effectiveFormat = format == Format.Unknown ? Format.B8G8R8A8_UNorm : format;
+        // Map B8G8R8A8_UNorm_SRgb to B8G8R8A8_UNorm so CopyResource copies raw sRGB bytes without
+        // causing D3D11 SRV sRGB->linear darkening under the cursor bounding box.
+        Format effectiveFormat = format is Format.Unknown or Format.B8G8R8A8_UNorm_SRgb
+            ? Format.B8G8R8A8_UNorm
+            : format;
         if (_cleanDesktopTexture is not null &&
             _desktopWidth == width &&
             _desktopHeight == height &&
@@ -679,7 +699,7 @@ float4 PSMain(VSOut input) : SV_Target
         public float ScreenWidth;
         public float ScreenHeight;
         public uint CursorType;
-        public uint Reserved;
+        public uint IsHdrLinear;
     }
 
     [DllImport("d3dcompiler_47.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]

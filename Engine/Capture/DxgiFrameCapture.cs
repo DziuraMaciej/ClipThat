@@ -30,6 +30,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
         Format.R16G16B16A16_Float
     };
 
+    private readonly string? _monitorDeviceName;
     private readonly long _frameIntervalTicks;
     private readonly Stopwatch _sessionClock;
     private readonly ID3D11Device _device;
@@ -40,6 +41,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
     private readonly Action<Exception> _onFrameError;
     private readonly ManualResetEventSlim _stopEvent = new(initialState: false);
 
+    private nint _monitorHandle;
     private IDXGIOutputDuplication? _duplication;
     private Thread? _captureThread;
     private byte[] _pointerShapeBuffer = Array.Empty<byte>();
@@ -65,6 +67,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
         ArgumentNullException.ThrowIfNull(onSessionClosed);
         ArgumentNullException.ThrowIfNull(onFrameError);
 
+        _monitorDeviceName = monitorDeviceName;
         int normalizedFps = targetFps == 30 ? 30 : 60;
         _frameIntervalTicks = TimeSpan.TicksPerSecond / normalizedFps;
         _sessionClock = sessionClock;
@@ -81,7 +84,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
         try
         {
             nint monitorHandle = CaptureInterop.ResolveMonitorHandle(monitorDeviceName);
-            MonitorHandle = monitorHandle;
+            _monitorHandle = monitorHandle;
 
             MonitorDeviceFactory.MatchedDeviceInfo deviceInfo = MonitorDeviceFactory.CreateD3D11DeviceForMonitor(
                 monitorHandle,
@@ -117,6 +120,8 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
             _immediateContext = immediateContext;
             _duplication = duplication;
             _cursorCompositor = cursorCompositor;
+            CaptureWidth = (int)duplDesc.ModeDescription.Width;
+            CaptureHeight = (int)duplDesc.ModeDescription.Height;
 
             EngineLogger.Info(
                 "DxgiFrameCapture",
@@ -148,7 +153,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
     public ID3D11DeviceContext ImmediateContext => _immediateContext;
 
-    public nint MonitorHandle { get; }
+    public nint MonitorHandle => _monitorHandle;
 
     public string AdapterName { get; }
 
@@ -161,6 +166,10 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
     public bool MatchedMonitorAdapter { get; }
 
     public string CaptureBackendName => "DXGI Desktop Duplication";
+
+    public int CaptureWidth { get; }
+
+    public int CaptureHeight { get; }
 
     public int CapturedFrameCount => Volatile.Read(ref _capturedFrameCount);
 
@@ -184,27 +193,30 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
     public void StopCapture()
     {
-        if (Interlocked.Exchange(ref _stopped, 1) != 0)
+        _ = StopCaptureAndWaitForExit(timeoutMs: 3000);
+    }
+
+    private bool StopCaptureAndWaitForExit(int timeoutMs)
+    {
+        if (Interlocked.Exchange(ref _stopped, 1) == 0)
         {
-            return;
+            try
+            {
+                _stopEvent.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed.
+            }
         }
 
-        try
-        {
-            _stopEvent.Set();
-        }
-        catch (ObjectDisposedException)
-        {
-            // Already disposed.
-        }
-
-        Thread? thread = _captureThread;
+        Thread? thread = Interlocked.Exchange(ref _captureThread, null);
         if (thread is not null && thread != Thread.CurrentThread)
         {
-            thread.Join(2000);
+            return thread.Join(timeoutMs);
         }
 
-        _captureThread = null;
+        return true;
     }
 
     private void CaptureLoop()
@@ -212,6 +224,24 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
         // DuplicateOutput1 requires Per-Monitor DPI Awareness V2 on the calling thread.
         TrySetThreadDpiAwarenessV2();
 
+        // Request 1 ms system timer resolution while capturing so 60 FPS pacing and short sleeps
+        // do not snap to Windows' default 15.6 ms timer tick.
+        bool timerPeriodRaised = timeBeginPeriod(1) == 0;
+        try
+        {
+            CaptureLoopCore();
+        }
+        finally
+        {
+            if (timerPeriodRaised)
+            {
+                _ = timeEndPeriod(1);
+            }
+        }
+    }
+
+    private void CaptureLoopCore()
+    {
         int consecutiveAccessLost = 0;
         int consecutiveErrors = 0;
         long nextSlotTicks = _sessionClock.Elapsed.Ticks;
@@ -255,9 +285,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                 // and 1000Hz gaming mice coalesce cleanly inside DXGI without spinning the CPU or starving DWM.
                 long nowTicks = _sessionClock.Elapsed.Ticks;
                 long remainingTicks = nextSlotTicks - nowTicks;
-                if (remainingTicks > TimeSpan.TicksPerMillisecond * 2)
+                if (remainingTicks > TimeSpan.TicksPerMillisecond)
                 {
-                    int sleepMs = (int)Math.Min(remainingTicks / TimeSpan.TicksPerMillisecond - 1, 30);
+                    int sleepMs = (int)Math.Min(remainingTicks / TimeSpan.TicksPerMillisecond, 30);
                     if (sleepMs > 0 && _stopEvent.Wait(sleepMs))
                     {
                         return;
@@ -272,7 +302,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                 if (hr == Vortice.DXGI.ResultCode.WaitTimeout)
                 {
                     desktopResource?.Dispose();
-                    nextSlotTicks = _sessionClock.Elapsed.Ticks + _frameIntervalTicks;
+                    // AcquireNextFrame already waited a full frame interval; keep nextSlotTicks ready
+                    // so the next desktop/cursor update wakes immediately without double latency.
+                    nextSlotTicks = _sessionClock.Elapsed.Ticks;
                     continue;
                 }
 
@@ -440,6 +472,19 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
     {
         try
         {
+            nint currentTargetMonitor = _monitorHandle;
+            if (!string.IsNullOrWhiteSpace(_monitorDeviceName))
+            {
+                try
+                {
+                    currentTargetMonitor = CaptureInterop.ResolveMonitorHandle(_monitorDeviceName);
+                }
+                catch
+                {
+                    // Fall back to the previously known monitor handle.
+                }
+            }
+
             using IDXGIDevice dxgiDevice = _device.QueryInterface<IDXGIDevice>();
             using IDXGIAdapter adapter = dxgiDevice.GetAdapter();
 
@@ -454,8 +499,14 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
                 using (output)
                 {
-                    nint outputMonitor = MonitorDeviceFactory.GetOutputMonitorHandle(output, out _);
-                    if (outputMonitor != MonitorHandle)
+                    nint outputMonitor = MonitorDeviceFactory.GetOutputMonitorHandle(output, out string outputDeviceName);
+                    bool monitorMatched =
+                        outputMonitor == currentTargetMonitor ||
+                        outputMonitor == _monitorHandle ||
+                        (!string.IsNullOrWhiteSpace(_monitorDeviceName) &&
+                         string.Equals(outputDeviceName, _monitorDeviceName, StringComparison.OrdinalIgnoreCase));
+
+                    if (!monitorMatched)
                     {
                         continue;
                     }
@@ -467,6 +518,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                         return false;
                     }
 
+                    _monitorHandle = outputMonitor;
                     _duplication = newDuplication;
                     EngineLogger.Info(
                         "DxgiFrameCapture",
@@ -559,7 +611,14 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
             return;
         }
 
-        StopCapture();
+        bool exitedCleanly = StopCaptureAndWaitForExit(timeoutMs: 3500);
+        if (!exitedCleanly)
+        {
+            EngineLogger.Warn(
+                "DxgiFrameCapture",
+                "Capture thread did not exit within 3500 ms during Dispose; skipping unsafe COM teardown to prevent native crash.");
+            return;
+        }
 
         // Dispose in strict reverse dependency order.
         SafeDispose(_duplication);
@@ -589,4 +648,10 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern nint SetThreadDpiAwarenessContext(nint dpiContext);
+
+    [DllImport("winmm.dll", ExactSpelling = true)]
+    private static extern uint timeBeginPeriod(uint uPeriod);
+
+    [DllImport("winmm.dll", ExactSpelling = true)]
+    private static extern uint timeEndPeriod(uint uPeriod);
 }

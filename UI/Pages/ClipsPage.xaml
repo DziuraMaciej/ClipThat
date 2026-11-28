@@ -334,11 +334,10 @@
                       Background="{DynamicResource AppWorkspaceBrush}"
                       VerticalScrollBarVisibility="Auto"
                       HorizontalScrollBarVisibility="Disabled"
-                      PreviewMouseWheel="EditorScrollViewer_PreviewMouseWheel">
+                      SizeChanged="EditorScrollViewer_SizeChanged">
             <StackPanel x:Name="EditorContentPanel"
                         Background="Transparent"
-                        Margin="20,14,20,18"
-                        PreviewMouseWheel="EditorScrollViewer_PreviewMouseWheel">
+                        Margin="20,14,20,18">
 
                 <!-- Header -->
                 <Grid Margin="0,0,0,10">
@@ -375,12 +374,13 @@
                          BorderBrush="#2E2E2E"
                          BorderThickness="1">
                     <StackPanel>
-                        <Border Background="#FF09090B"
+                        <Border x:Name="VideoPreviewBorder"
+                                Background="#FF09090B"
                                 BorderBrush="#26FFFFFF"
                                 BorderThickness="1"
                                 CornerRadius="6"
-                                MinHeight="500"
-                                Height="540"
+                                MinHeight="260"
+                                Height="360"
                                 ClipToBounds="True"
                                 Cursor="Hand"
                                 MouseLeftButtonUp="VideoSurface_MouseLeftButtonUp">

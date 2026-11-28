@@ -39,6 +39,7 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
     private readonly Action<ID3D11Texture2D, long, long> _onFrameCaptured;
     private readonly Action _onSessionClosed;
     private readonly Action<Exception> _onFrameError;
+    private readonly object _callbackGate = new();
     private readonly ManualResetEventSlim _frameIdleEvent = new(initialState: true);
 
     private SizeInt32 _lastContentSize;
@@ -49,7 +50,7 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
     private long _lastSubmittedTimestamp100Ns = -1;
     private int _consecutiveErrors;
     private int _capturedFrameCount;
-    private int _inFlightFrame;
+    private bool _inFlightFrame;
     private int _started;
     private int _stopped;
     private int _disposed;
@@ -176,6 +177,10 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
 
     public string CaptureBackendName => "WGC";
 
+    public int CaptureWidth => _lastContentSize.Width;
+
+    public int CaptureHeight => _lastContentSize.Height;
+
     public SizeInt32 ContentSize => _lastContentSize;
 
     public int CapturedFrameCount => Volatile.Read(ref _capturedFrameCount);
@@ -203,43 +208,51 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
     /// </summary>
     public void StopCapture()
     {
-        if (Interlocked.Exchange(ref _stopped, 1) != 0)
-        {
-            return;
-        }
-
-        try
-        {
-            _captureItem.Closed -= OnCaptureItemClosed;
-        }
-        catch
-        {
-            // Ignore event detachment errors if WinRT item is already closed.
-        }
-
-        try
-        {
-            _framePool.FrameArrived -= OnFrameArrived;
-        }
-        catch
-        {
-            // Ignore event detachment errors if frame pool is already closing.
-        }
-
-        SafeDispose(_captureSession);
-
-        // Wait deterministically for any in-flight GPU frame callback to finish.
-        _frameIdleEvent.Wait(2000);
+        _ = StopCaptureAndWaitForIdle(timeoutMs: 3000);
     }
 
-    /// <summary>
-    /// Enumerates DXGI adapters via <see cref="IDXGIFactory1.EnumAdapters1"/> and each adapter's
-    /// <see cref="IDXGIAdapter.EnumOutputs"/> to locate the exact <see cref="IDXGIAdapter1"/> whose
-    /// <see cref="OutputDescription1.Monitor"/> handle matches <paramref name="targetMonitorHandle"/>.
-    /// Returns <see langword="null"/> only if no DXGI output matches.
-    /// </summary>
-    public static IDXGIAdapter1? FindAdapterForMonitor(nint targetMonitorHandle)
-        => MonitorDeviceFactory.FindAdapterForMonitor(targetMonitorHandle, logTag: "WgcFrameCapture");
+    private bool StopCaptureAndWaitForIdle(int timeoutMs)
+    {
+        bool alreadyStopped;
+        lock (_callbackGate)
+        {
+            alreadyStopped = Volatile.Read(ref _stopped) != 0;
+            Volatile.Write(ref _stopped, 1);
+        }
+
+        if (!alreadyStopped)
+        {
+            try
+            {
+                _captureItem.Closed -= OnCaptureItemClosed;
+            }
+            catch
+            {
+                // Ignore event detachment errors if WinRT item is already closed.
+            }
+
+            try
+            {
+                _framePool.FrameArrived -= OnFrameArrived;
+            }
+            catch
+            {
+                // Ignore event detachment errors if frame pool is already closing.
+            }
+
+            SafeDispose(_captureSession);
+        }
+
+        // Wait deterministically for any in-flight GPU frame callback to finish.
+        try
+        {
+            return _frameIdleEvent.Wait(timeoutMs);
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
+        }
+    }
 
     private static void ConfigureCaptureSessionOptions(GraphicsCaptureSession captureSession)
     {
@@ -296,28 +309,22 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
 
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
-        if (Volatile.Read(ref _stopped) != 0)
+        // Atomically check stop state, claim the single in-flight slot, and reset _frameIdleEvent
+        // under _callbackGate so StopCapture() can never observe _frameIdleEvent signaled mid-entry.
+        lock (_callbackGate)
         {
-            DrainAndDiscardFrameSafe(sender);
-            return;
-        }
-
-        if (Interlocked.CompareExchange(ref _inFlightFrame, 1, 0) != 0)
-        {
-            // Avoid frame pool starvation if a previous GPU frame is still finishing.
-            DrainAndDiscardFrameSafe(sender);
-            return;
-        }
-
-        _frameIdleEvent.Reset();
-        try
-        {
-            if (Volatile.Read(ref _stopped) != 0)
+            if (Volatile.Read(ref _stopped) != 0 || _inFlightFrame)
             {
                 DrainAndDiscardFrameSafe(sender);
                 return;
             }
 
+            _inFlightFrame = true;
+            _frameIdleEvent.Reset();
+        }
+
+        try
+        {
             using Direct3D11CaptureFrame? frame = sender.TryGetNextFrame();
             if (frame is null)
             {
@@ -371,15 +378,25 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
                 EngineLogger.Warn("WgcFrameCapture", $"Frame processing error: {ex.Message}", ex);
                 if (Interlocked.Increment(ref _consecutiveErrors) >= 5)
                 {
-                    Interlocked.Exchange(ref _stopped, 1);
+                    Volatile.Write(ref _stopped, 1);
                     _onFrameError(ex);
                 }
             }
         }
         finally
         {
-            Interlocked.Exchange(ref _inFlightFrame, 0);
-            _frameIdleEvent.Set();
+            lock (_callbackGate)
+            {
+                _inFlightFrame = false;
+                try
+                {
+                    _frameIdleEvent.Set();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Ignore if already torn down.
+                }
+            }
         }
     }
 
@@ -456,7 +473,14 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
             return;
         }
 
-        StopCapture();
+        bool drained = StopCaptureAndWaitForIdle(timeoutMs: 3500);
+        if (!drained)
+        {
+            EngineLogger.Warn(
+                "WgcFrameCapture",
+                "In-flight WGC frame callback did not finish within 3500 ms during Dispose; skipping unsafe COM teardown.");
+            return;
+        }
 
         // Dispose in strict reverse dependency order.
         SafeDispose(_framePool);

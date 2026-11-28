@@ -11,21 +11,29 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>ClipThat</RootNamespace>
     <AssemblyName>ClipThat</AssemblyName>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <RollForward>Major</RollForward>
+    <DefaultItemExcludes>$(DefaultItemExcludes);ClipThat.Tests\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <!-- Prevent CS0104 ambiguities between WPF and WinForms/System.Drawing when both UseWPF and UseWindowsForms are enabled -->
   <ItemGroup>
     <Using Remove="System.Windows.Forms" />
     <Using Remove="System.Drawing" />
+    <InternalsVisibleTo Include="ClipThat.Tests" />
   </ItemGroup>
 
   <Target Name="EnsureFfmpegAsset" BeforeTargets="BeforeBuild;AssignTargetPaths;PrepareResourceNames" Condition="!Exists('Assets\ffmpeg.exe')">
     <Message Text="Pobieranie ffmpeg.exe do folderu Assets..." Importance="high" />
-    <Exec Command="powershell -NoProfile -Command &quot;$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; New-Item -ItemType Directory -Force -Path 'Assets' | Out-Null; $zip = Join-Path $env:TEMP 'ffmpeg-clipthat.zip'; Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip; $extract = Join-Path $env:TEMP 'ffmpeg-clipthat-extract'; Expand-Archive -Path $zip -DestinationPath $extract -Force; $exe = Get-ChildItem -Path $extract -Filter 'ffmpeg.exe' -Recurse | Select-Object -First 1; Copy-Item $exe.FullName 'Assets\ffmpeg.exe' -Force; Remove-Item $zip, $extract -Recurse -Force&quot;" />
+    <Exec Command="powershell -NoProfile -Command &quot;$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; New-Item -ItemType Directory -Force -Path 'Assets' | Out-Null; $id = [Guid]::NewGuid().ToString('N'); $zip = Join-Path $env:TEMP ('ffmpeg-clipthat-' + $id + '.zip'); $extract = Join-Path $env:TEMP ('ffmpeg-clipthat-extract-' + $id); try { Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip -UseBasicParsing; Expand-Archive -Path $zip -DestinationPath $extract -Force; $exe = Get-ChildItem -Path $extract -Filter 'ffmpeg.exe' -Recurse | Select-Object -First 1; if (-not $exe -or $exe.Length -lt 10485760) { throw 'Pobrany plik ffmpeg.exe jest nieprawidlowy.' }; Copy-Item $exe.FullName 'Assets\ffmpeg.exe' -Force } finally { Remove-Item $zip, $extract -Recurse -Force -ErrorAction SilentlyContinue }&quot;" />
   </Target>
 
-  <ItemGroup>
+  <!-- Embed ffmpeg.exe only for self-contained single-file publishing; copy next to output for regular builds. -->
+  <ItemGroup Condition="'$(PublishSingleFile)' == 'true'">
     <EmbeddedResource Include="Assets\ffmpeg.exe" LogicalName="ClipThat.Assets.ffmpeg.exe" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(PublishSingleFile)' != 'true'">
+    <Content Include="Assets\ffmpeg.exe" Link="ffmpeg.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
@@ -36,7 +44,7 @@
   </ItemGroup>
 
   <Target Name="SignOutputs" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
-    <Exec Command="powershell -NoProfile -Command &quot;$cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Select-Object -First 1; if (-not $cert) { $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ClipThat Local' -CertStoreLocation Cert:\CurrentUser\My }; if (-not (Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Thumbprint -eq $cert.Thumbprint })) { $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser'); $store.Open('ReadWrite'); $store.Add($cert); $store.Close() }; if (Test-Path '$(TargetPath)') { Set-AuthenticodeSignature -FilePath '$(TargetPath)' -Certificate $cert | Out-Null }; if (Test-Path '$(TargetDir)$(TargetName).exe') { Set-AuthenticodeSignature -FilePath '$(TargetDir)$(TargetName).exe' -Certificate $cert | Out-Null }&quot;"
+    <Exec Command="powershell -NoProfile -Command &quot;$now = Get-Date; $certs = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -in @('CN=ClipThatDev', 'CN=ClipThat Local') -and $_.HasPrivateKey -and $_.NotAfter -gt $now }; $cert = ($certs | Where-Object { $_.Subject -eq 'CN=ClipThatDev' } | Sort-Object NotAfter -Descending | Select-Object -First 1); if (-not $cert) { $cert = $certs | Sort-Object NotAfter -Descending | Select-Object -First 1 }; if (-not $cert -and '$(Configuration)' -eq 'Release') { $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ClipThat Local' -CertStoreLocation Cert:\CurrentUser\My; if (-not (Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Thumbprint -eq $cert.Thumbprint })) { $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser'); $store.Open('ReadWrite'); $store.Add($cert); $store.Close() } }; if ($cert) { if (Test-Path '$(TargetPath)') { Set-AuthenticodeSignature -FilePath '$(TargetPath)' -Certificate $cert | Out-Null }; if (Test-Path '$(TargetDir)$(TargetName).exe') { Set-AuthenticodeSignature -FilePath '$(TargetDir)$(TargetName).exe' -Certificate $cert | Out-Null } }&quot;"
           IgnoreExitCode="true" />
   </Target>
 

@@ -20,6 +20,7 @@ namespace ClipThat.UI.Pages;
 /// </summary>
 public partial class SettingsPage : Page
 {
+    private static readonly CultureInfo PolishCulture = CultureInfo.GetCultureInfo("pl-PL");
     private static readonly Brush RecordingDotBrush = CreateFrozenBrush(0xFF, 0x22, 0xC5, 0x5E);
     private static readonly Brush PausedDotBrush = CreateFrozenBrush(0xFF, 0x71, 0x71, 0x7A);
     private static readonly Brush ErrorDotBrush = CreateFrozenBrush(0xFF, 0xEF, 0x44, 0x44);
@@ -34,6 +35,7 @@ public partial class SettingsPage : Page
 
     private readonly DispatcherTimer _sliderDebounceTimer;
     private readonly DispatcherTimer _filenamePreviewTimer;
+    private readonly DispatcherTimer _audioDevicesDebounceTimer;
 
     private AppSettings _workingSettings;
     private bool _isInitializing = true;
@@ -74,6 +76,12 @@ public partial class SettingsPage : Page
         };
         _filenamePreviewTimer.Tick += FilenamePreviewTimer_Tick;
 
+        _audioDevicesDebounceTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(250)
+        };
+        _audioDevicesDebounceTimer.Tick += AudioDevicesDebounceTimer_Tick;
+
         InitializeComponent();
 
         LoadSettingsIntoControls();
@@ -112,6 +120,9 @@ public partial class SettingsPage : Page
         _sliderDebounceTimer.Stop();
         _sliderDebounceTimer.Tick -= SliderDebounceTimer_Tick;
 
+        _audioDevicesDebounceTimer.Stop();
+        _audioDevicesDebounceTimer.Tick -= AudioDevicesDebounceTimer_Tick;
+
         if (_hasPendingSliderSave)
         {
             _hasPendingSliderSave = false;
@@ -139,6 +150,30 @@ public partial class SettingsPage : Page
         Unloaded -= SettingsPage_Unloaded;
     }
 
+    /// <summary>
+    /// Pauses background UI timers when the host window is hidden to the system tray and resumes them when restored.
+    /// </summary>
+    public void OnHostWindowVisibilityChanged(bool isVisible)
+    {
+        if (_isDetached)
+        {
+            return;
+        }
+
+        if (!isVisible)
+        {
+            _filenamePreviewTimer.Stop();
+            _audioDevicesDebounceTimer.Stop();
+        }
+        else if (IsLoaded)
+        {
+            UpdateEngineControls(_replayEngine.IsRecording, _replayEngine.LastError, _replayEngine.CurrentStatus);
+            UpdateFilenamePreview();
+            _filenamePreviewTimer.Start();
+            ScheduleAudioDevicesRefresh();
+        }
+    }
+
     private void SettingsPage_Loaded(object sender, RoutedEventArgs e)
     {
         if (_isDetached)
@@ -154,6 +189,7 @@ public partial class SettingsPage : Page
     private void SettingsPage_Unloaded(object sender, RoutedEventArgs e)
     {
         _filenamePreviewTimer.Stop();
+        _audioDevicesDebounceTimer.Stop();
     }
 
     private void LoadSettingsIntoControls()
@@ -176,7 +212,13 @@ public partial class SettingsPage : Page
         OutputDirectoryTextBox.Text = _workingSettings.OutputDirectory;
         SaveHotkeyBox.Initialize(_globalHotkeyService, _workingSettings.HotkeyModifiers, _workingSettings.HotkeyVirtualKey);
 
-        bool startupEnabled = _workingSettings.StartWithWindows || _startupService.IsEnabled();
+        bool startupEnabled = _startupService.IsStartupEnabled();
+        if (_workingSettings.StartWithWindows != startupEnabled)
+        {
+            _workingSettings.StartWithWindows = startupEnabled;
+            SaveWorkingSettingsOnly();
+        }
+
         StartWithWindowsSwitch.IsChecked = startupEnabled;
         StartRecordingOnLaunchSwitch.IsChecked = _workingSettings.StartRecordingOnLaunch;
     }
@@ -353,6 +395,7 @@ public partial class SettingsPage : Page
 
         _workingSettings.SystemAudioDeviceId = selectedSystemAudioId;
         _workingSettings.MicrophoneDeviceId = selectedMicrophoneId;
+        UpdateResourceEstimate();
         await SaveAndApplySettingsAsync();
     }
 
@@ -360,9 +403,25 @@ public partial class SettingsPage : Page
     {
         var dialog = new OpenFolderDialog
         {
-            Title = "Wybierz folder zapisu nagrań",
-            InitialDirectory = OutputDirectoryTextBox.Text
+            Title = "Wybierz folder zapisu nagrań"
         };
+
+        string currentDir = OutputDirectoryTextBox.Text;
+        if (!string.IsNullOrWhiteSpace(currentDir))
+        {
+            if (Directory.Exists(currentDir))
+            {
+                dialog.InitialDirectory = currentDir;
+            }
+            else
+            {
+                string? parent = Path.GetDirectoryName(currentDir);
+                if (!string.IsNullOrWhiteSpace(parent) && Directory.Exists(parent))
+                {
+                    dialog.InitialDirectory = parent;
+                }
+            }
+        }
 
         if (dialog.ShowDialog() == true && !string.IsNullOrWhiteSpace(dialog.FolderName))
         {
@@ -381,7 +440,7 @@ public partial class SettingsPage : Page
         try
         {
             Directory.CreateDirectory(folderPath);
-            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{folderPath}\"")
+            using Process? _ = Process.Start(new ProcessStartInfo("explorer.exe", $"\"{folderPath}\"")
             {
                 UseShellExecute = true
             });
@@ -514,13 +573,13 @@ public partial class SettingsPage : Page
 
         ResolutionPreset resolution = _workingSettings.Resolution;
         int fps = _workingSettings.Fps;
+        bool includeMicrophone = !AudioDeviceService.IsDisabledDeviceId(_workingSettings.MicrophoneDeviceId);
 
-        ResourceEstimate estimate = _resourceEstimatorService.Estimate(durationMinutes, resolution, fps);
-        CultureInfo polishCulture = CultureInfo.GetCultureInfo("pl-PL");
+        ResourceEstimate estimate = _resourceEstimatorService.Estimate(durationMinutes, resolution, fps, includeMicrophone);
 
-        RamEstimateText.Text = string.Format(polishCulture, "~{0:0} MB", estimate.EstimatedRamUsageMb);
-        DiskEstimateText.Text = string.Format(polishCulture, "~{0:0} MB", estimate.EstimatedDiskSizeMb);
-        BitrateEstimateText.Text = string.Format(polishCulture, "{0:0.0} Mbps", estimate.VideoBitrateMbps);
+        RamEstimateText.Text = string.Format(PolishCulture, "~{0:0} MB", estimate.EstimatedRamUsageMb);
+        DiskEstimateText.Text = string.Format(PolishCulture, "~{0:0} MB", estimate.EstimatedDiskSizeMb);
+        BitrateEstimateText.Text = string.Format(PolishCulture, "{0:0.0} Mbps", estimate.VideoBitrateMbps);
     }
 
     private void FilenamePreviewTimer_Tick(object? sender, EventArgs e)
@@ -599,7 +658,7 @@ public partial class SettingsPage : Page
             return;
         }
 
-        Dispatcher.InvokeAsync(RefreshAudioDeviceLists);
+        Dispatcher.InvokeAsync(ScheduleAudioDevicesRefresh);
     }
 
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
@@ -609,7 +668,24 @@ public partial class SettingsPage : Page
             return;
         }
 
-        Dispatcher.InvokeAsync(RefreshAudioDeviceLists);
+        Dispatcher.InvokeAsync(ScheduleAudioDevicesRefresh);
+    }
+
+    private void ScheduleAudioDevicesRefresh()
+    {
+        if (_isDetached)
+        {
+            return;
+        }
+
+        _audioDevicesDebounceTimer.Stop();
+        _audioDevicesDebounceTimer.Start();
+    }
+
+    private void AudioDevicesDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        _audioDevicesDebounceTimer.Stop();
+        RefreshAudioDeviceLists();
     }
 
     private void OnEngineStatusChanged(string status)
@@ -680,7 +756,16 @@ public partial class SettingsPage : Page
         }
 
         ToggleRecordingButton.Content = isRecording ? "Wstrzymaj" : "Wznów";
-        ToggleRecordingButton.Icon = new SymbolIcon(isRecording ? SymbolRegular.Pause24 : SymbolRegular.Play24);
+        SymbolRegular toggleSymbol = isRecording ? SymbolRegular.Pause24 : SymbolRegular.Play24;
+        if (ToggleRecordingButton.Icon is SymbolIcon existingIcon)
+        {
+            existingIcon.Symbol = toggleSymbol;
+        }
+        else
+        {
+            ToggleRecordingButton.Icon = new SymbolIcon(toggleSymbol);
+        }
+
         SaveReplayButton.IsEnabled = isRecording;
     }
 

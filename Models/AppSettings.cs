@@ -52,6 +52,26 @@ public sealed class AppSettings
         {
             OutputDirectory = DefaultOutputDirectory;
         }
+        else
+        {
+            string trimmedDir = OutputDirectory.Trim();
+            try
+            {
+                _ = Path.GetFullPath(trimmedDir);
+                OutputDirectory = trimmedDir;
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                OutputDirectory = DefaultOutputDirectory;
+            }
+        }
+
+        HotkeyModifiers &= 0x000Fu;
+        if (HotkeyVirtualKey == 0u || HotkeyVirtualKey > 0xFFu)
+        {
+            HotkeyModifiers = DefaultHotkeyModifiers;
+            HotkeyVirtualKey = DefaultHotkeyVirtualKey;
+        }
 
         SystemAudioDeviceId = string.IsNullOrWhiteSpace(SystemAudioDeviceId)
             ? null

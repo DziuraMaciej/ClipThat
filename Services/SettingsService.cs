@@ -1,6 +1,7 @@
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using ClipThat.Engine.Diagnostics;
 using ClipThat.Models;
 
 namespace ClipThat.Services;
@@ -92,9 +93,29 @@ public sealed class SettingsService
             string json = File.ReadAllText(SettingsFilePath);
             return JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (JsonException ex)
         {
+            EngineLogger.Warn("SettingsService", $"Corrupted settings file '{SettingsFilePath}': {ex.Message}; backing up and resetting to defaults.", ex);
+            TryBackupCorruptSettingsFile();
             return new AppSettings();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            EngineLogger.Warn("SettingsService", $"Failed to read settings file '{SettingsFilePath}': {ex.Message}", ex);
+            return new AppSettings();
+        }
+    }
+
+    private void TryBackupCorruptSettingsFile()
+    {
+        try
+        {
+            string backupPath = SettingsFilePath + ".corrupt.bak";
+            File.Copy(SettingsFilePath, backupPath, overwrite: true);
+        }
+        catch
+        {
+            // Ignore best-effort backup failures.
         }
     }
 
@@ -118,9 +139,28 @@ public sealed class SettingsService
             Directory.CreateDirectory(directory);
         }
 
-        string tempPath = SettingsFilePath + ".tmp";
+        string tempPath = $"{SettingsFilePath}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
         string json = JsonSerializer.Serialize(settings, JsonOptions);
-        File.WriteAllText(tempPath, json);
-        File.Move(tempPath, SettingsFilePath, overwrite: true);
+        try
+        {
+            File.WriteAllText(tempPath, json);
+            File.Move(tempPath, SettingsFilePath, overwrite: true);
+        }
+        catch
+        {
+            try
+            {
+                if (File.Exists(tempPath))
+                {
+                    File.Delete(tempPath);
+                }
+            }
+            catch
+            {
+                // Ignore temp cleanup failure.
+            }
+
+            throw;
+        }
     }
 }

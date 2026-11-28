@@ -21,8 +21,11 @@ namespace ClipThat.Engine;
 public sealed class ReplayEngine : IReplayEngine
 {
     private const int KeyframeWatchdogTimeoutMs = 1500;
+    private const int MaxIdleWatchdogDeferrals = 6;
     private const int StartupPrimingIntervalMs = 60;
     private const int MaxStartupPrimingFrames = 6;
+    private const int StaticDesktopKeepAliveIntervalMs = 1500;
+    private static readonly int[] RecoveryRetryDelaysMs = { 0, 400, 900, 1600 };
 
     private readonly ResourceEstimatorService _resourceEstimatorService;
     private readonly Mp4ReplayMuxer _mp4Muxer = new();
@@ -65,7 +68,10 @@ public sealed class ReplayEngine : IReplayEngine
         ArgumentNullException.ThrowIfNull(settings);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        string statusMessage;
+        string? statusMessage = null;
+        string? startupError = null;
+        CapturePipelineSession? startedSession = null;
+        MfH264Encoder? startedEncoder = null;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -83,7 +89,7 @@ public sealed class ReplayEngine : IReplayEngine
             _ringBuffer.Clear();
             _ringBuffer.SetBufferDuration(normalized.BufferDurationMinutes);
             _currentSettings = normalized;
-            _consecutiveDxgiFaults = 0;
+            Interlocked.Exchange(ref _consecutiveDxgiFaults, 0);
 
             _activeSession = StartCapturePipelineLocked(normalized, EncoderNegotiationTier.HardwareGpuZeroCopy, preferDxgiDuplication: true);
             _isRecording = true;
@@ -100,26 +106,39 @@ public sealed class ReplayEngine : IReplayEngine
             Volatile.Write(ref _lastError, null);
             Volatile.Write(ref _currentStatus, statusMessage);
 
-            ArmKeyframeWatchdog(_activeSession, activeEncoder);
+            startedSession = _activeSession;
+            startedEncoder = activeEncoder;
         }
         catch (Exception ex)
         {
             TeardownActiveSessionLocked();
             _isRecording = false;
-            string errorMessage = $"Błąd uruchamiania przechwytywania: {ex.Message}";
-            EngineLogger.Error("ReplayEngine", errorMessage, ex);
-            Volatile.Write(ref _lastError, errorMessage);
-            Volatile.Write(ref _currentStatus, errorMessage);
-            StatusChanged?.Invoke(errorMessage);
-            ErrorOccurred?.Invoke(errorMessage);
+            startupError = $"Błąd uruchamiania przechwytywania: {ex.Message}";
+            EngineLogger.Error("ReplayEngine", startupError, ex);
+            Volatile.Write(ref _lastError, startupError);
+            Volatile.Write(ref _currentStatus, startupError);
             throw;
         }
         finally
         {
             _gate.Release();
+
+            if (startupError is not null)
+            {
+                StatusChanged?.Invoke(startupError);
+                ErrorOccurred?.Invoke(startupError);
+            }
         }
 
-        StatusChanged?.Invoke(statusMessage);
+        if (startedSession is not null && startedEncoder is not null)
+        {
+            ArmKeyframeWatchdog(startedSession, startedEncoder);
+        }
+
+        if (statusMessage is not null)
+        {
+            StatusChanged?.Invoke(statusMessage);
+        }
     }
 
     public async Task StopAsync()
@@ -163,6 +182,9 @@ public sealed class ReplayEngine : IReplayEngine
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
         string? statusMessage = null;
+        string? updateError = null;
+        CapturePipelineSession? restartedSession = null;
+        MfH264Encoder? restartedEncoder = null;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -202,15 +224,13 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 TeardownActiveSessionLocked();
                 _ringBuffer.Clear();
-                _consecutiveDxgiFaults = 0;
+                Interlocked.Exchange(ref _consecutiveDxgiFaults, 0);
 
                 _activeSession = StartCapturePipelineLocked(updated, EncoderNegotiationTier.HardwareGpuZeroCopy, preferDxgiDuplication: true);
                 _isRecording = true;
 
-                if (_activeSession.Encoder is not null)
-                {
-                    ArmKeyframeWatchdog(_activeSession, _activeSession.Encoder);
-                }
+                restartedSession = _activeSession;
+                restartedEncoder = _activeSession.Encoder;
             }
 
             MfH264Encoder? currentEncoder = _activeSession.Encoder;
@@ -230,17 +250,26 @@ public sealed class ReplayEngine : IReplayEngine
         {
             TeardownActiveSessionLocked();
             _isRecording = false;
-            string errorMessage = $"Błąd aktualizacji potoku wideo: {ex.Message}";
-            EngineLogger.Error("ReplayEngine", errorMessage, ex);
-            Volatile.Write(ref _lastError, errorMessage);
-            Volatile.Write(ref _currentStatus, errorMessage);
-            StatusChanged?.Invoke(errorMessage);
-            ErrorOccurred?.Invoke(errorMessage);
+            updateError = $"Błąd aktualizacji potoku wideo: {ex.Message}";
+            EngineLogger.Error("ReplayEngine", updateError, ex);
+            Volatile.Write(ref _lastError, updateError);
+            Volatile.Write(ref _currentStatus, updateError);
             throw;
         }
         finally
         {
             _gate.Release();
+
+            if (updateError is not null)
+            {
+                StatusChanged?.Invoke(updateError);
+                ErrorOccurred?.Invoke(updateError);
+            }
+        }
+
+        if (restartedSession is not null && restartedEncoder is not null)
+        {
+            ArmKeyframeWatchdog(restartedSession, restartedEncoder);
         }
 
         if (statusMessage is not null)
@@ -267,6 +296,7 @@ public sealed class ReplayEngine : IReplayEngine
         int targetHeight = 0;
         int targetFps = 60;
         uint targetBitrateBps = 0;
+        EncodedPacketSnapshot? snapshot = null;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -279,20 +309,27 @@ public sealed class ReplayEngine : IReplayEngine
             isRecordingSnapshot = _isRecording;
             outputDirectory = _currentSettings?.OutputDirectory;
 
-            MfH264Encoder? activeEncoder = _activeSession?.Encoder;
-            if (activeEncoder is not null)
+            if (isRecordingSnapshot && !string.IsNullOrWhiteSpace(outputDirectory))
             {
-                targetWidth = activeEncoder.OutputWidth;
-                targetHeight = activeEncoder.OutputHeight;
-                targetFps = activeEncoder.TargetFps;
-                targetBitrateBps = activeEncoder.TargetBitrateBps;
-            }
-            else if (_currentSettings is not null)
-            {
-                (targetWidth, targetHeight) = GpuVideoProcessor.GetTargetDimensions(_currentSettings.Resolution);
-                targetFps = _currentSettings.Fps;
-                double bitrateMbps = _resourceEstimatorService.GetVideoBitrateMbps(_currentSettings.Resolution, targetFps);
-                targetBitrateBps = (uint)Math.Clamp((long)Math.Round(bitrateMbps * 1_000_000.0), 250_000L, 100_000_000L);
+                MfH264Encoder? activeEncoder = _activeSession?.Encoder;
+                if (activeEncoder is not null)
+                {
+                    targetWidth = activeEncoder.OutputWidth;
+                    targetHeight = activeEncoder.OutputHeight;
+                    targetFps = activeEncoder.TargetFps;
+                    targetBitrateBps = activeEncoder.TargetBitrateBps;
+                }
+                else if (_currentSettings is not null)
+                {
+                    (targetWidth, targetHeight) = GpuVideoProcessor.GetTargetDimensions(_currentSettings.Resolution);
+                    targetFps = _currentSettings.Fps;
+                    double bitrateMbps = _resourceEstimatorService.GetVideoBitrateMbps(_currentSettings.Resolution, targetFps);
+                    targetBitrateBps = (uint)Math.Clamp((long)Math.Round(bitrateMbps * 1_000_000.0), 250_000L, 100_000_000L);
+                }
+
+                // Retain packet handles atomically inside _gate so resolution/FPS metadata always matches
+                // the buffered packets and Dispose()/UpdateSettingsAsync cannot race with SnapshotPackets().
+                snapshot = _ringBuffer.SnapshotPackets();
             }
         }
         finally
@@ -302,16 +339,16 @@ public sealed class ReplayEngine : IReplayEngine
 
         if (!isRecordingSnapshot || string.IsNullOrWhiteSpace(outputDirectory))
         {
+            snapshot?.Dispose();
             const string pausedNotice = "Nagrywanie jest wstrzymane — brak bufora do zapisania";
             Volatile.Write(ref _currentStatus, pausedNotice);
             StatusChanged?.Invoke(pausedNotice);
             return null;
         }
 
-        EncodedPacketSnapshot snapshot = _ringBuffer.SnapshotPackets();
-        if (snapshot.Count == 0)
+        if (snapshot is null || snapshot.Count == 0)
         {
-            snapshot.Dispose();
+            snapshot?.Dispose();
             const string noKeyframeNotice = "Bufor powtórki nie zawiera jeszcze gotowej klatki kluczowej";
             Volatile.Write(ref _currentStatus, noKeyframeNotice);
             StatusChanged?.Invoke(noKeyframeNotice);
@@ -354,38 +391,6 @@ public sealed class ReplayEngine : IReplayEngine
         }
     }
 
-    public void PushAudioPacket(EncodedPacket packet)
-    {
-        ArgumentNullException.ThrowIfNull(packet);
-
-        if (!_isRecording || Volatile.Read(ref _disposed) != 0)
-        {
-            packet.Dispose();
-            return;
-        }
-
-        _ringBuffer.AddPacket(packet);
-    }
-
-    public void PushAudioPacket(
-        MediaTrackType trackType,
-        byte[] rentedBuffer,
-        int length,
-        long timestamp100Ns,
-        long duration100Ns)
-    {
-        if (!_isRecording || Volatile.Read(ref _disposed) != 0)
-        {
-            System.Buffers.ArrayPool<byte>.Shared.Return(rentedBuffer);
-            return;
-        }
-
-        _ringBuffer.AddAudioPacket(trackType, rentedBuffer, length, timestamp100Ns, duration100Ns);
-    }
-
-    public long GetCurrentSessionTimestamp100Ns()
-        => _activeSession?.GetCurrentSessionTimestamp100Ns() ?? 0L;
-
     private CapturePipelineSession StartCapturePipelineLocked(
         AppSettings settings,
         EncoderNegotiationTier minimumTier,
@@ -412,7 +417,20 @@ public sealed class ReplayEngine : IReplayEngine
                     OnSessionClosed(createdSession);
                 }
             };
-            Action<Exception> onCaptureError = ex => OnActivePipelineFault(ex, isEncoderFault: false);
+            Action<Exception> onCaptureError = ex =>
+            {
+                if (createdSession is not null)
+                {
+                    OnActivePipelineFault(createdSession, ex, isEncoderFault: false);
+                }
+            };
+            Action<Exception> onEncoderError = ex =>
+            {
+                if (createdSession is not null)
+                {
+                    OnActivePipelineFault(createdSession, ex, isEncoderFault: true);
+                }
+            };
 
             if (preferDxgiDuplication)
             {
@@ -450,9 +468,11 @@ public sealed class ReplayEngine : IReplayEngine
                 settings.Fps,
                 captureSource.AdapterName,
                 captureSource.AdapterLuid,
-                ownsDevice: false);
+                ownsDevice: false,
+                sourceWidth: captureSource.CaptureWidth,
+                sourceHeight: captureSource.CaptureHeight);
 
-            encoder = CreateEncoder(gpuProcessor, settings, minimumTier);
+            encoder = CreateEncoder(gpuProcessor, settings, minimumTier, onEncoderError);
 
             try
             {
@@ -479,7 +499,7 @@ public sealed class ReplayEngine : IReplayEngine
                 gpuProcessor,
                 encoder,
                 audioCapture,
-                onEncodeError: ex => OnActivePipelineFault(ex, isEncoderFault: true));
+                onEncodeError: onEncoderError);
 
             createdSession = pipeline;
             pipeline.Start();
@@ -506,7 +526,8 @@ public sealed class ReplayEngine : IReplayEngine
     private MfH264Encoder CreateEncoder(
         GpuVideoProcessor gpuProcessor,
         AppSettings settings,
-        EncoderNegotiationTier minimumTier)
+        EncoderNegotiationTier minimumTier,
+        Action<Exception> onEncoderError)
     {
         return new MfH264Encoder(
             gpuProcessor,
@@ -515,23 +536,26 @@ public sealed class ReplayEngine : IReplayEngine
             _resourceEstimatorService,
             onPacketEncoded: _ringBuffer.AddPacket,
             onSequenceHeader: header => _ringBuffer.SetVideoSequenceHeader(header.Span),
-            onEncoderError: ex => OnActivePipelineFault(ex, isEncoderFault: true),
+            onEncoderError: onEncoderError,
             minimumTier: minimumTier);
     }
 
     /// <summary>
     /// Arms a 1.5-second watchdog verifying that <paramref name="monitoredEncoder"/> emits at least
-    /// one H.264 keyframe (<c>IsKeyFrame == true</c>). If zero keyframes arrive in time, automatically
-    /// disposes the stalled encoder and steps down <c>Tier 1 -&gt; Tier 2 -&gt; Tier 3</c>.
+    /// one H.264 keyframe (<c>IsKeyFrame == true</c>) once frames have been submitted. If zero keyframes
+    /// arrive in time despite submitted frames, automatically steps down <c>Tier 1 -&gt; Tier 2 -&gt; Tier 3</c>.
     /// </summary>
-    private void ArmKeyframeWatchdog(CapturePipelineSession session, MfH264Encoder monitoredEncoder)
+    private void ArmKeyframeWatchdog(
+        CapturePipelineSession session,
+        MfH264Encoder monitoredEncoder,
+        int idleDeferralsRemaining = MaxIdleWatchdogDeferrals)
     {
         _ = Task.Run(async () =>
         {
             try
             {
                 await Task.Delay(KeyframeWatchdogTimeoutMs).ConfigureAwait(false);
-                await CheckKeyframeWatchdogAsync(session, monitoredEncoder).ConfigureAwait(false);
+                await CheckKeyframeWatchdogAsync(session, monitoredEncoder, idleDeferralsRemaining).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -540,7 +564,10 @@ public sealed class ReplayEngine : IReplayEngine
         });
     }
 
-    private async Task CheckKeyframeWatchdogAsync(CapturePipelineSession session, MfH264Encoder monitoredEncoder)
+    private async Task CheckKeyframeWatchdogAsync(
+        CapturePipelineSession session,
+        MfH264Encoder monitoredEncoder,
+        int idleDeferralsRemaining)
     {
         if (Volatile.Read(ref _disposed) != 0 || monitoredEncoder.HasEmittedKeyframe)
         {
@@ -550,6 +577,7 @@ public sealed class ReplayEngine : IReplayEngine
         string? updatedStatus = null;
         string? fatalError = null;
         MfH264Encoder? nextEncoderToMonitor = null;
+        bool deferWatchdog = false;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -576,6 +604,28 @@ public sealed class ReplayEngine : IReplayEngine
             int needInputEvents = monitoredEncoder.NeedInputEventCount;
             int haveOutputEvents = monitoredEncoder.HaveOutputEventCount;
 
+            // Do not falsely downgrade a healthy hardware GPU encoder when 0 frames were captured/submitted
+            // (for example on a locked desktop, UAC screen, or sleeping monitor during Windows autostart).
+            if (submittedFrames == 0)
+            {
+                if (idleDeferralsRemaining > 0)
+                {
+                    EngineLogger.Info(
+                        "ReplayEngine",
+                        $"Keyframe watchdog deferred ({idleDeferralsRemaining} left): 0 frames submitted yet " +
+                        $"(captureFrames={wgcFrames}, tier={currentTier}, encoder=\"{currentEncoderName}\").");
+                    deferWatchdog = true;
+                }
+                else
+                {
+                    EngineLogger.Warn(
+                        "ReplayEngine",
+                        $"Keyframe watchdog: still 0 frames submitted after deferrals (captureFrames={wgcFrames}, tier={currentTier}); keeping current encoder.");
+                }
+
+                return;
+            }
+
             EncoderNegotiationTier? nextTier = GetNextDowngradeTier(currentTier);
             if (!nextTier.HasValue)
             {
@@ -598,11 +648,12 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 _ringBuffer.Clear();
 
+                Action<Exception> sessionEncoderError = ex => OnActivePipelineFault(session, ex, isEncoderFault: true);
                 MfH264Encoder replacement;
                 try
                 {
                     replacement = session.ReplaceEncoder(
-                        () => CreateEncoder(session.GpuProcessor, _currentSettings, nextTier.Value));
+                        () => CreateEncoder(session.GpuProcessor, _currentSettings, nextTier.Value, sessionEncoderError));
                 }
                 catch (Exception tierEx) when (nextTier.Value != EncoderNegotiationTier.SoftwareFallback)
                 {
@@ -611,7 +662,7 @@ public sealed class ReplayEngine : IReplayEngine
                         $"Step-down to {nextTier.Value} failed ({tierEx.Message}); retrying directly with SoftwareFallback.",
                         tierEx);
                     replacement = session.ReplaceEncoder(
-                        () => CreateEncoder(session.GpuProcessor, _currentSettings, EncoderNegotiationTier.SoftwareFallback));
+                        () => CreateEncoder(session.GpuProcessor, _currentSettings, EncoderNegotiationTier.SoftwareFallback, sessionEncoderError));
                 }
 
                 EngineLogger.Info(
@@ -643,6 +694,12 @@ public sealed class ReplayEngine : IReplayEngine
         finally
         {
             _gate.Release();
+        }
+
+        if (deferWatchdog)
+        {
+            ArmKeyframeWatchdog(session, monitoredEncoder, idleDeferralsRemaining - 1);
+            return;
         }
 
         if (nextEncoderToMonitor is not null)
@@ -678,33 +735,30 @@ public sealed class ReplayEngine : IReplayEngine
             preferDxgiDuplication: preferDxgi));
     }
 
-    private void OnActivePipelineFault(Exception exception, bool isEncoderFault)
+    private void OnActivePipelineFault(CapturePipelineSession faultedSession, Exception exception, bool isEncoderFault)
     {
         EngineLogger.Error("ReplayEngine", $"Active pipeline fault (encoderFault={isEncoderFault}): {exception.Message}", exception);
-        CapturePipelineSession? session = _activeSession;
-        if (session is not null)
-        {
-            EncoderNegotiationTier recoveryTier = EncoderNegotiationTier.HardwareGpuZeroCopy;
-            bool preferDxgi = session.Capture is DxgiFrameCapture;
-            if (isEncoderFault)
-            {
-                MfH264Encoder? currentEncoder = session.Encoder;
-                if (currentEncoder is not null)
-                {
-                    recoveryTier = GetNextDowngradeTier(currentEncoder.ActiveTier) ?? EncoderNegotiationTier.SoftwareFallback;
-                }
-            }
-            else
-            {
-                preferDxgi = ShouldRetryDxgiAfterCaptureInterruption(session);
-            }
 
-            _ = Task.Run(() => RecoverFromSessionInterruptionAsync(
-                session,
-                $"Błąd kodera wideo ({exception.Message}) — próba wznowienia ({recoveryTier})...",
-                minimumTier: recoveryTier,
-                preferDxgiDuplication: preferDxgi));
+        EncoderNegotiationTier recoveryTier = EncoderNegotiationTier.HardwareGpuZeroCopy;
+        bool preferDxgi = faultedSession.Capture is DxgiFrameCapture;
+        if (isEncoderFault)
+        {
+            MfH264Encoder? currentEncoder = faultedSession.Encoder;
+            if (currentEncoder is not null)
+            {
+                recoveryTier = GetNextDowngradeTier(currentEncoder.ActiveTier) ?? EncoderNegotiationTier.SoftwareFallback;
+            }
         }
+        else
+        {
+            preferDxgi = ShouldRetryDxgiAfterCaptureInterruption(faultedSession);
+        }
+
+        _ = Task.Run(() => RecoverFromSessionInterruptionAsync(
+            faultedSession,
+            $"Błąd potoku wideo ({exception.Message}) — próba wznowienia ({recoveryTier})...",
+            minimumTier: recoveryTier,
+            preferDxgiDuplication: preferDxgi));
     }
 
     private bool ShouldRetryDxgiAfterCaptureInterruption(CapturePipelineSession session)
@@ -716,7 +770,7 @@ public sealed class ReplayEngine : IReplayEngine
 
         if (session.Capture.CapturedFrameCount == 0)
         {
-            _consecutiveDxgiFaults = 2;
+            Interlocked.Exchange(ref _consecutiveDxgiFaults, 2);
             return false;
         }
 
@@ -754,31 +808,58 @@ public sealed class ReplayEngine : IReplayEngine
             TeardownActiveSessionLocked();
             _ringBuffer.Clear();
 
-            // Attempt clean recovery (falling back to WGC or lower encoder tier on repeated faults).
-            try
+            Exception? lastException = null;
+            for (int attempt = 0; attempt < RecoveryRetryDelaysMs.Length; attempt++)
             {
-                _activeSession = StartCapturePipelineLocked(_currentSettings, minimumTier, preferDxgiDuplication);
-                _isRecording = true;
-                recoveredSession = _activeSession;
-                recoveredEncoder = _activeSession.Encoder;
-                if (recoveredEncoder is not null)
+                int delayMs = RecoveryRetryDelaysMs[attempt];
+                if (delayMs > 0)
                 {
-                    finalStatus = BuildActiveStatusMessage(
-                        _currentSettings,
-                        _activeSession.Capture,
-                        recoveredEncoder,
-                        _activeSession.AudioCapture);
-                    Volatile.Write(ref _lastError, null);
-                    Volatile.Write(ref _currentStatus, finalStatus);
+                    await Task.Delay(delayMs).ConfigureAwait(false);
+                }
+
+                if (Volatile.Read(ref _disposed) != 0 || !_isRecording || _currentSettings is null)
+                {
+                    return;
+                }
+
+                bool useDxgiThisAttempt = preferDxgiDuplication && attempt == 0;
+                try
+                {
+                    _activeSession = StartCapturePipelineLocked(_currentSettings, minimumTier, useDxgiThisAttempt);
+                    _isRecording = true;
+                    recoveredSession = _activeSession;
+                    recoveredEncoder = _activeSession.Encoder;
+                    if (recoveredEncoder is not null)
+                    {
+                        finalStatus = BuildActiveStatusMessage(
+                            _currentSettings,
+                            _activeSession.Capture,
+                            recoveredEncoder,
+                            _activeSession.AudioCapture);
+                        Volatile.Write(ref _lastError, null);
+                        Volatile.Write(ref _currentStatus, finalStatus);
+                    }
+
+                    lastException = null;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    TeardownActiveSessionLocked();
+                    EngineLogger.Warn(
+                        "ReplayEngine",
+                        $"Pipeline recovery attempt {attempt + 1}/{RecoveryRetryDelaysMs.Length} failed: {ex.Message}");
                 }
             }
-            catch (Exception ex)
+
+            if (lastException is not null)
             {
                 TeardownActiveSessionLocked();
                 _isRecording = false;
-                fatalError = $"Przechwytywanie wstrzymane po błędzie potoku: {ex.Message}";
+                fatalError = $"Przechwytywanie wstrzymane po błędzie potoku: {lastException.Message}";
                 finalStatus = fatalError;
-                EngineLogger.Error("ReplayEngine", fatalError, ex);
+                EngineLogger.Error("ReplayEngine", fatalError, lastException);
                 Volatile.Write(ref _lastError, fatalError);
                 Volatile.Write(ref _currentStatus, fatalError);
             }
@@ -886,6 +967,7 @@ public sealed class ReplayEngine : IReplayEngine
         private ID3D11Texture2D? _lastProcessedFrame;
         private long _lastSubmittedTimestamp100Ns = -1;
         private Timer? _startupPrimingTimer;
+        private Timer? _staticKeepAliveTimer;
         private int _primingFramesRemaining = MaxStartupPrimingFrames;
         private int _encodeWorkerStopped;
         private int _disposed;
@@ -947,6 +1029,7 @@ public sealed class ReplayEngine : IReplayEngine
 
             _capture.Start();
             ArmStartupPrimingTimer();
+            ArmStaticKeepAliveTimer();
         }
 
         public void HandleCapturedFrame(ID3D11Texture2D bgraTexture, long timestamp100Ns, long frameDuration100Ns)
@@ -960,6 +1043,7 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 ID3D11Texture2D? busyActive;
                 ID3D11Texture2D? busyPending;
+                ID3D11Texture2D? busyCached;
                 lock (_encodeQueueLock)
                 {
                     if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
@@ -969,11 +1053,19 @@ public sealed class ReplayEngine : IReplayEngine
 
                     busyActive = _activeEncodeTexture;
                     busyPending = _pendingEncodeFrame?.Texture;
+                    busyCached = _lastProcessedFrame;
                 }
+
+                MfH264Encoder? currentEncoder = Volatile.Read(ref _encoder);
 
                 // Perform only the fast GPU BGRA->NV12 VideoProcessorBlt on the capture thread (<0.2ms)
                 // and offload staging/encoding to ClipThat.VideoEncodeWorker so capture never stalls DWM.
-                ID3D11Texture2D processed = _gpuProcessor.ProcessFrame(bgraTexture, busyActive, busyPending);
+                ID3D11Texture2D processed = _gpuProcessor.ProcessFrame(
+                    bgraTexture,
+                    busyActive,
+                    busyPending,
+                    candidate => ReferenceEquals(candidate, busyCached) ||
+                                 (currentEncoder is not null && currentEncoder.IsTextureInUse(candidate)));
 
                 lock (_encodeQueueLock)
                 {
@@ -1254,6 +1346,100 @@ public sealed class ReplayEngine : IReplayEngine
             }
         }
 
+        private void ArmStaticKeepAliveTimer()
+        {
+            StopStaticKeepAliveTimer();
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            _staticKeepAliveTimer = new Timer(
+                OnStaticKeepAliveTick,
+                state: null,
+                dueTime: StaticDesktopKeepAliveIntervalMs,
+                period: StaticDesktopKeepAliveIntervalMs);
+        }
+
+        private void OnStaticKeepAliveTick(object? state)
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return;
+            }
+
+            if (!Monitor.TryEnter(_frameSubmitLock))
+            {
+                return;
+            }
+
+            try
+            {
+                MfH264Encoder? encoder = _encoder;
+                if (Volatile.Read(ref _disposed) != 0 || encoder is null || !encoder.HasEmittedKeyframe)
+                {
+                    return;
+                }
+
+                ID3D11Texture2D? cachedFrame;
+                long ts = 0;
+                bool shouldSubmit = false;
+                long nowTicks = _sessionClock.Elapsed.Ticks;
+                long idleThresholdTicks = StaticDesktopKeepAliveIntervalMs * TimeSpan.TicksPerMillisecond;
+
+                lock (_encodeQueueLock)
+                {
+                    cachedFrame = _lastProcessedFrame;
+                    if (cachedFrame is not null &&
+                        _pendingEncodeFrame is null &&
+                        _lastSubmittedTimestamp100Ns >= 0 &&
+                        nowTicks - _lastSubmittedTimestamp100Ns >= idleThresholdTicks)
+                    {
+                        ts = NextMonotonicTimestampLocked(nowTicks);
+                        shouldSubmit = true;
+                    }
+                }
+
+                if (shouldSubmit && cachedFrame is not null)
+                {
+                    // Emit a periodic static keep-alive IDR frame so the ring buffer always maintains
+                    // fresh GOP boundaries even if the user leaves a completely static desktop for hours.
+                    try
+                    {
+                        encoder.EncodeFrame(cachedFrame, ts, _frameIntervalTicks, forceKeyFrame: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        EngineLogger.Warn("ReplayEngine", $"Static keep-alive frame submit failed: {ex.Message}");
+                    }
+                }
+            }
+            finally
+            {
+                Monitor.Exit(_frameSubmitLock);
+            }
+        }
+
+        private void StopStaticKeepAliveTimer()
+        {
+            Timer? timer = Interlocked.Exchange(ref _staticKeepAliveTimer, null);
+            if (timer is not null)
+            {
+                try
+                {
+                    using var stopped = new ManualResetEvent(false);
+                    if (timer.Dispose(stopped))
+                    {
+                        stopped.WaitOne(250);
+                    }
+                }
+                catch
+                {
+                    // Ignore timer disposal errors.
+                }
+            }
+        }
+
         private void StopStartupPrimingTimer()
         {
             Timer? timer = Interlocked.Exchange(ref _startupPrimingTimer, null);
@@ -1261,7 +1447,11 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 try
                 {
-                    timer.Dispose();
+                    using var stopped = new ManualResetEvent(false);
+                    if (timer.Dispose(stopped))
+                    {
+                        stopped.WaitOne(250);
+                    }
                 }
                 catch
                 {
@@ -1282,6 +1472,7 @@ public sealed class ReplayEngine : IReplayEngine
 
             _sessionClock.Stop();
             StopStartupPrimingTimer();
+            StopStaticKeepAliveTimer();
 
             // 1. Stop capture callbacks/loop first so no further frames enter HandleCapturedFrame.
             try

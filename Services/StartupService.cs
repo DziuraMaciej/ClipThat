@@ -11,13 +11,14 @@ namespace ClipThat.Services;
 public sealed class StartupService
 {
     private const string RunKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+    private const string StartupApprovedRunKeyPath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
     private const string ValueName = "ClipThat";
     private const string LauncherScriptFileName = "Start_ClipThat.bat";
     private const string ProjectFileName = "ClipThat.csproj";
 
     /// <summary>
-    /// Returns true if ClipThat is currently registered to start with Windows
-    /// (whether registered as standalone <c>ClipThat.exe</c> or via <c>Start_ClipThat.bat</c> / <c>dotnet.exe</c>).
+    /// Returns true if ClipThat is currently registered to start with Windows and has not been
+    /// explicitly disabled in Windows Task Manager's Startup Apps list.
     /// </summary>
     public bool IsStartupEnabled()
     {
@@ -25,11 +26,53 @@ public sealed class StartupService
         {
             using RegistryKey? key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
             object? value = key?.GetValue(ValueName);
-            return value is string command && !string.IsNullOrWhiteSpace(command);
+            if (value is not string command || string.IsNullOrWhiteSpace(command))
+            {
+                return false;
+            }
+
+            if (IsDisabledInStartupApproved())
+            {
+                return false;
+            }
+
+            return true;
         }
         catch
         {
             return false;
+        }
+    }
+
+    private static bool IsDisabledInStartupApproved()
+    {
+        try
+        {
+            using RegistryKey? approvedKey = Registry.CurrentUser.OpenSubKey(StartupApprovedRunKeyPath, writable: false);
+            if (approvedKey?.GetValue(ValueName) is byte[] data && data.Length > 0)
+            {
+                // Windows encodes enabled entries with an even status byte (0x02/0x06) and disabled entries with an odd byte (0x03/0x07).
+                return (data[0] & 0x01) != 0;
+            }
+        }
+        catch
+        {
+            // Ignore StartupApproved query failures.
+        }
+
+        return false;
+    }
+
+    private static void ClearStartupApprovedOverride()
+    {
+        try
+        {
+            using RegistryKey? approvedKey = Registry.CurrentUser.OpenSubKey(StartupApprovedRunKeyPath, writable: true);
+            approvedKey?.DeleteValue(ValueName, throwOnMissingValue: false);
+        }
+        catch
+        {
+            // Ignore best-effort cleanup of Task Manager StartupApproved override.
         }
     }
 
@@ -72,6 +115,7 @@ public sealed class StartupService
         if (enabled)
         {
             key.SetValue(ValueName, BuildStartupCommand(), RegistryValueKind.String);
+            ClearStartupApprovedOverride();
         }
         else
         {
@@ -140,21 +184,11 @@ public sealed class StartupService
 
         if (!string.IsNullOrWhiteSpace(launcherBatPath))
         {
-            return $"cmd.exe /c start \"\" /min \"{launcherBatPath}\"";
+            return $"cmd.exe /c start \"\" /min \"{launcherBatPath}\" --minimized";
         }
 
         if (!string.IsNullOrWhiteSpace(projectFilePath))
         {
-            string? projectDir = Path.GetDirectoryName(projectFilePath);
-            if (!string.IsNullOrWhiteSpace(projectDir))
-            {
-                string expectedBatPath = Path.Combine(projectDir, LauncherScriptFileName);
-                if (File.Exists(expectedBatPath))
-                {
-                    return $"cmd.exe /c start \"\" /min \"{expectedBatPath}\"";
-                }
-            }
-
             return $"cmd.exe /c start \"\" /min \"{dotnetPath}\" run --project \"{projectFilePath}\" -- --minimized";
         }
 
