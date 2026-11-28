@@ -294,4 +294,15 @@ public sealed class ServicesLifecycleAndPlatformTests
         Assert.True(reached);
         Assert.Equal(200.0, pos);
     }
+
+    [Fact]
+    public void AppStartupFlagParser_DetectsMinimizedVariantsFromStartupOrProcessArgs()
+    {
+        Assert.True(App.ShouldStartMinimized(new[] { "--minimized" }, Array.Empty<string>()));
+        Assert.True(App.ShouldStartMinimized(Array.Empty<string>(), new[] { "  \"--MINIMIZED\"  " }));
+        Assert.True(App.ShouldStartMinimized(new[] { "-minimized" }, null));
+        Assert.True(App.ShouldStartMinimized(null, new[] { "/minimized" }));
+        Assert.False(App.ShouldStartMinimized(Array.Empty<string>(), Array.Empty<string>()));
+        Assert.False(App.ShouldStartMinimized(new[] { "--exit" }, new[] { "--other" }));
+    }
 }

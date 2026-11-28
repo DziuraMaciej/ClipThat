@@ -69,21 +69,27 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
-        if (e.Args.Any(arg => string.Equals(arg, "--exit", StringComparison.OrdinalIgnoreCase)))
+        string[] processArgs = GetProcessCommandLineArguments();
+
+        if (HasFlag(e.Args, processArgs, "--exit", "-exit", "/exit"))
         {
             RequestExistingInstanceExitAndWait(timeoutMs: 5000);
             Shutdown();
             return;
         }
 
-        bool startMinimized = e.Args.Any(arg =>
-            string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
+        bool startMinimized = ShouldStartMinimized(e.Args, processArgs);
 
-        if (!TryAcquireSingleInstance(wakeExistingWindow: !startMinimized))
+        if (!TryAcquireSingleInstance(wakeExistingWindow: !startMinimized, processArgs))
         {
             Shutdown();
             return;
         }
+
+        TryUnregisterApplicationRestart();
+        EngineLogger.Info(
+            "App",
+            $"Startup: Pid={Environment.ProcessId}, StartMinimized={startMinimized}, Args=[{string.Join(", ", processArgs)}]");
 
         SubscribeGlobalExceptionHandlers();
         SessionEnding += OnSessionEnding;
@@ -124,7 +130,7 @@ public partial class App : Application
             // for GPU/encoder/WASAPI hardware initialization to finish.
             if (!startMinimized)
             {
-                ShowMainWindow();
+                ShowMainWindow("StartupManualLaunch");
             }
 
             SyncTrayState();
@@ -193,7 +199,70 @@ public partial class App : Application
         }
     }
 
-    private bool TryAcquireSingleInstance(bool wakeExistingWindow)
+    internal static bool ShouldStartMinimized(string[]? startupArgs, string[]? processArgs)
+        => HasFlag(startupArgs, processArgs, "--minimized", "-minimized", "/minimized");
+
+    internal static bool HasFlag(string[]? startupArgs, string[]? processArgs, params string[] acceptedFlags)
+    {
+        return ContainsFlag(startupArgs, acceptedFlags) || ContainsFlag(processArgs, acceptedFlags);
+
+        static bool ContainsFlag(string[]? args, string[] flags)
+        {
+            if (args is null || args.Length == 0)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < args.Length; i++)
+            {
+                string? raw = args[i];
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    continue;
+                }
+
+                string normalized = raw.Trim().Trim('"');
+                for (int j = 0; j < flags.Length; j++)
+                {
+                    if (string.Equals(normalized, flags[j], StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private static string[] GetProcessCommandLineArguments()
+    {
+        string[] raw = Environment.GetCommandLineArgs();
+        if (raw.Length <= 1)
+        {
+            return Array.Empty<string>();
+        }
+
+        string[] args = new string[raw.Length - 1];
+        Array.Copy(raw, 1, args, 0, args.Length);
+        return args;
+    }
+
+    private static void TryUnregisterApplicationRestart()
+    {
+        try
+        {
+            // Ensure Windows Restart Manager / ARSO never relaunches a second non-minimized copy
+            // alongside the HKCU\...\Run "--minimized" autostart entry after a Windows reboot.
+            _ = UnregisterApplicationRestart();
+        }
+        catch
+        {
+            // Ignore when not registered or unsupported.
+        }
+    }
+
+    private bool TryAcquireSingleInstance(bool wakeExistingWindow, string[] processArgs)
     {
         try
         {
@@ -201,6 +270,10 @@ public partial class App : Application
             if (!createdNew)
             {
                 mutex.Dispose();
+                EngineLogger.Info(
+                    "App",
+                    $"Second instance detected (Pid={Environment.ProcessId}, WakeExistingWindow={wakeExistingWindow}, Args=[{string.Join(", ", processArgs)}]).");
+
                 if (wakeExistingWindow)
                 {
                     try
@@ -224,13 +297,14 @@ public partial class App : Application
 
             _singleInstanceMutex = mutex;
             _showWindowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowWindowEventName);
+            _showWindowEvent.Reset();
             _showWindowWaitRegistration = ThreadPool.RegisterWaitForSingleObject(
                 _showWindowEvent,
-                static (state, _) =>
+                static (state, timedOut) =>
                 {
-                    if (state is App app && !app.IsShuttingDown)
+                    if (!timedOut && state is App app && !app.IsShuttingDown)
                     {
-                        app.Dispatcher.InvokeAsync(app.ShowMainWindow);
+                        app.Dispatcher.InvokeAsync(() => app.ShowMainWindow("SingleInstanceWakeEvent"));
                     }
                 },
                 this,
@@ -238,11 +312,12 @@ public partial class App : Application
                 executeOnlyOnce: false);
 
             _exitApplicationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ExitApplicationEventName);
+            _exitApplicationEvent.Reset();
             _exitApplicationWaitRegistration = ThreadPool.RegisterWaitForSingleObject(
                 _exitApplicationEvent,
-                static (state, _) =>
+                static (state, timedOut) =>
                 {
-                    if (state is App app && !app.IsShuttingDown)
+                    if (!timedOut && state is App app && !app.IsShuttingDown)
                     {
                         app.Dispatcher.InvokeAsync(async () => await app.ExitApplicationAsync());
                     }
@@ -329,7 +404,7 @@ public partial class App : Application
         _toggleRecordingMenuItem.Click += async (_, _) => await ToggleRecordingAsync();
 
         var openMenuItem = new WinForms.ToolStripMenuItem("Otwórz ClipThat");
-        openMenuItem.Click += (_, _) => Dispatcher.Invoke(ShowMainWindow);
+        openMenuItem.Click += (_, _) => Dispatcher.Invoke(() => ShowMainWindow("TrayMenuOpen"));
 
         var exitMenuItem = new WinForms.ToolStripMenuItem("Zamknij");
         exitMenuItem.Click += async (_, _) => await ExitApplicationAsync();
@@ -353,7 +428,7 @@ public partial class App : Application
             ContextMenuStrip = _trayMenu,
             Visible = true
         };
-        _notifyIcon.DoubleClick += (_, _) => Dispatcher.Invoke(ShowMainWindow);
+        _notifyIcon.DoubleClick += (_, _) => Dispatcher.Invoke(() => ShowMainWindow("TrayIconDoubleClick"));
     }
 
     private void InitializeGlobalHotkey(AppSettings settings)
@@ -413,12 +488,14 @@ public partial class App : Application
         }
     }
 
-    private void ShowMainWindow()
+    private void ShowMainWindow(string reason = "Unknown")
     {
         if (IsShuttingDown)
         {
             return;
         }
+
+        EngineLogger.Info("App", $"ShowMainWindow invoked (reason={reason}, existingWindow={_mainWindow is not null}).");
 
         try
         {
@@ -1033,4 +1110,7 @@ public partial class App : Application
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool DestroyIcon(nint hIcon);
+
+    [DllImport("kernel32.dll")]
+    private static extern int UnregisterApplicationRestart();
 }
