@@ -81,9 +81,9 @@ if not defined DOTNET_EXE (
 
 echo Budowanie aplikacji ClipThat (przy pierwszym uruchomieniu pobierany jest FFmpeg)...
 if "%FORCE_REBUILD%"=="1" (
-    "%DOTNET_EXE%" build -c Release --no-incremental --nologo -v q
+    "%DOTNET_EXE%" build -c Release --no-incremental --nologo -v m
 ) else (
-    "%DOTNET_EXE%" build -c Release --nologo -v q
+    "%DOTNET_EXE%" build -c Release --nologo -v m
 )
 if errorlevel 1 (
     echo.
@@ -130,18 +130,20 @@ exit /b 0
 
 :ResolveDotnet
 set "DOTNET_EXE="
-set "CANDIDATE="
-where dotnet >nul 2>&1
-if not errorlevel 1 (
-    set "CANDIDATE=dotnet"
-) else if exist "%ProgramFiles%\dotnet\dotnet.exe" (
-    set "PATH=%ProgramFiles%\dotnet;%PATH%"
-    set "CANDIDATE=%ProgramFiles%\dotnet\dotnet.exe"
+if exist "%ProgramFiles%\dotnet\dotnet.exe" (
+    "%ProgramFiles%\dotnet\dotnet.exe" --list-sdks 2>nul | findstr /R "^[89]\. ^[1-9][0-9]\." >nul 2>&1
+    if not errorlevel 1 (
+        set "PATH=%ProgramFiles%\dotnet;%PATH%"
+        set "DOTNET_EXE=%ProgramFiles%\dotnet\dotnet.exe"
+        exit /b 0
+    )
 )
-if not defined CANDIDATE exit /b 0
 
-"%CANDIDATE%" --list-sdks 2>nul | findstr /R "^[89]\. ^[1-9][0-9]\." >nul 2>&1
+where dotnet >nul 2>&1
+if errorlevel 1 exit /b 0
+
+dotnet --list-sdks 2>nul | findstr /R "^[89]\. ^[1-9][0-9]\." >nul 2>&1
 if not errorlevel 1 (
-    set "DOTNET_EXE=%CANDIDATE%"
+    set "DOTNET_EXE=dotnet"
 )
 exit /b 0
