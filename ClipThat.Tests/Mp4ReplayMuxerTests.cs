@@ -283,6 +283,57 @@ public sealed class Mp4ReplayMuxerTests : IDisposable
     }
 
     [Fact]
+    public void WriteMpegTsIntermediate_EnforcesStrictlyMonotonicPtsWhenPacketsAreCloserThanOne90kTick()
+    {
+        string tsPath = Path.Combine(_tempDir, "monotonic_pts.ts");
+        byte[] spsPps =
+        {
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80
+        };
+        byte[] idrPayload = { 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x11, 0x22 };
+        byte[] pSlicePayload = { 0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x33, 0x44 };
+
+        // Two video packets only 10 ticks (1 microsecond) apart -> would both quantize to PTS 0 without 90 kHz clamping.
+        using var v0 = new EncodedPacket(MediaTrackType.Video, idrPayload, idrPayload.Length, 1000L, 166_667, isKeyframe: true, returnToArrayPool: false);
+        using var v1 = new EncodedPacket(MediaTrackType.Video, pSlicePayload, pSlicePayload.Length, 1010L, 166_667, isKeyframe: false, returnToArrayPool: false);
+
+        var ordered = new List<Mp4ReplayMuxer.IndexedPacket> { new(v0, 0), new(v1, 1) };
+        Mp4ReplayMuxer.WriteMpegTsIntermediate(
+            tsPath,
+            ordered,
+            baseTimestamp100Ns: 1000L,
+            videoSequenceHeader: spsPps,
+            hasSystemAudio: false,
+            hasMicrophoneAudio: false,
+            includeCombinedMix: false);
+
+        byte[] tsBytes = File.ReadAllBytes(tsPath);
+        var videoPtsValues = new List<long>();
+        for (int offset = 0; offset < tsBytes.Length; offset += 188)
+        {
+            bool pusi = (tsBytes[offset + 1] & 0x40) != 0;
+            ushort pid = (ushort)(((tsBytes[offset + 1] & 0x1F) << 8) | tsBytes[offset + 2]);
+            byte afc = (byte)((tsBytes[offset + 3] >> 4) & 0x03);
+            if (!pusi || pid != 0x0100)
+            {
+                continue;
+            }
+
+            int payloadStart = offset + 4;
+            if ((afc & 0x02) != 0)
+            {
+                payloadStart += 1 + tsBytes[payloadStart];
+            }
+
+            videoPtsValues.Add(DecodePts90k(tsBytes.AsSpan(payloadStart + 9, 5)));
+        }
+
+        Assert.Equal(2, videoPtsValues.Count);
+        Assert.True(videoPtsValues[1] > videoPtsValues[0], $"Expected strictly increasing 90 kHz PTS, got {videoPtsValues[0]} then {videoPtsValues[1]}");
+    }
+
+    [Fact]
     public void WriteMpegTsIntermediate_SupportsThreeAudioTracksAndMultiPacketVideoFrames()
     {
         string tsPath = Path.Combine(_tempDir, "multi_track_large.ts");

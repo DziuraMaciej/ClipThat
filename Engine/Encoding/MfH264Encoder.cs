@@ -57,7 +57,7 @@ public sealed class MfH264Encoder : IVideoEncoder
     private static readonly Guid CodecApiAvEncCommonMaxBitRate = new("9651EAE4-39B9-4EBF-85EF-D7F444EC7465");
     private static readonly Guid CodecApiAvEncCommonQualityVsSpeed = new("98332DF8-03CD-476B-89FA-3F9E442DEC9F");
     private static readonly Guid CodecApiAvEncMpvGopSize = new("95F31B26-95A4-41AA-9303-246A7FC6EEF1");
-    private static readonly Guid CodecApiAvEncMpvDefaultBPictureCount = new("8D390AAC-DC5C-4200-B57F-BE7D96342F2D");
+    private static readonly Guid CodecApiAvEncMpvDefaultBPictureCount = new("8D390AAC-DC5C-4200-B57F-814D04BABAB2");
     private static readonly Guid CodecApiAvEncVideoForceKeyFrame = new("398C1B98-8353-475A-9EF2-8F265D260345");
     private static readonly Guid CodecApiAvLowLatencyMode = new("9C27891A-ED7A-40E1-88E8-B22727A024EE");
 
@@ -295,6 +295,7 @@ public sealed class MfH264Encoder : IVideoEncoder
                         }
 
                         QueuedInputItem droppedOldest = _pendingInputQueue.Dequeue();
+                        forceKeyFrame |= droppedOldest.ForceKeyFrame;
                         SafeDisposeSample(droppedOldest.Sample);
                     }
 
@@ -877,6 +878,11 @@ public sealed class MfH264Encoder : IVideoEncoder
             EngineLogger.Warn(
                 "MfH264Encoder",
                 $"Tier {tier}: Skipped MFT \"{friendlyName}\":\n{ex}");
+
+            if (ReferenceEquals(_activeActivate, activate)) _activeActivate = null;
+            if (ReferenceEquals(_transform, transform)) _transform = null;
+            if (ReferenceEquals(_dxgiDeviceManager, dxgiManager)) _dxgiDeviceManager = null;
+            if (ReferenceEquals(_eventGenerator, eventGenerator)) _eventGenerator = null;
 
             SafeDisposeComObject(eventGenerator);
 
@@ -1494,7 +1500,7 @@ public sealed class MfH264Encoder : IVideoEncoder
 
             try
             {
-                _inputWorkSignal.WaitOne(100);
+                _inputWorkSignal.WaitOne(1000);
             }
             catch (ObjectDisposedException)
             {
@@ -1759,6 +1765,9 @@ public sealed class MfH264Encoder : IVideoEncoder
             _reusableOutputBuffer is not null &&
             _reusableOutputCapacity >= requiredCapacity)
         {
+            // Clear stale sample attributes (especially MFSampleExtension_CleanPoint) so P-frames
+            // never inherit CleanPoint = 1 from a preceding IDR frame on reusable output samples.
+            _reusableOutputSample.DeleteAllItems();
             _reusableOutputBuffer.CurrentLength = 0;
             return _reusableOutputSample;
         }
@@ -2162,7 +2171,8 @@ public sealed class MfH264Encoder : IVideoEncoder
                     _drainCompleteEvent.Wait(250);
                 }
 
-                if (Monitor.TryEnter(_mftLock, lockTimeoutMs))
+                acquiredMftLock = Monitor.TryEnter(_mftLock, lockTimeoutMs);
+                if (acquiredMftLock)
                 {
                     try
                     {

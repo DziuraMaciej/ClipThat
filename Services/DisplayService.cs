@@ -10,6 +10,8 @@ namespace ClipThat.Services;
 public sealed class DisplayService
 {
     private const int EnumCurrentSettings = -1;
+    private static readonly short DevModeWSize = (short)Marshal.SizeOf<DevModeW>();
+    private static readonly int DisplayDeviceWSize = Marshal.SizeOf<DisplayDeviceW>();
 
     /// <summary>
     /// Returns all active physical monitors with exact virtual desktop coordinates and refresh rates.
@@ -26,7 +28,7 @@ public sealed class DisplayService
 
             var devMode = new DevModeW
             {
-                dmSize = (short)Marshal.SizeOf<DevModeW>()
+                dmSize = DevModeWSize
             };
 
             bool hasSettings = EnumDisplaySettingsW(screen.DeviceName, EnumCurrentSettings, ref devMode);
@@ -57,7 +59,7 @@ public sealed class DisplayService
     {
         var displayDevice = new DisplayDeviceW
         {
-            cb = Marshal.SizeOf<DisplayDeviceW>()
+            cb = DisplayDeviceWSize
         };
 
         if (EnumDisplayDevicesW(deviceName, 0, ref displayDevice, 0) &&
@@ -75,13 +77,13 @@ public sealed class DisplayService
         return $"Monitor {displayIndex}";
     }
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool EnumDisplaySettingsW(
         string? lpszDeviceName,
         int iModeNum,
         ref DevModeW lpDevMode);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool EnumDisplayDevicesW(
         string? lpDevice,
         uint iDevNum,

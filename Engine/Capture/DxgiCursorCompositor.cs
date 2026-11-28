@@ -22,6 +22,9 @@ internal sealed class DxgiCursorCompositor : IDisposable
     private const uint HdrModePq2084 = 2u;
 
     private static readonly ID3D11RenderTargetView[] NullRenderTargets = { null! };
+    private static readonly object ShaderCacheLock = new();
+    private static byte[]? CachedVsBytecode;
+    private static byte[]? CachedPsBytecode;
     private static readonly ID3D11ShaderResourceView[] NullShaderResources = { null!, null! };
 
     private const string HlslSource = @"
@@ -137,6 +140,8 @@ float4 PSMain(VSOut input) : SV_Target
     private ID3D11ShaderResourceView? _cleanDesktopSrv;
     private ID3D11Texture2D? _compositedTexture;
     private ID3D11RenderTargetView? _compositedRtv;
+    private uint _compositedWidth;
+    private uint _compositedHeight;
     private uint _desktopWidth;
     private uint _desktopHeight;
     private Format _desktopFormat;
@@ -161,8 +166,8 @@ float4 PSMain(VSOut input) : SV_Target
         try
         {
             // Use Shader Model 4.0 so D3D11 Feature Level 10_0 / 10_1 adapters also support GPU cursor compositing.
-            byte[] vsBytecode = CompileHlsl(HlslSource, "VSMain", "vs_4_0");
-            byte[] psBytecode = CompileHlsl(HlslSource, "PSMain", "ps_4_0");
+            // Cache compiled HLSL bytecode statically so session restarts never re-invoke d3dcompiler_47.dll.
+            (byte[] vsBytecode, byte[] psBytecode) = GetOrCompileShaderBytecode();
 
             _vertexShader = _device.CreateVertexShader(vsBytecode);
             _pixelShader = _device.CreatePixelShader(psBytecode);
@@ -484,12 +489,29 @@ float4 PSMain(VSOut input) : SV_Target
         _desktopFormat = effectiveFormat;
     }
 
+    private static (byte[] VsBytecode, byte[] PsBytecode) GetOrCompileShaderBytecode()
+    {
+        byte[]? vs = Volatile.Read(ref CachedVsBytecode);
+        byte[]? ps = Volatile.Read(ref CachedPsBytecode);
+        if (vs is not null && ps is not null)
+        {
+            return (vs, ps);
+        }
+
+        lock (ShaderCacheLock)
+        {
+            CachedVsBytecode ??= CompileHlsl(HlslSource, "VSMain", "vs_4_0");
+            CachedPsBytecode ??= CompileHlsl(HlslSource, "PSMain", "ps_4_0");
+            return (CachedVsBytecode, CachedPsBytecode);
+        }
+    }
+
     private void EnsureCompositedTarget()
     {
         if (_compositedTexture is not null &&
             _compositedRtv is not null &&
-            _compositedTexture.Description.Width == _desktopWidth &&
-            _compositedTexture.Description.Height == _desktopHeight)
+            _compositedWidth == _desktopWidth &&
+            _compositedHeight == _desktopHeight)
         {
             return;
         }
@@ -498,6 +520,8 @@ float4 PSMain(VSOut input) : SV_Target
         _compositedRtv = null;
         _compositedTexture?.Dispose();
         _compositedTexture = null;
+        _compositedWidth = 0;
+        _compositedHeight = 0;
 
         _compositedTexture = _device.CreateTexture2D(new Texture2DDescription
         {
@@ -514,6 +538,8 @@ float4 PSMain(VSOut input) : SV_Target
         });
 
         _compositedRtv = _device.CreateRenderTargetView(_compositedTexture);
+        _compositedWidth = _desktopWidth;
+        _compositedHeight = _desktopHeight;
     }
 
     private void EnsureCursorTexture(uint width, uint height)

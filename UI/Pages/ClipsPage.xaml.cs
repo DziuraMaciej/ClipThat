@@ -74,6 +74,8 @@ public partial class ClipsPage : Page
     private double? _pendingTrimSeekSeconds;
     private double? _lastTrimDragSeconds;
     private double _suspendedPositionSeconds;
+    private int _lastDisplayedCurrentSec = -1;
+    private int _lastDisplayedTotalSec = -1;
 
     private bool _isClipsListCollapsed;
     private int _sidebarAnimationGeneration;
@@ -86,6 +88,7 @@ public partial class ClipsPage : Page
     private bool _isPopulatingExportFileName;
     private bool _userEditedExportFileName;
     private bool _isPreviewSuspendedForClip;
+    private bool _restoreSuspendedPositionOnMediaOpened;
     private bool _isExtractingPreviewAudio;
     private bool _isPreviewAudioReady;
     private bool _isExporting;
@@ -93,6 +96,12 @@ public partial class ClipsPage : Page
     private bool _isDetached;
 
     public bool IsExporting => _isExporting;
+
+    /// <summary>
+    /// Raised on the UI thread when an active export finishes (succeeded, failed, or cancelled),
+    /// allowing a hidden host window to close itself and reclaim WPF memory.
+    /// </summary>
+    public event Action? ExportCompleted;
 
     public ClipsPage(
         SettingsService settingsService,
@@ -306,6 +315,17 @@ public partial class ClipsPage : Page
         }
     }
 
+    private bool IsPageVisibleInHost()
+    {
+        if (_isDetached || !IsLoaded || !IsVisible)
+        {
+            return false;
+        }
+
+        Window? hostWindow = Window.GetWindow(this);
+        return hostWindow is null || hostWindow.IsVisible;
+    }
+
     private void OnDirectoryWatcherError(object sender, ErrorEventArgs e)
     {
         Exception? ex = e.GetException();
@@ -318,7 +338,7 @@ public partial class ClipsPage : Page
 
         Dispatcher.InvokeAsync(() =>
         {
-            if (_isDetached || !IsLoaded)
+            if (!IsPageVisibleInHost())
             {
                 return;
             }
@@ -352,7 +372,7 @@ public partial class ClipsPage : Page
 
         Dispatcher.InvokeAsync(() =>
         {
-            if (_isDetached || !IsLoaded)
+            if (!IsPageVisibleInHost())
             {
                 return;
             }
@@ -365,7 +385,7 @@ public partial class ClipsPage : Page
     private async void WatcherDebounceTimer_Tick(object? sender, EventArgs e)
     {
         _watcherDebounceTimer.Stop();
-        if (_isDetached || !IsLoaded)
+        if (!IsPageVisibleInHost())
         {
             return;
         }
@@ -375,7 +395,7 @@ public partial class ClipsPage : Page
 
     private async Task RefreshClipsAsync(string? preferredSelectionPath = null)
     {
-        if (_isDetached)
+        if (!IsPageVisibleInHost())
         {
             return;
         }
@@ -409,7 +429,7 @@ public partial class ClipsPage : Page
             clips = Array.Empty<ClipItem>();
         }
 
-        if (_isDetached || cts.IsCancellationRequested)
+        if (!IsPageVisibleInHost() || cts.IsCancellationRequested)
         {
             return;
         }
@@ -454,6 +474,7 @@ public partial class ClipsPage : Page
                 if (_isPreviewSuspendedForClip && PreviewMediaElement.Source is null && File.Exists(matchingClip.FilePath))
                 {
                     _isPreviewSuspendedForClip = false;
+                    _restoreSuspendedPositionOnMediaOpened = true;
                     try
                     {
                         if (_clipDurationSeconds > 0.0)
@@ -468,14 +489,15 @@ public partial class ClipsPage : Page
                     }
                     catch (Exception ex)
                     {
+                        _restoreSuspendedPositionOnMediaOpened = false;
                         EngineLogger.Warn("ClipsPage", $"Nie udało się wznowić podglądu wideo: {ex.Message}", ex);
                     }
                 }
 
-                // If preview audio was cleaned up when navigating away from ClipsPage, re-extract it cleanly.
-                if (!_isPreviewAudioReady && !_isExtractingPreviewAudio && matchingClip.AudioTrackCount > 0)
+                // Preview audio streams are initialized lazily on first Play to avoid allocating WaveOutEvent/MF handles while browsing.
+                if (matchingClip.AudioTrackCount <= 0)
                 {
-                    _ = PreparePreviewAudioAsync(matchingClip);
+                    _isPreviewAudioReady = true;
                 }
             }
             else
@@ -536,6 +558,9 @@ public partial class ClipsPage : Page
         _selectedClip = clip;
         _userEditedExportFileName = false;
         _isPreviewSuspendedForClip = false;
+        _restoreSuspendedPositionOnMediaOpened = false;
+        _lastDisplayedCurrentSec = -1;
+        _lastDisplayedTotalSec = -1;
         _clipDurationSeconds = Math.Max(0.0, clip.Duration.TotalSeconds);
         NoPreviewOverlay.Visibility = Visibility.Collapsed;
 
@@ -566,15 +591,9 @@ public partial class ClipsPage : Page
             ShowExportStatus($"Nie udało się załadować podglądu wideo: {ex.Message}", ErrorStatusBrush);
         }
 
-        if (clip.AudioTrackCount > 0)
-        {
-            _ = PreparePreviewAudioAsync(clip);
-        }
-        else
-        {
-            _isPreviewAudioReady = true;
-            HideAudioLoadingOverlay();
-        }
+        // Lazy-init preview audio (WaveOutEvent + MF IMFSourceReader) on first Play instead of eagerly on clip selection.
+        _isPreviewAudioReady = clip.AudioTrackCount <= 0;
+        HideAudioLoadingOverlay();
     }
 
     private bool IsCurrentSelectedClip(ClipItem clip)
@@ -608,7 +627,7 @@ public partial class ClipsPage : Page
                 return (ok, sys, mic);
             }, cts.Token);
 
-            if (_isDetached || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
+            if (!IsPageVisibleInHost() || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
             {
                 try { mfMic?.Dispose(); } catch { /* ignore */ }
                 try { mfSys?.Dispose(); } catch { /* ignore */ }
@@ -646,9 +665,9 @@ public partial class ClipsPage : Page
                 progress,
                 cts.Token);
 
-            if (_isDetached || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
+            if (!IsPageVisibleInHost() || cts.IsCancellationRequested || !IsCurrentSelectedClip(clip))
             {
-                // Clip changed or page unloaded while ffmpeg was running; discard temp WAV files immediately.
+                // Clip changed or page unloaded/hidden while ffmpeg was running; discard temp WAV files immediately.
                 ClipEditorService.TryDeletePreviewFile(extractionResult.SystemAudioWavPath);
                 ClipEditorService.TryDeletePreviewFile(extractionResult.MicrophoneAudioWavPath);
                 return;
@@ -913,7 +932,10 @@ public partial class ClipsPage : Page
         _wasPlayingBeforeTimelineScrub = false;
         _isDraggingTrimHandle = false;
         _isPreviewSuspendedForClip = false;
+        _restoreSuspendedPositionOnMediaOpened = false;
         _suspendedPositionSeconds = 0.0;
+        _lastDisplayedCurrentSec = -1;
+        _lastDisplayedTotalSec = -1;
 
         DisposeAudioMixerAndDeleteTempFiles();
         HideAudioLoadingOverlay();
@@ -1032,7 +1054,10 @@ public partial class ClipsPage : Page
         ExportButton.IsEnabled = canInteract && _clipDurationSeconds > 0.0;
     }
 
-    private void InitializeTimelineAndTrimRange(double durationSeconds, bool resetRangeToFull)
+    private void InitializeTimelineAndTrimRange(
+        double durationSeconds,
+        bool resetRangeToFull,
+        double? initialPositionSeconds = null)
     {
         double safeMax = durationSeconds > 0.0 ? durationSeconds : 1.0;
 
@@ -1044,9 +1069,11 @@ public partial class ClipsPage : Page
             ? (durationSeconds > 0.0 ? durationSeconds : 1.0)
             : Math.Clamp(TrimRangeSlider.EndValue, targetStart, safeMax);
 
-        double targetPosition = resetRangeToFull
-            ? 0.0
-            : Math.Clamp(TrimRangeSlider.CurrentPosition, 0.0, safeMax);
+        double targetPosition = initialPositionSeconds.HasValue
+            ? Math.Clamp(initialPositionSeconds.Value, 0.0, safeMax)
+            : resetRangeToFull
+                ? 0.0
+                : Math.Clamp(TrimRangeSlider.CurrentPosition, 0.0, safeMax);
 
         TrimRangeSlider.SetRange(
             minimum: 0.0,
@@ -1069,6 +1096,9 @@ public partial class ClipsPage : Page
         PreviewMediaElement.IsMuted = true;
         PreviewMediaElement.Volume = 0.0;
 
+        bool restoreSuspendedPosition = _restoreSuspendedPositionOnMediaOpened;
+        _restoreSuspendedPositionOnMediaOpened = false;
+
         if (PreviewMediaElement.NaturalDuration.HasTimeSpan &&
             PreviewMediaElement.NaturalDuration.TimeSpan > TimeSpan.Zero)
         {
@@ -1078,10 +1108,13 @@ public partial class ClipsPage : Page
             bool endAtFullDuration = !hadValidDuration ||
                                      Math.Abs(TrimRangeSlider.EndValue - _clipDurationSeconds) < 0.25;
             _clipDurationSeconds = naturalSeconds;
+            double? restoredPosition = restoreSuspendedPosition
+                ? Math.Clamp(_suspendedPositionSeconds, 0.0, naturalSeconds)
+                : null;
 
             if (startAtBeginning && endAtFullDuration)
             {
-                InitializeTimelineAndTrimRange(naturalSeconds, resetRangeToFull: true);
+                InitializeTimelineAndTrimRange(naturalSeconds, resetRangeToFull: true, initialPositionSeconds: restoredPosition);
             }
             else
             {
@@ -1089,7 +1122,7 @@ public partial class ClipsPage : Page
                 double preservedEnd = endAtFullDuration
                     ? naturalSeconds
                     : Math.Clamp(TrimRangeSlider.EndValue, preservedStart, naturalSeconds);
-                double preservedPos = Math.Clamp(TrimRangeSlider.CurrentPosition, 0.0, naturalSeconds);
+                double preservedPos = restoredPosition ?? Math.Clamp(TrimRangeSlider.CurrentPosition, 0.0, naturalSeconds);
 
                 TrimRangeSlider.SetRange(
                     minimum: 0.0,
@@ -1137,7 +1170,8 @@ public partial class ClipsPage : Page
         }
 
         PausePlayback();
-        ShowExportStatus($"Nie udało się odtworzyć podglądu: {e.ErrorException.Message}", ErrorStatusBrush);
+        string errorMessage = e.ErrorException?.Message ?? "Nieznany błąd odtwarzania";
+        ShowExportStatus($"Nie udało się odtworzyć podglądu: {errorMessage}", ErrorStatusBrush);
     }
 
     private void VideoSurface_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -1212,11 +1246,19 @@ public partial class ClipsPage : Page
             PreviewMediaElement.IsMuted = true;
             PreviewMediaElement.Volume = 0.0;
             PreviewMediaElement.Play();
-            TryStartWaveOut();
 
             _isPlaying = true;
             _playbackTimer.Start();
             UpdatePlayPauseButtonVisual();
+
+            if (_selectedClip.AudioTrackCount > 0 && !_isPreviewAudioReady && !_isExtractingPreviewAudio)
+            {
+                _ = PreparePreviewAudioAsync(_selectedClip);
+            }
+            else
+            {
+                TryStartWaveOut();
+            }
         }
     }
 
@@ -1648,8 +1690,17 @@ public partial class ClipsPage : Page
 
     private void UpdateTimeReadout(TimeSpan currentPosition)
     {
-        string currentText = ClipItem.FormatDuration(currentPosition);
-        string totalText = ClipItem.FormatDuration(TimeSpan.FromSeconds(_clipDurationSeconds));
+        int currentWholeSec = Math.Max(0, (int)Math.Floor(currentPosition.TotalSeconds));
+        int totalWholeSec = Math.Max(0, (int)Math.Floor(Math.Max(0.0, _clipDurationSeconds)));
+        if (currentWholeSec == _lastDisplayedCurrentSec && totalWholeSec == _lastDisplayedTotalSec)
+        {
+            return;
+        }
+
+        _lastDisplayedCurrentSec = currentWholeSec;
+        _lastDisplayedTotalSec = totalWholeSec;
+        string currentText = ClipItem.FormatDuration(TimeSpan.FromSeconds(currentWholeSec));
+        string totalText = ClipItem.FormatDuration(TimeSpan.FromSeconds(totalWholeSec));
         TimeReadoutText.Text = $"{currentText} / {totalText}";
     }
 
@@ -1870,7 +1921,11 @@ public partial class ClipsPage : Page
                 : $"Wyeksportowano klip: {exportedName}";
 
             ShowExportStatus(successMessage, SuccessStatusBrush);
-            await RefreshClipsAsync(preferredSelectionPath: _selectedClip?.FilePath);
+            _watcherDebounceTimer.Stop();
+            if (IsPageVisibleInHost())
+            {
+                await RefreshClipsAsync(preferredSelectionPath: _selectedClip?.FilePath);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1888,6 +1943,7 @@ public partial class ClipsPage : Page
         }
         finally
         {
+            bool shouldNotifyExportCompleted = false;
             if (!_isDetached)
             {
                 _isExporting = false;
@@ -1895,6 +1951,12 @@ public partial class ClipsPage : Page
                 ExportProgressBar.Visibility = Visibility.Collapsed;
                 ExportProgressBar.IsIndeterminate = false;
                 SetEditorControlsEnabled(hasClip: _selectedClip is not null);
+                shouldNotifyExportCompleted = true;
+            }
+
+            if (shouldNotifyExportCompleted)
+            {
+                ExportCompleted?.Invoke();
             }
         }
     }

@@ -120,7 +120,20 @@ public partial class SettingsPage : Page
             _hasPendingSliderSave = false;
             try
             {
-                _settingsService.Save(_workingSettings);
+                AppSettings finalSnapshot = _workingSettings.Clone();
+                finalSnapshot.Normalize();
+                _settingsService.Save(finalSnapshot);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await _replayEngine.UpdateSettingsAsync(finalSnapshot).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        // Ignore best-effort engine sync errors on window close.
+                    }
+                });
             }
             catch
             {
@@ -186,7 +199,7 @@ public partial class SettingsPage : Page
         // explicitly clicks a monitor tile so unrelated setting edits never trigger a capture restart.
         MonitorLayout.Initialize(_displayService, _workingSettings.SelectedMonitorDeviceName);
 
-        RefreshAudioDeviceLists();
+        _ = RefreshAudioDeviceListsAsync();
 
         DurationSlider.Value = _workingSettings.BufferDurationMinutes;
         DurationValueText.Text = $"{_workingSettings.BufferDurationMinutes} min";
@@ -233,9 +246,23 @@ public partial class SettingsPage : Page
         }
     }
 
-    private void RefreshAudioDeviceLists()
+    private int _audioRefreshGeneration;
+
+    private async Task RefreshAudioDeviceListsAsync()
     {
         if (_isDetached)
+        {
+            return;
+        }
+
+        int generation = Interlocked.Increment(ref _audioRefreshGeneration);
+        string? configuredSystemId = _workingSettings.SystemAudioDeviceId;
+        string? configuredMicId = _workingSettings.MicrophoneDeviceId;
+
+        (IReadOnlyList<AudioDeviceInfo> rawPlayback, IReadOnlyList<AudioDeviceInfo> rawCapture) =
+            await Task.Run(_audioDeviceService.GetPlaybackAndCaptureDevices).ConfigureAwait(true);
+
+        if (_isDetached || Volatile.Read(ref _audioRefreshGeneration) != generation)
         {
             return;
         }
@@ -244,15 +271,15 @@ public partial class SettingsPage : Page
         try
         {
             IReadOnlyList<AudioDeviceInfo> playbackDevices = EnsureConfiguredDevicePresent(
-                _audioDeviceService.GetPlaybackDevices(),
-                _workingSettings.SystemAudioDeviceId,
+                rawPlayback,
+                _workingSettings.SystemAudioDeviceId ?? configuredSystemId,
                 disconnectedLabel: "Odłączone urządzenie audio (zapisane)");
             SystemAudioComboBox.ItemsSource = playbackDevices;
             SystemAudioComboBox.SelectedItem = FindMatchingAudioDevice(playbackDevices, _workingSettings.SystemAudioDeviceId);
 
             IReadOnlyList<AudioDeviceInfo> captureDevices = EnsureConfiguredDevicePresent(
-                _audioDeviceService.GetCaptureDevices(),
-                _workingSettings.MicrophoneDeviceId,
+                rawCapture,
+                _workingSettings.MicrophoneDeviceId ?? configuredMicId,
                 disconnectedLabel: "Odłączony mikrofon (zapisany)");
             MicrophoneComboBox.ItemsSource = captureDevices;
             MicrophoneComboBox.SelectedItem = FindMatchingAudioDevice(captureDevices, _workingSettings.MicrophoneDeviceId);
@@ -449,7 +476,14 @@ public partial class SettingsPage : Page
             }
         }
 
-        if (dialog.ShowDialog() == true && !string.IsNullOrWhiteSpace(dialog.FolderName))
+        if (_isDetached)
+        {
+            return;
+        }
+
+        Window? owner = Window.GetWindow(this);
+        bool? confirmed = owner is not null ? dialog.ShowDialog(owner) : dialog.ShowDialog();
+        if (!_isDetached && confirmed == true && !string.IsNullOrWhiteSpace(dialog.FolderName))
         {
             OutputDirectoryTextBox.Text = dialog.FolderName;
             _workingSettings.OutputDirectory = dialog.FolderName;
@@ -575,7 +609,7 @@ public partial class SettingsPage : Page
                 snapshot.Normalize();
                 await _replayEngine.UpdateSettingsAsync(snapshot);
             }
-            while (_hasPendingEngineUpdate && !_isDetached);
+            while (_hasPendingEngineUpdate);
         }
         catch (Exception ex)
         {
@@ -628,7 +662,14 @@ public partial class SettingsPage : Page
         SaveReplayButton.IsEnabled = false;
         try
         {
-            await _replayEngine.SaveReplayAsync();
+            if (Application.Current is App app)
+            {
+                await app.RequestSaveReplayAsync("SaveReplayFromSettingsAsync");
+            }
+            else
+            {
+                await _replayEngine.SaveReplayAsync();
+            }
         }
         catch (Exception ex)
         {
@@ -671,7 +712,11 @@ public partial class SettingsPage : Page
                 SaveWorkingSettingsOnly();
             }
 
-            if (_replayEngine.IsRecording)
+            if (Application.Current is App app)
+            {
+                await app.RequestToggleRecordingAsync();
+            }
+            else if (_replayEngine.IsRecording)
             {
                 await _replayEngine.StopAsync();
             }
@@ -727,7 +772,7 @@ public partial class SettingsPage : Page
 
     private void ScheduleAudioDevicesRefresh()
     {
-        if (_isDetached)
+        if (_isDetached || !IsLoaded || !IsVisible)
         {
             return;
         }
@@ -739,7 +784,10 @@ public partial class SettingsPage : Page
     private void AudioDevicesDebounceTimer_Tick(object? sender, EventArgs e)
     {
         _audioDevicesDebounceTimer.Stop();
-        RefreshAudioDeviceLists();
+        if (!_isDetached && IsLoaded && IsVisible)
+        {
+            _ = RefreshAudioDeviceListsAsync();
+        }
     }
 
     private void OnEngineStatusChanged(string status)
@@ -749,17 +797,19 @@ public partial class SettingsPage : Page
             return;
         }
 
-        EngineStatusLevel level = _replayEngine.StatusLevel;
-        bool isError = level == EngineStatusLevel.Error;
-        string? errorDetail = isError ? status : _replayEngine.LastError;
-        string? infoDetail = isError || level == EngineStatusLevel.Paused ? null : status;
-
         Dispatcher.InvokeAsync(() =>
         {
-            if (!_isDetached)
+            if (_isDetached)
             {
-                UpdateEngineControls(_replayEngine.IsRecording, errorDetail, infoDetail);
+                return;
             }
+
+            EngineStatusLevel level = _replayEngine.StatusLevel;
+            bool isError = level == EngineStatusLevel.Error;
+            string? currentStatus = _replayEngine.CurrentStatus ?? status;
+            string? errorDetail = isError ? currentStatus : _replayEngine.LastError;
+            string? infoDetail = isError || level == EngineStatusLevel.Paused ? null : currentStatus;
+            UpdateEngineControls(_replayEngine.IsRecording, errorDetail, infoDetail);
         });
     }
 

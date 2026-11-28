@@ -30,9 +30,14 @@
         <ui:TitleBar Grid.Row="0"
                      Title="ClipThat"
                      Height="36"
-                     Padding="16,0,16,0"
+                     Padding="12,0,8,0"
                      Background="{DynamicResource AppRailBrush}"
                      CloseWindowByDoubleClickOnIcon="True">
+            <ui:TitleBar.Icon>
+                <ui:ImageIcon Source="pack://application:,,,/Assets/app.ico"
+                              Width="16"
+                              Height="16" />
+            </ui:TitleBar.Icon>
             <ui:TitleBar.Resources>
                 <Style TargetType="{x:Type ui:TitleBarButton}"
                        BasedOn="{StaticResource {x:Type ui:TitleBarButton}}">
@@ -61,6 +66,13 @@
                                        Icon="{ui:SymbolIcon Video24}"
                                        TargetPageType="{x:Type pages:ClipsPage}" />
             </ui:NavigationView.MenuItems>
+            <ui:NavigationView.FooterMenuItems>
+                <ui:NavigationViewItem x:Name="UpdateNavItem"
+                                       Content="Aktualizacja"
+                                       Icon="{ui:SymbolIcon ArrowDownload24}"
+                                       PreviewMouseLeftButtonUp="UpdateNavItem_PreviewMouseLeftButtonUp"
+                                       PreviewKeyDown="UpdateNavItem_PreviewKeyDown" />
+            </ui:NavigationView.FooterMenuItems>
         </ui:NavigationView>
     </Grid>
 </ui:FluentWindow>

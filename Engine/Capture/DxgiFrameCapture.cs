@@ -227,21 +227,25 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
         // Request 1 ms system timer resolution while capturing so 60 FPS pacing and short sleeps
         // do not snap to Windows' default 15.6 ms timer tick.
-        bool timerPeriodRaised = timeBeginPeriod(1) == 0;
+        nint highResTimer = CreateWaitableTimerExW(
+            nint.Zero,
+            nint.Zero,
+            CreateWaitableTimerHighResolution,
+            TimerAllAccess);
         try
         {
-            CaptureLoopCore();
+            CaptureLoopCore(highResTimer);
         }
         finally
         {
-            if (timerPeriodRaised)
+            if (highResTimer != nint.Zero)
             {
-                _ = timeEndPeriod(1);
+                CloseHandle(highResTimer);
             }
         }
     }
 
-    private void CaptureLoopCore()
+    private void CaptureLoopCore(nint highResTimer)
     {
         int consecutiveAccessLost = 0;
         int consecutiveErrors = 0;
@@ -288,8 +292,8 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                 long remainingTicks = nextSlotTicks - nowTicks;
                 if (remainingTicks > TimeSpan.TicksPerMillisecond)
                 {
-                    int sleepMs = (int)Math.Min(remainingTicks / TimeSpan.TicksPerMillisecond, 30);
-                    if (sleepMs > 0 && _stopEvent.Wait(sleepMs))
+                    long waitTicks = Math.Min(remainingTicks, 30 * TimeSpan.TicksPerMillisecond);
+                    if (WaitForPacingSlot(highResTimer, waitTicks))
                     {
                         return;
                     }
@@ -297,7 +301,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                     continue;
                 }
 
-                uint acquireTimeoutMs = (uint)Math.Clamp(_frameIntervalTicks / TimeSpan.TicksPerMillisecond, 10, 34);
+                // Wait up to 100 ms on a completely idle desktop (10 wakeups/s instead of 60);
+                // AcquireNextFrame still returns immediately on any screen or hardware cursor change.
+                const uint acquireTimeoutMs = 100u;
                 Result hr = duplication.AcquireNextFrame(acquireTimeoutMs, out OutduplFrameInfo frameInfo, out IDXGIResource? desktopResource);
 
                 if (hr == Vortice.DXGI.ResultCode.WaitTimeout)
@@ -655,12 +661,47 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
     private static void SafeDispose(IDisposable? disposable)
         => EngineDisposeHelper.SafeDispose(disposable, "Błąd zwalniania zasobu DXGI/D3D11");
 
+    private bool WaitForPacingSlot(nint highResTimer, long waitTicks100Ns)
+    {
+        if (highResTimer != nint.Zero && waitTicks100Ns > 0)
+        {
+            long dueTime = -waitTicks100Ns;
+            if (SetWaitableTimer(highResTimer, ref dueTime, 0, nint.Zero, nint.Zero, false))
+            {
+                _ = WaitForSingleObject(highResTimer, 40u);
+                return Volatile.Read(ref _stopped) != 0 || _stopEvent.IsSet;
+            }
+        }
+
+        int sleepMs = (int)(waitTicks100Ns / TimeSpan.TicksPerMillisecond);
+        return sleepMs > 0 && _stopEvent.Wait(sleepMs);
+    }
+
+    private const uint CreateWaitableTimerHighResolution = 0x00000002u;
+    private const uint TimerAllAccess = 0x001F0003u;
+
     [DllImport("user32.dll", SetLastError = true)]
     private static extern nint SetThreadDpiAwarenessContext(nint dpiContext);
 
-    [DllImport("winmm.dll", ExactSpelling = true)]
-    private static extern uint timeBeginPeriod(uint uPeriod);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint CreateWaitableTimerExW(
+        nint lpTimerAttributes,
+        nint lpTimerName,
+        uint dwFlags,
+        uint dwDesiredAccess);
 
-    [DllImport("winmm.dll", ExactSpelling = true)]
-    private static extern uint timeEndPeriod(uint uPeriod);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetWaitableTimer(
+        nint hTimer,
+        ref long lpDueTime,
+        int lPeriod,
+        nint pfnCompletionRoutine,
+        nint lpArgToCompletionRoutine,
+        bool fResume);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(nint hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(nint hObject);
 }

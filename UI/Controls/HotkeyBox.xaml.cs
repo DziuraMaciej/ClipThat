@@ -103,13 +103,28 @@ public partial class HotkeyBox : UserControl
 
         if (_hotkeyService is not null && _currentVirtualKey != 0)
         {
-            bool restored = _hotkeyService.UpdateHotkey(_currentModifiers, _currentVirtualKey);
-            if (!restored)
+            try
             {
-                string label = GlobalHotkeyService.FormatHotkey(_currentModifiers, _currentVirtualKey);
-                ShowWarning(
-                    $"Nie udało się przywrócić skrótu „{label}” — prawdopodobnie jest używany przez inną aplikację.");
+                bool restored = _hotkeyService.UpdateHotkey(_currentModifiers, _currentVirtualKey);
+                if (restored)
+                {
+                    ClearWarning();
+                }
+                else
+                {
+                    string label = GlobalHotkeyService.FormatHotkey(_currentModifiers, _currentVirtualKey);
+                    ShowWarning(
+                        $"Nie udało się przywrócić skrótu „{label}” — prawdopodobnie jest używany przez inną aplikację.");
+                }
             }
+            catch (ObjectDisposedException)
+            {
+                // Application is shutting down and GlobalHotkeyService was already disposed.
+            }
+        }
+        else
+        {
+            ClearWarning();
         }
     }
 

@@ -153,7 +153,10 @@ public sealed class ReplayEngine : IReplayEngine
 
         bool wasRecording;
 
-        await _gate.WaitAsync().ConfigureAwait(false);
+        if (!await TryEnterGateAsync().ConfigureAwait(false))
+        {
+            return;
+        }
         try
         {
             if (Volatile.Read(ref _disposed) != 0)
@@ -169,7 +172,7 @@ public sealed class ReplayEngine : IReplayEngine
         }
         finally
         {
-            _gate.Release();
+            ReleaseGateSafe();
         }
 
         if (wasRecording)
@@ -306,7 +309,10 @@ public sealed class ReplayEngine : IReplayEngine
         uint targetBitrateBps = 0;
         EncodedPacketSnapshot? snapshot = null;
 
-        await _gate.WaitAsync().ConfigureAwait(false);
+        if (!await TryEnterGateAsync().ConfigureAwait(false))
+        {
+            return null;
+        }
         try
         {
             if (Volatile.Read(ref _disposed) != 0)
@@ -342,7 +348,7 @@ public sealed class ReplayEngine : IReplayEngine
         }
         finally
         {
-            _gate.Release();
+            ReleaseGateSafe();
         }
 
         if (!isRecordingSnapshot || string.IsNullOrWhiteSpace(outputDirectory))
@@ -616,7 +622,10 @@ public sealed class ReplayEngine : IReplayEngine
         IVideoEncoder? nextEncoderToMonitor = null;
         bool deferWatchdog = false;
 
-        await _gate.WaitAsync().ConfigureAwait(false);
+        if (!await TryEnterGateAsync().ConfigureAwait(false))
+        {
+            return;
+        }
         try
         {
             if (Volatile.Read(ref _disposed) != 0 ||
@@ -732,7 +741,7 @@ public sealed class ReplayEngine : IReplayEngine
         }
         finally
         {
-            _gate.Release();
+            ReleaseGateSafe();
         }
 
         if (deferWatchdog)
@@ -767,11 +776,11 @@ public sealed class ReplayEngine : IReplayEngine
     private void OnSessionClosed(CapturePipelineSession closedSession)
     {
         bool preferDxgi = ShouldRetryDxgiAfterCaptureInterruption(closedSession);
-        _ = Task.Run(() => RecoverFromSessionInterruptionAsync(
+        LaunchRecoveryAsync(
             closedSession,
             "Monitor zmienił stan — ponowne uruchamianie przechwytywania...",
             minimumTier: EncoderNegotiationTier.HardwareGpuZeroCopy,
-            preferDxgiDuplication: preferDxgi));
+            preferDxgiDuplication: preferDxgi);
     }
 
     private void OnActivePipelineFault(CapturePipelineSession faultedSession, Exception exception, bool isEncoderFault)
@@ -793,11 +802,31 @@ public sealed class ReplayEngine : IReplayEngine
             preferDxgi = ShouldRetryDxgiAfterCaptureInterruption(faultedSession);
         }
 
-        _ = Task.Run(() => RecoverFromSessionInterruptionAsync(
+        LaunchRecoveryAsync(
             faultedSession,
             $"Błąd potoku wideo ({exception.Message}) — próba wznowienia ({recoveryTier})...",
             minimumTier: recoveryTier,
-            preferDxgiDuplication: preferDxgi));
+            preferDxgiDuplication: preferDxgi);
+    }
+
+    private void LaunchRecoveryAsync(
+        CapturePipelineSession session,
+        string notice,
+        EncoderNegotiationTier minimumTier,
+        bool preferDxgiDuplication)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RecoverFromSessionInterruptionAsync(session, notice, minimumTier, preferDxgiDuplication)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                EngineLogger.Error("ReplayEngine", $"Unhandled recovery exception: {ex.Message}", ex);
+            }
+        });
     }
 
     private bool ShouldRetryDxgiAfterCaptureInterruption(CapturePipelineSession session)
@@ -833,7 +862,10 @@ public sealed class ReplayEngine : IReplayEngine
         IVideoEncoder? recoveredEncoder = null;
         long expectedGeneration = 0;
 
-        await _gate.WaitAsync().ConfigureAwait(false);
+        if (!await TryEnterGateAsync().ConfigureAwait(false))
+        {
+            return;
+        }
         try
         {
             if (Volatile.Read(ref _disposed) != 0 ||
@@ -851,7 +883,7 @@ public sealed class ReplayEngine : IReplayEngine
         }
         finally
         {
-            _gate.Release();
+            ReleaseGateSafe();
         }
 
         Exception? lastException = null;
@@ -871,7 +903,10 @@ public sealed class ReplayEngine : IReplayEngine
                 return;
             }
 
-            await _gate.WaitAsync().ConfigureAwait(false);
+            if (!await TryEnterGateAsync().ConfigureAwait(false))
+            {
+                return;
+            }
             try
             {
                 if (Volatile.Read(ref _disposed) != 0 ||
@@ -915,13 +950,16 @@ public sealed class ReplayEngine : IReplayEngine
             }
             finally
             {
-                _gate.Release();
+                ReleaseGateSafe();
             }
         }
 
         if (lastException is not null)
         {
-            await _gate.WaitAsync().ConfigureAwait(false);
+            if (!await TryEnterGateAsync().ConfigureAwait(false))
+            {
+                return;
+            }
             try
             {
                 if (Volatile.Read(ref _disposed) == 0 &&
@@ -939,7 +977,7 @@ public sealed class ReplayEngine : IReplayEngine
             }
             finally
             {
-                _gate.Release();
+                ReleaseGateSafe();
             }
         }
 
@@ -993,6 +1031,36 @@ public sealed class ReplayEngine : IReplayEngine
         return string.IsNullOrWhiteSpace(audioError)
             ? baseStatus
             : $"{baseStatus} · {audioError}";
+    }
+
+    private async Task<bool> TryEnterGateAsync()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            await _gate.WaitAsync().ConfigureAwait(false);
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    private void ReleaseGateSafe()
+    {
+        try
+        {
+            _gate.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Engine was disposed concurrently while exiting _gate.
+        }
     }
 
     public void Dispose()
@@ -1196,7 +1264,18 @@ public sealed class ReplayEngine : IReplayEngine
                     monotonicTs = NextMonotonicTimestampLocked(timestamp100Ns);
                 }
 
-                encoder.EncodeFrame(bgraTexture, monotonicTs, frameDuration100Ns);
+                try
+                {
+                    encoder.EncodeFrame(bgraTexture, monotonicTs, frameDuration100Ns);
+                }
+                catch (Exception ex)
+                {
+                    if (Volatile.Read(ref _disposed) == 0 && Volatile.Read(ref _encodeWorkerStopped) == 0)
+                    {
+                        EngineLogger.Error("ReplayEngine", $"Synchronous fallback video encode failed: {ex.Message}", ex);
+                        _onEncodeError(ex);
+                    }
+                }
             }
         }
 
@@ -1209,17 +1288,13 @@ public sealed class ReplayEngine : IReplayEngine
                 {
                     nextFrame = _pendingEncodeFrame;
                     _pendingEncodeFrame = null;
-                    if (nextFrame.HasValue)
-                    {
-                        _activeEncodeTexture = nextFrame.Value.Texture;
-                    }
                 }
 
                 if (!nextFrame.HasValue)
                 {
                     try
                     {
-                        _encodeWorkSignal.WaitOne(100);
+                        _encodeWorkSignal.WaitOne(1000);
                     }
                     catch (ObjectDisposedException)
                     {
@@ -1229,9 +1304,9 @@ public sealed class ReplayEngine : IReplayEngine
                     continue;
                 }
 
+                PendingVideoFrame frame = nextFrame.Value;
                 try
                 {
-                    PendingVideoFrame frame = nextFrame.Value;
                     lock (_frameSubmitLock)
                     {
                         if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
@@ -1239,8 +1314,26 @@ public sealed class ReplayEngine : IReplayEngine
                             break;
                         }
 
-                        IVideoEncoder? encoder = _encoder;
-                        encoder?.EncodeFrame(frame.Texture, frame.Timestamp100Ns, frame.Duration100Ns);
+                        lock (_encodeQueueLock)
+                        {
+                            _activeEncodeTexture = frame.Texture;
+                        }
+
+                        try
+                        {
+                            IVideoEncoder? encoder = _encoder;
+                            encoder?.EncodeFrame(frame.Texture, frame.Timestamp100Ns, frame.Duration100Ns);
+                        }
+                        finally
+                        {
+                            lock (_encodeQueueLock)
+                            {
+                                if (ReferenceEquals(_activeEncodeTexture, frame.Texture))
+                                {
+                                    _activeEncodeTexture = null;
+                                }
+                            }
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -1249,13 +1342,6 @@ public sealed class ReplayEngine : IReplayEngine
                     {
                         EngineLogger.Error("ReplayEngine", $"Background video encode worker failed: {ex.Message}", ex);
                         _onEncodeError(ex);
-                    }
-                }
-                finally
-                {
-                    lock (_encodeQueueLock)
-                    {
-                        _activeEncodeTexture = null;
                     }
                 }
             }
@@ -1412,25 +1498,30 @@ public sealed class ReplayEngine : IReplayEngine
                 lock (_encodeQueueLock)
                 {
                     cachedFrame = _lastProcessedFrame;
-                    if (cachedFrame is not null && nowTicks - _lastSubmittedTimestamp100Ns >= _frameIntervalTicks)
-                    {
-                        _activeEncodeTexture = cachedFrame;
-                        ts = NextMonotonicTimestampLocked(nowTicks);
-                        shouldSubmit = true;
-                    }
                 }
 
                 if (cachedFrame is not null)
                 {
+                    if (Interlocked.Decrement(ref _primingFramesRemaining) < 0)
+                    {
+                        shouldStopTimer = true;
+                        return;
+                    }
+
+                    lock (_encodeQueueLock)
+                    {
+                        cachedFrame = _lastProcessedFrame;
+                        if (cachedFrame is not null && nowTicks - _lastSubmittedTimestamp100Ns >= _frameIntervalTicks)
+                        {
+                            _activeEncodeTexture = cachedFrame;
+                            ts = NextMonotonicTimestampLocked(nowTicks);
+                            shouldSubmit = true;
+                        }
+                    }
+
                     try
                     {
-                        if (Interlocked.Decrement(ref _primingFramesRemaining) < 0)
-                        {
-                            shouldStopTimer = true;
-                            return;
-                        }
-
-                        if (shouldSubmit)
+                        if (shouldSubmit && cachedFrame is not null)
                         {
                             try
                             {
@@ -1465,7 +1556,8 @@ public sealed class ReplayEngine : IReplayEngine
 
             if (shouldStopTimer)
             {
-                StopStartupPrimingTimer();
+                // Avoid self-deadlocking Timer.Dispose(WaitHandle) from inside the timer's own callback.
+                StopStartupPrimingTimer(waitForCallbackExit: false);
             }
         }
 
@@ -1574,13 +1666,19 @@ public sealed class ReplayEngine : IReplayEngine
             }
         }
 
-        private void StopStartupPrimingTimer()
+        private void StopStartupPrimingTimer(bool waitForCallbackExit = true)
         {
             Timer? timer = Interlocked.Exchange(ref _startupPrimingTimer, null);
             if (timer is not null)
             {
                 try
                 {
+                    if (!waitForCallbackExit)
+                    {
+                        timer.Dispose();
+                        return;
+                    }
+
                     using var stopped = new ManualResetEvent(false);
                     if (timer.Dispose(stopped))
                     {

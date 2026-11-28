@@ -64,7 +64,10 @@ public partial class MonitorLayoutControl : UserControl
         ArgumentNullException.ThrowIfNull(displayService);
         _displayService = displayService;
         SelectedMonitorDeviceName = selectedMonitorDeviceName;
-        RefreshDisplays();
+        if (IsLoaded)
+        {
+            RefreshDisplays();
+        }
     }
 
     public void RefreshDisplays()
@@ -512,7 +515,18 @@ public partial class MonitorLayoutControl : UserControl
 
     private void OnSystemDisplaySettingsChanged(object? sender, EventArgs e)
     {
-        Dispatcher.InvokeAsync(RefreshDisplays);
+        if (!_displayEventsSubscribed)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (IsLoaded && _displayEventsSubscribed)
+            {
+                RefreshDisplays();
+            }
+        });
     }
 
     private static nint GetWindowLongPtrCompat(nint hwnd, int index)

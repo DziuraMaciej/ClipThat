@@ -19,7 +19,8 @@ Lekka aplikacja dla Windows do ciągłego nagrywania powtórek z gier i pulpitu 
 
 ## Aktualizacja do nowej wersji
 
-Wystarczy kliknąć dwukrotnie **`Aktualizuj_ClipThat.bat`** w folderze aplikacji:
+Otwórz okno **ClipThat** i kliknij przycisk **Aktualizacja** (ikona strzałki w dół) na samym dole lewego paska nawigacji:
 
-- Skrypt sam zamknie działającą instancję ClipThat, pobierze najnowszą wersję z GitHuba (zachowując pobrany wcześniej `Assets\ffmpeg.exe`), przekompiluje ją i ponownie uruchomi.
+- Aplikacja sprawdzi na GitHubie, czy pojawiły się nowe zmiany. Jeśli masz już najnowszą wersję, poinformuje Cię o tym komunikatem.
+- Jeśli dostępna jest aktualizacja i ją potwierdzisz, ClipThat automatycznie się zamknie, pobierze najnowsze pliki (zachowując pobrany wcześniej `Assets\ffmpeg.exe`), przekompiluje wersję `Release` i uruchomi się ponownie.
 - **Twoje ustawienia i nagrania pozostają nietknięte** — konfiguracja jest zapisana osobno w `%AppData%\ClipThat\settings.json`.

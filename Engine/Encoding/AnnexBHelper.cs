@@ -31,6 +31,40 @@ internal static class AnnexBHelper
     }
 
     /// <summary>
+    /// Zero-allocation check returning <see langword="true"/> when <paramref name="data"/> contains
+    /// both an Annex-B SPS (NAL type 7) and PPS (NAL type 8).
+    /// </summary>
+    public static bool ContainsSpsPps(ReadOnlySpan<byte> data)
+    {
+        int pos = FindNextStartCode(data, 0, out int startCodeLen);
+        bool hasSps = false;
+        bool hasPps = false;
+
+        while (pos >= 0 && pos + startCodeLen < data.Length)
+        {
+            int nalStart = pos + startCodeLen;
+            int nalType = data[nalStart] & 0x1F;
+            if (nalType == 7)
+            {
+                hasSps = true;
+            }
+            else if (nalType == 8)
+            {
+                hasPps = true;
+            }
+
+            if (hasSps && hasPps)
+            {
+                return true;
+            }
+
+            pos = FindNextStartCode(data, nalStart + 1, out startCodeLen);
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Extracts all Annex-B SPS (NAL type 7) and PPS (NAL type 8) parameter sets from <paramref name="data"/>,
     /// returning <see langword="null"/> unless both SPS and PPS are present.
     /// </summary>

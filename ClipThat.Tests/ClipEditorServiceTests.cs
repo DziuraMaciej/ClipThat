@@ -28,6 +28,7 @@ public sealed class ClipEditorServiceTests
             hardwareVideoEncoder: null);
 
         List<string> args = psi.ArgumentList.ToList();
+        Assert.Contains("-nostdin", args);
         int ssIndex = args.IndexOf("-ss");
         int inputIndex = args.IndexOf("-i");
         int durationIndex = args.IndexOf("-t");

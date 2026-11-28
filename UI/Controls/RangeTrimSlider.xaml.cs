@@ -60,7 +60,7 @@ public partial class RangeTrimSlider : UserControl
             nameof(CurrentPosition),
             typeof(double),
             typeof(RangeTrimSlider),
-            new FrameworkPropertyMetadata(0.0, OnRangePropertyChanged));
+            new FrameworkPropertyMetadata(0.0, OnCurrentPositionChanged));
 
     private double _dragEdgeOffsetX;
     private bool _isBatchUpdating;
@@ -493,5 +493,59 @@ public partial class RangeTrimSlider : UserControl
 
         Canvas.SetLeft(EndThumb, endX);
         Canvas.SetTop(EndThumb, thumbTop);
+    }
+
+    private static void OnCurrentPositionChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        if (d is RangeTrimSlider slider && !slider._isBatchUpdating)
+        {
+            slider.UpdatePlayheadVisualsOnly();
+        }
+    }
+
+    /// <summary>
+    /// Lightweight 30 Hz playback visual update that repositions only the playhead indicator and
+    /// played progress highlight without re-laying out static track borders or trim handles.
+    /// </summary>
+    private void UpdatePlayheadVisualsOnly()
+    {
+        if (TrackCanvas is null)
+        {
+            return;
+        }
+
+        double canvasWidth = TrackCanvas.ActualWidth;
+        double canvasHeight = TrackCanvas.ActualHeight;
+        double usableWidth = canvasWidth - (HandleWidth * 2.0);
+        if (usableWidth <= 1.0 || canvasHeight <= 1.0)
+        {
+            return;
+        }
+
+        double range = Maximum - Minimum;
+        if (range <= 0.0)
+        {
+            PlayedRangeHighlight.Visibility = Visibility.Collapsed;
+            PlayheadIndicator.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        double trackLeft = HandleWidth;
+        double clampedStart = Math.Clamp(StartValue, Minimum, Maximum);
+        double clampedEnd = Math.Clamp(EndValue, clampedStart, Maximum);
+        double clampedPos = Math.Clamp(CurrentPosition, Minimum, Maximum);
+
+        double startX = trackLeft + (((clampedStart - Minimum) / range) * usableWidth);
+        double endX = trackLeft + (((clampedEnd - Minimum) / range) * usableWidth);
+        double playheadX = trackLeft + (((clampedPos - Minimum) / range) * usableWidth);
+
+        double playedEndX = Math.Clamp(playheadX, startX, endX);
+        double playedWidth = Math.Max(0.0, playedEndX - startX);
+        Canvas.SetLeft(PlayedRangeHighlight, startX);
+        PlayedRangeHighlight.Width = playedWidth;
+        PlayedRangeHighlight.Visibility = playedWidth > 0.5 ? Visibility.Visible : Visibility.Collapsed;
+
+        Canvas.SetLeft(PlayheadIndicator, playheadX - (PlayheadIndicator.Width / 2.0));
+        PlayheadIndicator.Visibility = Visibility.Visible;
     }
 }

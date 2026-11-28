@@ -48,9 +48,13 @@ public sealed class SettingsService
                 return _cachedSettings.Clone();
             }
 
-            AppSettings loaded = ReadFromDiskOrDefault(out bool shouldPersistDefaults);
+            AppSettings loaded = ReadFromDiskOrDefault(out bool shouldPersistDefaults, out bool shouldCache);
             loaded.Normalize();
-            _cachedSettings = loaded;
+
+            if (shouldCache)
+            {
+                _cachedSettings = loaded;
+            }
 
             if (shouldPersistDefaults)
             {
@@ -78,13 +82,14 @@ public sealed class SettingsService
         }
     }
 
-    private AppSettings ReadFromDiskOrDefault(out bool fileMissing)
+    private AppSettings ReadFromDiskOrDefault(out bool shouldPersistDefaults, out bool shouldCache)
     {
-        fileMissing = false;
+        shouldPersistDefaults = false;
+        shouldCache = true;
 
         if (!File.Exists(SettingsFilePath))
         {
-            fileMissing = true;
+            shouldPersistDefaults = true;
             return new AppSettings();
         }
 
@@ -97,11 +102,14 @@ public sealed class SettingsService
         {
             EngineLogger.Warn("SettingsService", $"Corrupted settings file '{SettingsFilePath}': {ex.Message}; backing up and resetting to defaults.", ex);
             TryBackupCorruptSettingsFile();
+            shouldPersistDefaults = true;
             return new AppSettings();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             EngineLogger.Warn("SettingsService", $"Failed to read settings file '{SettingsFilePath}': {ex.Message}", ex);
+            // Do not poison the in-memory cache with defaults on a transient file lock / I/O error.
+            shouldCache = false;
             return new AppSettings();
         }
     }

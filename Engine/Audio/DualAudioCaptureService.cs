@@ -35,7 +35,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
     public const int AacFrameSampleCount = 1024;
     public const int AacFrameByteCount = AacFrameSampleCount * TargetBlockAlignment; // 4096 bytes
 
-    private const int SilenceWatchdogPeriodMs = 20;
+    private const int SilenceWatchdogPeriodMs = 40;
     private const int LoopbackCaptureBufferMs = 20;
     private const int MicrophoneCaptureBufferMs = 20;
     private const int HotSwapRetryDelayMs = 150;
@@ -1133,6 +1133,8 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         private long _totalPcmFramesFed;
         private long _lastRealAudioClock100Ns;
         private long _lastEncodedTimestamp100Ns = -1;
+        private int _consecutiveEncodeErrors;
+        private long _lastEncodeErrorLogTickMs;
         private int _stopped;
         private int _disposed;
 
@@ -1275,10 +1277,23 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                     }
 
                     FeedPcmFramesLocked(_pcmScratchBuffer.AsSpan(0, incomingFrames * TargetBlockAlignment), incomingFrames);
+                    _consecutiveEncodeErrors = 0;
                 }
                 catch (Exception ex)
                 {
-                    EngineLogger.Warn("DualAudioCaptureService", $"Audio encoding error ({_trackType}): {ex.Message}");
+                    int consecutive = ++_consecutiveEncodeErrors;
+                    long nowMs = Environment.TickCount64;
+                    if (nowMs - _lastEncodeErrorLogTickMs >= 2000)
+                    {
+                        _lastEncodeErrorLogTickMs = nowMs;
+                        EngineLogger.Warn("DualAudioCaptureService", $"Audio encoding error ({_trackType}, consecutive={consecutive}): {ex.Message}");
+                    }
+
+                    if (consecutive >= 5)
+                    {
+                        _consecutiveEncodeErrors = 0;
+                        _onRuntimeError?.Invoke(_trackType, ex);
+                    }
                 }
             }
         }
@@ -1792,6 +1807,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
         private IMFMediaBuffer? _reusableOutputBuffer;
         private int _reusableOutputCapacity;
         private bool _nextSampleDiscontinuity;
+        private bool _hasDiscontinuityAttribute;
         private long _lastOutputTimestamp100Ns;
         private int _disposed;
 
@@ -1938,8 +1954,9 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             {
                 _reusableInputSample.Set(SampleAttributeKeys.Discontinuity, 1u);
                 _nextSampleDiscontinuity = false;
+                _hasDiscontinuityAttribute = true;
             }
-            else
+            else if (_hasDiscontinuityAttribute)
             {
                 try
                 {
@@ -1949,6 +1966,8 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 {
                     // Ignore when Discontinuity attribute is not present.
                 }
+
+                _hasDiscontinuityAttribute = false;
             }
 
             _reusableInputBuffer.Lock(out nint dstPtr, out int maxLength, out _);
@@ -1994,15 +2013,19 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
             _reusableInputBuffer = null;
             SafeDisposeComObject(_reusableInputSample);
             _reusableInputSample = null;
+            _hasDiscontinuityAttribute = false;
         }
 
         private void DrainOutputs()
         {
+            const int MaxStreamChangeRetries = 4;
+
             if (_transform is null)
             {
                 return;
             }
 
+            int streamChangeRetries = 0;
             while (Volatile.Read(ref _disposed) == 0)
             {
                 OutputDataBuffer outputBuffer = new()
@@ -2038,6 +2061,11 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
 
                     if (hr == ResultCode.TransformStreamChange)
                     {
+                        if (++streamChangeRetries > MaxStreamChangeRetries)
+                        {
+                            throw new InvalidOperationException("Koder AAC przekroczył limit renegocjacji formatu wyjściowego (TransformStreamChange).");
+                        }
+
                         HandleOutputStreamChange();
                         continue;
                     }
@@ -2086,6 +2114,7 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 _reusableOutputBuffer is not null &&
                 _reusableOutputCapacity >= requiredCapacity)
             {
+                _reusableOutputSample.DeleteAllItems();
                 _reusableOutputBuffer.CurrentLength = 0;
                 return _reusableOutputSample;
             }
@@ -2402,8 +2431,8 @@ public sealed class DualAudioCaptureService : IDisposable, IMMNotificationClient
                 return;
             }
 
-            using IMFMediaType updatedType = _transform.GetOutputAvailableType(_outputStreamId, 0);
-            _transform.SetOutputType(_outputStreamId, updatedType, 0);
+            using IMFMediaType preferredOutput = CreateAacOutputMediaType();
+            SetOutputTypeWithNegotiation(_transform, _outputStreamId, preferredOutput);
 
             _outputStreamInfo = _transform.GetOutputStreamInfo(_outputStreamId);
             OutputStreamInfoFlags streamFlags = (OutputStreamInfoFlags)_outputStreamInfo.Flags;

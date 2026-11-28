@@ -151,12 +151,12 @@ public sealed class StartupService
         return string.Equals(fileName, "dotnet.exe", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string BuildDotnetStartupCommand(string dotnetPath)
+    internal static string BuildDotnetStartupCommand(string dotnetPath, string? startBaseDir = null)
     {
         string? launcherBatPath = null;
         string? projectFilePath = null;
 
-        string baseDir = AppContext.BaseDirectory;
+        string baseDir = startBaseDir ?? AppContext.BaseDirectory;
         if (!string.IsNullOrWhiteSpace(baseDir))
         {
             DirectoryInfo? current = new DirectoryInfo(baseDir);
@@ -184,7 +184,9 @@ public sealed class StartupService
 
         if (!string.IsNullOrWhiteSpace(launcherBatPath))
         {
-            return $"cmd.exe /c start \"\" /min \"{launcherBatPath}\" --minimized";
+            // Invoke inner "cmd.exe /c" so Start_ClipThat.bat (which uses exit /b 0) closes the minimized
+            // console immediately instead of leaving an idle cmd /K window open on the taskbar.
+            return $"cmd.exe /c start \"\" /min cmd.exe /c \"\"{launcherBatPath}\" --minimized\"";
         }
 
         if (!string.IsNullOrWhiteSpace(projectFilePath))
@@ -192,12 +194,12 @@ public sealed class StartupService
             return $"cmd.exe /c start \"\" /min \"{dotnetPath}\" run --project \"{projectFilePath}\" -- --minimized";
         }
 
-        string fallbackDll = Path.Combine(AppContext.BaseDirectory, "ClipThat.dll");
+        string fallbackDll = Path.Combine(baseDir, "ClipThat.dll");
         if (File.Exists(fallbackDll))
         {
             return $"\"{dotnetPath}\" \"{fallbackDll}\" --minimized";
         }
 
-        return $"\"{dotnetPath}\" --minimized";
+        throw new InvalidOperationException("Nie udało się zlokalizować pliku uruchomieniowego ClipThat do autostartu.");
     }
 }

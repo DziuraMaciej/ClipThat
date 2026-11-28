@@ -14,6 +14,9 @@ public static class PortableFfmpegProvider
     public const string EmbeddedResourceLogicalName = "ClipThat.Assets.ffmpeg.exe";
 
     private static readonly SemaphoreSlim ExtractionGate = new(1, 1);
+    private static readonly Lazy<string?> CachedEmbeddedResourceName = new(
+        () => FindEmbeddedResourceName(typeof(PortableFfmpegProvider).Assembly),
+        LazyThreadSafetyMode.ExecutionAndPublication);
 
     public static string BinDirectory => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -138,6 +141,11 @@ public static class PortableFfmpegProvider
     }
 
     private static string? ResolveEmbeddedResourceName(Assembly assembly)
+        => ReferenceEquals(assembly, typeof(PortableFfmpegProvider).Assembly)
+            ? CachedEmbeddedResourceName.Value
+            : FindEmbeddedResourceName(assembly);
+
+    private static string? FindEmbeddedResourceName(Assembly assembly)
     {
         if (assembly.GetManifestResourceInfo(EmbeddedResourceLogicalName) is not null)
         {
@@ -265,7 +273,9 @@ public static class PortableFfmpegProvider
         {
             File.Move(tempPath, targetPath, overwrite: true);
         }
-        catch (IOException) when (File.Exists(targetPath) && new FileInfo(targetPath).Length == expectedLength)
+        catch (Exception ex) when ((ex is IOException or UnauthorizedAccessException) &&
+                                   File.Exists(targetPath) &&
+                                   new FileInfo(targetPath).Length == expectedLength)
         {
             // Another instance/process extracted the exact same file concurrently or is actively executing it.
             TryDeleteFile(tempPath);

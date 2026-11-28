@@ -53,6 +53,27 @@ public sealed class AudioDeviceService : IDisposable
         => EnumerateDevices(DataFlow.Capture, includeDisabledOption: true);
 
     /// <summary>
+    /// Enumerates both playback and capture endpoints using a single shared <see cref="MMDeviceEnumerator"/>
+    /// COM instance, reducing RPC/COM overhead when populating settings selectors.
+    /// </summary>
+    public (IReadOnlyList<AudioDeviceInfo> Playback, IReadOnlyList<AudioDeviceInfo> Capture) GetPlaybackAndCaptureDevices()
+    {
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            IReadOnlyList<AudioDeviceInfo> playback = EnumerateDevices(enumerator, DataFlow.Render, includeDisabledOption: false);
+            IReadOnlyList<AudioDeviceInfo> capture = EnumerateDevices(enumerator, DataFlow.Capture, includeDisabledOption: true);
+            return (playback, capture);
+        }
+        catch (COMException ex)
+        {
+            Debug.WriteLine($"Brak dostępnych urządzeń audio: {ex.Message}");
+            return (CreateBaseDeviceList(DataFlow.Render, includeDisabledOption: false),
+                    CreateBaseDeviceList(DataFlow.Capture, includeDisabledOption: true));
+        }
+    }
+
+    /// <summary>
     /// Resolves a concrete active <see cref="MMDevice"/> for the specified <paramref name="dataFlow"/> and optional
     /// <paramref name="deviceId"/>. Returns <see langword="null"/> when capture is explicitly disabled (<c>"none"</c>).
     /// Uses <see cref="MMDeviceEnumerator.GetDevice"/> when a specific ID is configured, or
@@ -70,18 +91,21 @@ public sealed class AudioDeviceService : IDisposable
 
         if (!string.IsNullOrWhiteSpace(deviceId))
         {
+            MMDevice? specific = null;
             try
             {
-                MMDevice specific = enumerator.GetDevice(deviceId);
+                specific = enumerator.GetDevice(deviceId);
                 if (specific.State == DeviceState.Active)
                 {
                     return specific;
                 }
 
                 specific.Dispose();
+                specific = null;
             }
             catch (Exception ex) when (ex is COMException or ArgumentException)
             {
+                specific?.Dispose();
                 Debug.WriteLine($"Wybrane urządzenie audio '{deviceId}' jest niedostępne ({ex.Message}); powrót do domyślnego.");
             }
         }
@@ -96,24 +120,11 @@ public sealed class AudioDeviceService : IDisposable
         }
 
         // Last resort: pick the first active endpoint for the requested flow if default roles are unset.
+        // MMDeviceCollection wraps devices lazily on indexer access, so only materialize index 0.
         try
         {
             MMDeviceCollection endpoints = enumerator.EnumerateAudioEndPoints(dataFlow, DeviceState.Active);
-            MMDevice? selected = null;
-            for (int i = 0; i < endpoints.Count; i++)
-            {
-                MMDevice candidate = endpoints[i];
-                if (selected is null)
-                {
-                    selected = candidate;
-                }
-                else
-                {
-                    candidate.Dispose();
-                }
-            }
-
-            return selected;
+            return endpoints.Count > 0 ? endpoints[0] : null;
         }
         catch (COMException ex)
         {
@@ -161,18 +172,24 @@ public sealed class AudioDeviceService : IDisposable
         // Dispatch off the Core Audio RPC callback thread to avoid re-entrant MMDevApi deadlocks.
         ThreadPool.QueueUserWorkItem(static state =>
         {
+            var (service, callback) = ((AudioDeviceService, Action))state!;
+            if (Volatile.Read(ref service._disposed) != 0)
+            {
+                return;
+            }
+
             try
             {
-                ((Action)state!).Invoke();
+                callback.Invoke();
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Błąd powiadomienia o zmianie urządzeń audio: {ex.Message}");
             }
-        }, handler);
+        }, (this, handler));
     }
 
-    private static IReadOnlyList<AudioDeviceInfo> EnumerateDevices(DataFlow dataFlow, bool includeDisabledOption)
+    private static List<AudioDeviceInfo> CreateBaseDeviceList(DataFlow dataFlow, bool includeDisabledOption)
     {
         string defaultLabel = dataFlow == DataFlow.Capture
             ? DefaultCaptureDeviceLabel
@@ -202,12 +219,35 @@ public sealed class AudioDeviceService : IDisposable
             });
         }
 
+        return results;
+    }
+
+    private static IReadOnlyList<AudioDeviceInfo> EnumerateDevices(DataFlow dataFlow, bool includeDisabledOption)
+    {
         try
         {
             using var enumerator = new MMDeviceEnumerator();
+            return EnumerateDevices(enumerator, dataFlow, includeDisabledOption);
+        }
+        catch (COMException ex)
+        {
+            Debug.WriteLine($"Brak dostępnych urządzeń audio dla {dataFlow}: {ex.Message}");
+            return CreateBaseDeviceList(dataFlow, includeDisabledOption);
+        }
+    }
 
+    private static IReadOnlyList<AudioDeviceInfo> EnumerateDevices(
+        MMDeviceEnumerator enumerator,
+        DataFlow dataFlow,
+        bool includeDisabledOption)
+    {
+        List<AudioDeviceInfo> results = CreateBaseDeviceList(dataFlow, includeDisabledOption);
+
+        try
+        {
             string? defaultDeviceId = null;
             using (MMDevice? defaultEndpoint = TryGetDefaultEndpoint(enumerator, dataFlow, Role.Multimedia)
+                ?? TryGetDefaultEndpoint(enumerator, dataFlow, Role.Console)
                 ?? TryGetDefaultEndpoint(enumerator, dataFlow, Role.Communications))
             {
                 defaultDeviceId = defaultEndpoint?.ID;
@@ -220,9 +260,10 @@ public sealed class AudioDeviceService : IDisposable
                 try
                 {
                     string id = device.ID;
-                    string friendlyName = string.IsNullOrWhiteSpace(device.FriendlyName)
+                    string? rawFriendlyName = device.FriendlyName;
+                    string friendlyName = string.IsNullOrWhiteSpace(rawFriendlyName)
                         ? id
-                        : device.FriendlyName.Trim();
+                        : rawFriendlyName.Trim();
 
                     results.Add(new AudioDeviceInfo
                     {
@@ -251,9 +292,10 @@ public sealed class AudioDeviceService : IDisposable
 
     private static MMDevice? TryGetDefaultEndpoint(MMDeviceEnumerator enumerator, DataFlow dataFlow, Role role)
     {
+        MMDevice? device = null;
         try
         {
-            MMDevice device = enumerator.GetDefaultAudioEndpoint(dataFlow, role);
+            device = enumerator.GetDefaultAudioEndpoint(dataFlow, role);
             if (device.State == DeviceState.Active)
             {
                 return device;
@@ -264,6 +306,7 @@ public sealed class AudioDeviceService : IDisposable
         }
         catch (COMException)
         {
+            device?.Dispose();
             return null;
         }
     }

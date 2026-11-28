@@ -16,7 +16,8 @@ namespace ClipThat.Engine.Video;
 /// </summary>
 public sealed class GpuVideoProcessor : IDisposable
 {
-    private const int OutputSurfacePoolSize = 8;
+    // Headroom for async Tier 1 MFTs (up to 4 in-flight + 3 queued + 1 active + 1 pending = 9 concurrent textures).
+    private const int OutputSurfacePoolSize = 12;
 
     private readonly ID3D11Device _device;
     private readonly ID3D11DeviceContext _immediateContext;
@@ -47,6 +48,7 @@ public sealed class GpuVideoProcessor : IDisposable
 
     private uint _configuredInputWidth;
     private uint _configuredInputHeight;
+    private Format _configuredInputFormat = Format.Unknown;
     private uint _outputFrameIndex;
     private int _nextPoolIndex;
     private int _disposed;
@@ -261,60 +263,60 @@ public sealed class GpuVideoProcessor : IDisposable
 
         try
         {
-            EnsureVideoProcessor(inputDesc.Width, inputDesc.Height);
+            EnsureVideoProcessor(inputDesc.Width, inputDesc.Height, inputDesc.Format);
+
+            int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2, busyTexture3, isTextureBusy);
+
+            ID3D11Texture2D outputTexture = _nv12OutputTextures[poolIndex];
+            ID3D11VideoProcessorOutputView outputView = _nv12OutputViews[poolIndex]
+                ?? throw new InvalidOperationException("Widok wyjściowy procesora wideo (VPOV) nie został zainicjalizowany.");
+
+            ID3D11VideoProcessorInputView inputView = AcquireInputView(inputBgraTexture, inputDesc, cacheInputView, out bool ownsInputView);
+            try
+            {
+                _streams[0] = new VideoProcessorStream
+                {
+                    Enable = true,
+                    OutputIndex = 0,
+                    InputFrameOrField = 0,
+                    PastFrames = 0,
+                    FutureFrames = 0,
+                    InputSurface = inputView
+                };
+
+                try
+                {
+                    _videoContext.VideoProcessorBlt(_videoProcessor!, outputView, _outputFrameIndex++, 1, _streams).CheckError();
+                    // Flush queued D3D11 video blit commands so async hardware encoders (AMD AMF / NVENC / QSV)
+                    // immediately observe the completed NV12 surface on their video encode engine queue.
+                    _immediateContext.Flush();
+                }
+                finally
+                {
+                    // Clear the COM reference from the reusable stream struct before inputView is disposed.
+                    _streams[0].InputSurface = null;
+                }
+            }
+            finally
+            {
+                if (ownsInputView)
+                {
+                    inputView.Dispose();
+                }
+            }
+
+            return outputTexture;
         }
         catch (Exception ex)
         {
             EngineLogger.Warn(
                 "GpuVideoProcessor",
-                $"Runtime ID3D11VideoProcessor initialization failed ({inputDesc.Width}x{inputDesc.Height} -> {OutputWidth}x{OutputHeight}): {ex.Message}; falling back to CPU BGRA->NV12 conversion.",
+                $"Runtime ID3D11VideoProcessor processing failed ({inputDesc.Width}x{inputDesc.Height} {inputDesc.Format} -> {OutputWidth}x{OutputHeight}): {ex.Message}; falling back to CPU BGRA->NV12 conversion.",
                 ex);
             ReleaseVideoProcessorResources();
             SupportsHardwareVideoProcessor = false;
             return inputBgraTexture;
         }
-
-        int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2, busyTexture3, isTextureBusy);
-
-        ID3D11Texture2D outputTexture = _nv12OutputTextures[poolIndex];
-        ID3D11VideoProcessorOutputView outputView = _nv12OutputViews[poolIndex]
-            ?? throw new InvalidOperationException("Widok wyjściowy procesora wideo (VPOV) nie został zainicjalizowany.");
-
-        ID3D11VideoProcessorInputView inputView = AcquireInputView(inputBgraTexture, inputDesc, cacheInputView, out bool ownsInputView);
-        try
-        {
-            _streams[0] = new VideoProcessorStream
-            {
-                Enable = true,
-                OutputIndex = 0,
-                InputFrameOrField = 0,
-                PastFrames = 0,
-                FutureFrames = 0,
-                InputSurface = inputView
-            };
-
-            try
-            {
-                _videoContext.VideoProcessorBlt(_videoProcessor!, outputView, _outputFrameIndex++, 1, _streams).CheckError();
-                // Flush queued D3D11 video blit commands so async hardware encoders (AMD AMF / NVENC / QSV)
-                // immediately observe the completed NV12 surface on their video encode engine queue.
-                _immediateContext.Flush();
-            }
-            finally
-            {
-                // Clear the COM reference from the reusable stream struct before inputView is disposed.
-                _streams[0].InputSurface = null;
-            }
-        }
-        finally
-        {
-            if (ownsInputView)
-            {
-                inputView.Dispose();
-            }
-        }
-
-        return outputTexture;
     }
 
     /// <summary>
@@ -720,7 +722,15 @@ public sealed class GpuVideoProcessor : IDisposable
                 break;
             }
 
-            Thread.Sleep(1);
+            if (attempt < 3)
+            {
+                Thread.SpinWait(64);
+                Thread.Yield();
+            }
+            else
+            {
+                Thread.Sleep(1);
+            }
         }
 
         return _immediateContext.Map(stagingTexture, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
@@ -769,16 +779,23 @@ public sealed class GpuVideoProcessor : IDisposable
                 ID3D11VideoProcessorInputView created = _videoDevice!.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
                 if (cacheInputView && inputTexture.NativePointer != nint.Zero)
                 {
-                    // Cache up to 2 persistent DXGI compositor textures (clean desktop + composited cursor target)
-                    // so we avoid 60 COM view create/release cycles per second without retaining transient WGC frames.
+                    // Maintain a true 2-slot LRU cache for persistent DXGI compositor textures (clean desktop +
+                    // composited cursor target) so recreating surfaces at the same resolution never leaks slot 0.
                     if (_cachedDirectInputView0 is null)
                     {
                         _cachedDirectInputPtr0 = inputTexture.NativePointer;
                         _cachedDirectInputView0 = created;
                     }
+                    else if (_cachedDirectInputView1 is null)
+                    {
+                        _cachedDirectInputPtr1 = inputTexture.NativePointer;
+                        _cachedDirectInputView1 = created;
+                    }
                     else
                     {
-                        _cachedDirectInputView1?.Dispose();
+                        _cachedDirectInputView0.Dispose();
+                        _cachedDirectInputPtr0 = _cachedDirectInputPtr1;
+                        _cachedDirectInputView0 = _cachedDirectInputView1;
                         _cachedDirectInputPtr1 = inputTexture.NativePointer;
                         _cachedDirectInputView1 = created;
                     }
@@ -840,17 +857,31 @@ public sealed class GpuVideoProcessor : IDisposable
         return _fallbackBgraInputTexture;
     }
 
-    private void EnsureVideoProcessor(uint inputWidth, uint inputHeight)
+    private void EnsureVideoProcessor(uint inputWidth, uint inputHeight, Format inputFormat)
     {
         if (_videoProcessor is not null &&
             _enumerator is not null &&
             _configuredInputWidth == inputWidth &&
             _configuredInputHeight == inputHeight)
         {
+            if (_configuredInputFormat != inputFormat)
+            {
+                // Release cached direct/fallback VPIVs on SDR <-> HDR format transitions so old full-screen
+                // surfaces are never retained in VRAM at the same display resolution.
+                _cachedDirectInputView0?.Dispose();
+                _cachedDirectInputView0 = null;
+                _cachedDirectInputPtr0 = nint.Zero;
+                _cachedDirectInputView1?.Dispose();
+                _cachedDirectInputView1 = null;
+                _cachedDirectInputPtr1 = nint.Zero;
+                _configuredInputFormat = inputFormat;
+            }
+
             return;
         }
 
         ReleaseVideoProcessorResources();
+        _configuredInputFormat = inputFormat;
 
         try
         {

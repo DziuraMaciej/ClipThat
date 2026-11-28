@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
@@ -76,6 +77,7 @@ public sealed partial class ClipEditorService : IDisposable
     private static readonly string[] HardwareEncoderCandidates =
         { "h264_nvenc", "h264_amf", "h264_qsv" };
     private static readonly char[] Sha256Separators = { ' ', '\t', '\r', '\n' };
+    private static readonly SearchValues<char> InvalidFileNameChars = SearchValues.Create(Path.GetInvalidFileNameChars());
 
     private static readonly HttpClient SharedHttpClient = CreateHttpClient();
     private static readonly SemaphoreSlim FfmpegDownloadGate = new(1, 1);
@@ -147,7 +149,7 @@ public sealed partial class ClipEditorService : IDisposable
 
                     long fileSizeBytes = file.Length;
                     long lastWriteTicksUtc = file.LastWriteTimeUtc.Ticks;
-                    DateTime recordedAt = ClipItem.ParseRecordedAt(fullName);
+                    DateTime recordedAt = ClipItem.ParseRecordedAt(fullName, file.CreationTime);
 
                     if (_metadataCache.TryGetValue(fullName, out CachedClipMetadata cached) &&
                         cached.LastWriteTicksUtc == lastWriteTicksUtc &&
@@ -175,6 +177,8 @@ public sealed partial class ClipEditorService : IDisposable
 
             if (coldEntries.Count > 0)
             {
+                // Resolve ffprobe.exe once per scan instead of walking %PATH% inside every parallel worker.
+                string? resolvedFfprobePath = ResolveToolExecutable("ffprobe.exe");
                 var coldResults = new ConcurrentBag<ClipItem>();
                 var parallelOptions = new ParallelOptions
                 {
@@ -188,16 +192,17 @@ public sealed partial class ClipEditorService : IDisposable
                     {
                         (TimeSpan duration, int audioTrackCount) = await ReadMediaMetadataAsync(
                             entry.FullName,
-                            ct).ConfigureAwait(false);
+                            ct,
+                            resolvedFfprobePath,
+                            hasPreResolvedFfprobe: true).ConfigureAwait(false);
 
-                        if (duration > TimeSpan.Zero || audioTrackCount > 0)
-                        {
-                            _metadataCache[entry.FullName] = new CachedClipMetadata(
-                                entry.LastWriteTicksUtc,
-                                entry.FileSizeBytes,
-                                duration,
-                                audioTrackCount);
-                        }
+                        // Cache both positive and negative metadata lookups (keyed by size + write timestamp)
+                        // so unreadable/zero-duration files do not re-run WinRT + ffprobe on every scan.
+                        _metadataCache[entry.FullName] = new CachedClipMetadata(
+                            entry.LastWriteTicksUtc,
+                            entry.FileSizeBytes,
+                            duration,
+                            audioTrackCount);
 
                         coldResults.Add(new ClipItem(
                             entry.FullName,
@@ -323,55 +328,62 @@ public sealed partial class ClipEditorService : IDisposable
                 response.EnsureSuccessStatusCode();
 
                 long? totalBytes = response.Content.Headers.ContentLength;
+                string downloadedSha256Hex;
 
-                await using (Stream contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
-                await using (FileStream zipStream = new(
-                    tempZipPath,
-                    FileMode.Create,
-                    FileAccess.Write,
-                    FileShare.None,
-                    bufferSize: 81920,
-                    useAsync: true))
+                using (var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
                 {
-                    byte[] buffer = new byte[81920];
-                    long totalRead = 0;
-                    int lastReportedPercent = -1;
-                    long lastReportedBytes = 0;
-
-                    while (true)
+                    await using (Stream contentStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+                    await using (FileStream zipStream = new(
+                        tempZipPath,
+                        FileMode.Create,
+                        FileAccess.Write,
+                        FileShare.None,
+                        bufferSize: 81920,
+                        useAsync: true))
                     {
-                        int bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-                        if (bytesRead <= 0)
-                        {
-                            break;
-                        }
+                        byte[] buffer = new byte[81920];
+                        long totalRead = 0;
+                        int lastReportedPercent = -1;
+                        long lastReportedBytes = 0;
 
-                        await zipStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
-                        totalRead += bytesRead;
-
-                        if (totalBytes is > 0)
+                        while (true)
                         {
-                            double percent = Math.Clamp((totalRead * 100.0) / totalBytes.Value, 0.0, 100.0);
-                            int wholePercent = (int)percent;
-                            if (wholePercent != lastReportedPercent)
+                            int bytesRead = await contentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                            if (bytesRead <= 0)
                             {
-                                lastReportedPercent = wholePercent;
+                                break;
+                            }
+
+                            sha256.AppendData(buffer, 0, bytesRead);
+                            await zipStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
+                            totalRead += bytesRead;
+
+                            if (totalBytes is > 0)
+                            {
+                                double percent = Math.Clamp((totalRead * 100.0) / totalBytes.Value, 0.0, 100.0);
+                                int wholePercent = (int)percent;
+                                if (wholePercent != lastReportedPercent)
+                                {
+                                    lastReportedPercent = wholePercent;
+                                    progress?.Report(new ClipExportProgress(
+                                        $"Pobieranie FFmpeg ({wholePercent}%)...",
+                                        percent,
+                                        IsIndeterminate: false));
+                                }
+                            }
+                            else if (totalRead - lastReportedBytes >= 262_144)
+                            {
+                                lastReportedBytes = totalRead;
+                                double downloadedMb = totalRead / (1024.0 * 1024.0);
                                 progress?.Report(new ClipExportProgress(
-                                    $"Pobieranie FFmpeg ({wholePercent}%)...",
-                                    percent,
-                                    IsIndeterminate: false));
+                                    string.Format(PolishCulture, "Pobieranie FFmpeg ({0:0.0} MB)...", downloadedMb),
+                                    null,
+                                    IsIndeterminate: true));
                             }
                         }
-                        else if (totalRead - lastReportedBytes >= 262_144)
-                        {
-                            lastReportedBytes = totalRead;
-                            double downloadedMb = totalRead / (1024.0 * 1024.0);
-                            progress?.Report(new ClipExportProgress(
-                                string.Format(PolishCulture, "Pobieranie FFmpeg ({0:0.0} MB)...", downloadedMb),
-                                null,
-                                IsIndeterminate: true));
-                        }
                     }
+
+                    downloadedSha256Hex = Convert.ToHexString(sha256.GetHashAndReset());
                 }
 
                 progress?.Report(new ClipExportProgress(
@@ -379,7 +391,7 @@ public sealed partial class ClipEditorService : IDisposable
                     null,
                     IsIndeterminate: true));
 
-                await VerifyDownloadedArchiveSha256Async(tempZipPath, cancellationToken).ConfigureAwait(false);
+                await VerifyDownloadedArchiveSha256Async(downloadedSha256Hex, cancellationToken).ConfigureAwait(false);
 
                 progress?.Report(new ClipExportProgress(
                     "Rozpakowywanie ffmpeg.exe...",
@@ -576,6 +588,7 @@ public sealed partial class ClipEditorService : IDisposable
             RedirectStandardOutput = false
         };
 
+        startInfo.ArgumentList.Add("-nostdin");
         startInfo.ArgumentList.Add("-hide_banner");
         startInfo.ArgumentList.Add("-loglevel");
         startInfo.ArgumentList.Add("error");
@@ -625,8 +638,18 @@ public sealed partial class ClipEditorService : IDisposable
             using CancellationTokenRegistration cancelRegistration =
                 RegisterProcessTermination(process, cancellationToken);
 
-            Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+            try
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                await EnsureProcessExitedAfterKillAsync(process).ConfigureAwait(false);
+                await ObserveTaskSafeAsync(stderrTask).ConfigureAwait(false);
+                throw;
+            }
+
             string stderr = await stderrTask.ConfigureAwait(false);
 
             if (process.ExitCode != 0)
@@ -720,7 +743,7 @@ public sealed partial class ClipEditorService : IDisposable
             : duration;
 
         string sanitizedBaseName = SanitizeOutputBaseName(options.OutputFileName, options.InputFilePath);
-        string outputDirectory = Path.GetDirectoryName(options.InputFilePath) ?? AppSettings.DefaultOutputDirectory;
+        string outputDirectory = ResolveOutputDirectory(options.InputFilePath);
         string tempOutputPath = Path.Combine(outputDirectory, $".clipthat_export_{Guid.NewGuid():N}.tmp");
 
         bool usedSingleTrackFallback = audioTrackCount < 2;
@@ -898,38 +921,46 @@ public sealed partial class ClipEditorService : IDisposable
         using CancellationTokenRegistration cancelRegistration =
             RegisterProcessTermination(process, cancellationToken);
 
-        string? line;
-        while ((line = await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
+        try
         {
-            if (!string.IsNullOrWhiteSpace(line))
+            string? line;
+            while ((line = await process.StandardError.ReadLineAsync(cancellationToken).ConfigureAwait(false)) is not null)
             {
-                if (recentErrorLines.Count >= 16)
+                if (!string.IsNullOrWhiteSpace(line))
                 {
-                    recentErrorLines.Dequeue();
-                }
+                    if (recentErrorLines.Count >= 16)
+                    {
+                        recentErrorLines.Dequeue();
+                    }
 
-                recentErrorLines.Enqueue(line.Trim());
+                    recentErrorLines.Enqueue(line.Trim());
 
-                if (TryParseFfmpegTime(line, out TimeSpan processedTime) && expectedDuration.TotalSeconds > 0.05)
-                {
-                    double percent = Math.Clamp(
-                        (processedTime.TotalSeconds / expectedDuration.TotalSeconds) * 100.0,
-                        0.0,
-                        99.0);
-                    progress?.Report(new ClipExportProgress(
-                        $"{progressLabel} ({(int)percent}%)...",
-                        percent,
-                        IsIndeterminate: false));
+                    if (TryParseFfmpegTime(line, out TimeSpan processedTime) && expectedDuration.TotalSeconds > 0.05)
+                    {
+                        double percent = Math.Clamp(
+                            (processedTime.TotalSeconds / expectedDuration.TotalSeconds) * 100.0,
+                            0.0,
+                            99.0);
+                        progress?.Report(new ClipExportProgress(
+                            $"{progressLabel} ({(int)percent}%)...",
+                            percent,
+                            IsIndeterminate: false));
+                    }
                 }
             }
-        }
 
-        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await EnsureProcessExitedAfterKillAsync(process).ConfigureAwait(false);
+            throw;
+        }
 
         if (process.ExitCode != 0)
         {
             string detail = recentErrorLines.Count > 0
-                ? recentErrorLines.Last()
+                ? string.Join(" | ", recentErrorLines.TakeLast(3))
                 : $"Kod wyjścia: {process.ExitCode}";
             throw new InvalidOperationException($"FFmpeg zakończył się błędem: {detail}");
         }
@@ -962,6 +993,7 @@ public sealed partial class ClipEditorService : IDisposable
         string sysVol = systemVolume.ToString("0.###", CultureInfo.InvariantCulture);
         string micVol = microphoneVolume.ToString("0.###", CultureInfo.InvariantCulture);
 
+        startInfo.ArgumentList.Add("-nostdin");
         startInfo.ArgumentList.Add("-hide_banner");
         startInfo.ArgumentList.Add("-y");
         // Place -ss before -i for fast input seeking and -t duration after -i so exported length equals EndValue - StartValue.
@@ -1191,6 +1223,7 @@ public sealed partial class ClipEditorService : IDisposable
             RedirectStandardOutput = true
         };
 
+        startInfo.ArgumentList.Add("-nostdin");
         startInfo.ArgumentList.Add("-hide_banner");
         startInfo.ArgumentList.Add("-loglevel");
         startInfo.ArgumentList.Add("error");
@@ -1220,9 +1253,20 @@ public sealed partial class ClipEditorService : IDisposable
             using CancellationTokenRegistration cancelReg =
                 RegisterProcessTermination(process, probeCts.Token);
 
-            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(probeCts.Token);
-            Task<string> stderrTask = process.StandardError.ReadToEndAsync(probeCts.Token);
-            await process.WaitForExitAsync(probeCts.Token).ConfigureAwait(false);
+            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+            try
+            {
+                await process.WaitForExitAsync(probeCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                await EnsureProcessExitedAfterKillAsync(process).ConfigureAwait(false);
+                await ObserveTaskSafeAsync(stdoutTask).ConfigureAwait(false);
+                await ObserveTaskSafeAsync(stderrTask).ConfigureAwait(false);
+                throw;
+            }
+
             _ = await stdoutTask.ConfigureAwait(false);
             _ = await stderrTask.ConfigureAwait(false);
             return process.ExitCode == 0;
@@ -1239,7 +1283,9 @@ public sealed partial class ClipEditorService : IDisposable
 
     private async Task<(TimeSpan Duration, int AudioTrackCount)> ReadMediaMetadataAsync(
         string filePath,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? preResolvedFfprobePath = null,
+        bool hasPreResolvedFfprobe = false)
     {
         bool parsedBox = Mp4ReplayMuxer.TryReadMp4Metadata(
             filePath,
@@ -1260,7 +1306,9 @@ public sealed partial class ClipEditorService : IDisposable
 
         if (!parsedBox || duration <= TimeSpan.Zero)
         {
-            string? ffprobePath = ResolveToolExecutable("ffprobe.exe");
+            string? ffprobePath = hasPreResolvedFfprobe
+                ? preResolvedFfprobePath
+                : ResolveToolExecutable("ffprobe.exe");
             if (ffprobePath is not null)
             {
                 (TimeSpan probeDuration, int probeAudioCount) = await TryProbeWithFfprobeAsync(
@@ -1339,9 +1387,19 @@ public sealed partial class ClipEditorService : IDisposable
             using CancellationTokenRegistration cancelRegistration =
                 RegisterProcessTermination(process, cancellationToken);
 
-            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-            Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            Task<string> stderrTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
+            try
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                await EnsureProcessExitedAfterKillAsync(process).ConfigureAwait(false);
+                await ObserveTaskSafeAsync(stdoutTask).ConfigureAwait(false);
+                await ObserveTaskSafeAsync(stderrTask).ConfigureAwait(false);
+                throw;
+            }
 
             string output = await stdoutTask.ConfigureAwait(false);
             _ = await stderrTask.ConfigureAwait(false);
@@ -1385,7 +1443,7 @@ public sealed partial class ClipEditorService : IDisposable
     }
 
     private static async Task VerifyDownloadedArchiveSha256Async(
-        string zipPath,
+        string actualHex,
         CancellationToken cancellationToken)
     {
         using HttpResponseMessage shaResponse = await SharedHttpClient.GetAsync(
@@ -1399,19 +1457,6 @@ public sealed partial class ClipEditorService : IDisposable
             throw new InvalidOperationException("Nie udało się odczytać poprawnej sumy kontrolnej SHA-256 archiwum FFmpeg.");
         }
 
-        byte[] actualHashBytes;
-        await using (var verifyStream = new FileStream(
-                         zipPath,
-                         FileMode.Open,
-                         FileAccess.Read,
-                         FileShare.Read,
-                         bufferSize: 131072,
-                         useAsync: true))
-        {
-            actualHashBytes = await SHA256.HashDataAsync(verifyStream, cancellationToken).ConfigureAwait(false);
-        }
-
-        string actualHex = Convert.ToHexString(actualHashBytes);
         if (!string.Equals(actualHex, expectedHex, StringComparison.OrdinalIgnoreCase))
         {
             throw new InvalidOperationException(
@@ -1456,7 +1501,7 @@ public sealed partial class ClipEditorService : IDisposable
         }
 
         string portableBinCandidate = Path.Combine(PortableFfmpegProvider.BinDirectory, executableName);
-        if (File.Exists(portableBinCandidate))
+        if (IsNonEmptyFile(portableBinCandidate))
         {
             return portableBinCandidate;
         }
@@ -1466,7 +1511,7 @@ public sealed partial class ClipEditorService : IDisposable
             "ClipThat",
             "Tools",
             executableName);
-        if (File.Exists(localAppDataToolsCandidate))
+        if (IsNonEmptyFile(localAppDataToolsCandidate))
         {
             return localAppDataToolsCandidate;
         }
@@ -1485,7 +1530,7 @@ public sealed partial class ClipEditorService : IDisposable
                     }
 
                     string candidate = Path.Combine(cleanedDir, executableName);
-                    if (File.Exists(candidate))
+                    if (IsNonEmptyFile(candidate))
                     {
                         return candidate;
                     }
@@ -1498,6 +1543,18 @@ public sealed partial class ClipEditorService : IDisposable
         }
 
         return null;
+    }
+
+    private static bool IsNonEmptyFile(string path)
+    {
+        try
+        {
+            return File.Exists(path) && new FileInfo(path).Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static string GetWritableToolsDirectory()
@@ -1537,7 +1594,7 @@ public sealed partial class ClipEditorService : IDisposable
 
     private static void ExtractArchiveEntryAtomic(ZipArchiveEntry entry, string destinationPath)
     {
-        string tempPath = destinationPath + ".extracting";
+        string tempPath = $"{destinationPath}.{Environment.ProcessId}.{Guid.NewGuid():N}.extracting";
         TryDeleteFile(tempPath);
         try
         {
@@ -1553,34 +1610,49 @@ public sealed partial class ClipEditorService : IDisposable
 
     /// <summary>
     /// Strips a trailing <c>.mp4</c> extension (if entered), removes any invalid Windows filename characters,
-    /// and falls back to <c>{originalName}_edited</c> when the resulting name is empty or reserved.
+    /// clamps length safely below NTFS limits, and falls back to <c>{originalName}_edited</c> when empty or reserved.
     /// </summary>
     public static string SanitizeOutputBaseName(string? customOutputFileName, string inputFilePath)
     {
+        const int MaxBaseNameLength = 160;
+
         string originalName = Path.GetFileNameWithoutExtension(inputFilePath);
         string fallbackBaseName = string.IsNullOrWhiteSpace(originalName)
             ? "clip_edited"
             : $"{originalName}_edited";
+
+        if (fallbackBaseName.Length > MaxBaseNameLength)
+        {
+            fallbackBaseName = fallbackBaseName[..MaxBaseNameLength].TrimEnd('.', ' ');
+            if (string.IsNullOrWhiteSpace(fallbackBaseName))
+            {
+                fallbackBaseName = "clip_edited";
+            }
+        }
 
         if (string.IsNullOrWhiteSpace(customOutputFileName))
         {
             return fallbackBaseName;
         }
 
-        char[] invalidChars = Path.GetInvalidFileNameChars();
         string cleaned = StripMp4Extension(customOutputFileName);
 
         Span<char> buffer = cleaned.Length <= 256 ? stackalloc char[cleaned.Length] : new char[cleaned.Length];
         int written = 0;
         foreach (char ch in cleaned)
         {
-            if (Array.IndexOf(invalidChars, ch) < 0)
+            if (!InvalidFileNameChars.Contains(ch))
             {
                 buffer[written++] = ch;
             }
         }
 
         cleaned = StripMp4Extension(new string(buffer[..written]));
+        if (cleaned.Length > MaxBaseNameLength)
+        {
+            cleaned = StripMp4Extension(cleaned[..MaxBaseNameLength]);
+        }
+
         if (string.IsNullOrWhiteSpace(cleaned))
         {
             return fallbackBaseName;
@@ -1596,6 +1668,21 @@ public sealed partial class ClipEditorService : IDisposable
         return cleaned;
     }
 
+    private static string ResolveOutputDirectory(string inputFilePath)
+    {
+        string? directory = Path.GetDirectoryName(inputFilePath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            return directory;
+        }
+
+        string fullPath = Path.GetFullPath(inputFilePath);
+        string? fullDirectory = Path.GetDirectoryName(fullPath);
+        return !string.IsNullOrWhiteSpace(fullDirectory)
+            ? fullDirectory
+            : AppSettings.DefaultOutputDirectory;
+    }
+
     private static string StripMp4Extension(string value)
     {
         string result = value.Trim().TrimEnd('.', ' ');
@@ -1609,7 +1696,7 @@ public sealed partial class ClipEditorService : IDisposable
 
     private static string CommitExportedFile(string tempOutputPath, string inputFilePath, string sanitizedBaseName)
     {
-        string directory = Path.GetDirectoryName(inputFilePath) ?? AppSettings.DefaultOutputDirectory;
+        string directory = ResolveOutputDirectory(inputFilePath);
         Directory.CreateDirectory(directory);
 
         for (int index = 1; index < 10_000; index++)
@@ -1716,6 +1803,43 @@ public sealed partial class ClipEditorService : IDisposable
                 // Process may have already exited.
             }
         });
+    }
+
+    private static async Task EnsureProcessExitedAfterKillAsync(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+        }
+        catch
+        {
+            // Process may have already exited.
+        }
+
+        try
+        {
+            using var exitTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await process.WaitForExitAsync(exitTimeout.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Ignore timeout/exit wait errors during forced teardown.
+        }
+    }
+
+    private static async Task ObserveTaskSafeAsync(Task task)
+    {
+        try
+        {
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+            // Observe stream-read cancellation/IO exceptions so TaskScheduler.UnobservedTaskException is never raised.
+        }
     }
 
     public void Dispose()

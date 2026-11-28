@@ -118,6 +118,11 @@ public sealed class AudioAndCodecPipelineTests
         Assert.Null(Mp4ReplayMuxer.TryExtractAnnexBSpsPps(spsOnly));
         Assert.Null(MfH264Encoder.TryExtractAnnexBSpsPps(pSliceOnly));
         Assert.Null(Mp4ReplayMuxer.TryExtractAnnexBSpsPps(pSliceOnly));
+
+        Assert.True(AnnexBHelper.ContainsSpsPps(frameWithSpsPpsIdr));
+        Assert.False(AnnexBHelper.ContainsSpsPps(spsOnly));
+        Assert.False(AnnexBHelper.ContainsSpsPps(pSliceOnly));
+        Assert.False(AnnexBHelper.ContainsSpsPps(ReadOnlySpan<byte>.Empty));
     }
 
     [Fact]

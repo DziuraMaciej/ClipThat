@@ -1,3 +1,4 @@
+using System.IO;
 using ClipThat.Engine.Video;
 using ClipThat.Models;
 using ClipThat.Services;
@@ -24,6 +25,41 @@ public sealed class CoreServicesAndModelsTests
     {
         string result = ClipEditorService.SanitizeOutputBaseName(customName, inputPath);
         Assert.Equal(expected, result);
+    }
+
+    [Fact]
+    public void SanitizeOutputBaseName_ClampsExcessivelyLongNames()
+    {
+        string veryLongName = new string('a', 300);
+        string result = ClipEditorService.SanitizeOutputBaseName(veryLongName, @"C:\Videos\orig.mp4");
+
+        Assert.Equal(160, result.Length);
+        Assert.All(result, ch => Assert.Equal('a', ch));
+    }
+
+    [Theory]
+    [InlineData(@"C:\Videos\clip<bad>")]
+    [InlineData(@"C:\Videos\clip?name")]
+    [InlineData(@"C:\Videos\clip*star")]
+    [InlineData(@"C:\Videos\clip|pipe")]
+    [InlineData(@"C:\Videos\clip""quote")]
+    [InlineData(@"C:\Videos\sub:colon")]
+    public void AppSettingsNormalize_RejectsInvalidWindowsPathCharacters(string invalidDir)
+    {
+        var settings = new AppSettings { OutputDirectory = invalidDir };
+        settings.Normalize();
+
+        Assert.Equal(AppSettings.DefaultOutputDirectory, settings.OutputDirectory);
+    }
+
+    [Fact]
+    public void AppSettingsNormalize_ResolvesRelativeOutputDirectoryToFullPath()
+    {
+        var settings = new AppSettings { OutputDirectory = "ClipThatRelativeTestDir" };
+        settings.Normalize();
+
+        Assert.True(Path.IsPathFullyQualified(settings.OutputDirectory));
+        Assert.EndsWith("ClipThatRelativeTestDir", settings.OutputDirectory, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

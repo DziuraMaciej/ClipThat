@@ -57,9 +57,12 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
     private readonly uint _peakBitrateBps;
     private readonly long _defaultFrameDuration100Ns;
 
+    private static readonly Guid IidAmfBuffer = new(0xb04b7248, 0xb6f0, 0x4321, 0xb6, 0x91, 0xba, 0xa4, 0x74, 0x0f, 0x9f, 0xcb);
+
     private nint _amfLibrary;
     private nint _context;
     private nint _encoder;
+    private bool _encoderInitialized;
     private Thread? _outputDrainThread;
 
     // Cached AMF vtable function pointers for zero-overhead hot path calls.
@@ -270,12 +273,6 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
                     SetBoolProperty(surface, surfSetProp, "InsertPPS", true);
                 }
 
-                lock (_inFlightLock)
-                {
-                    _recentInFlightGpuTextures[_recentGpuTextureCursor] = texturePtr;
-                    _recentGpuTextureCursor = (_recentGpuTextureCursor + 1) % _recentInFlightGpuTextures.Length;
-                }
-
                 int submitRes = _encSubmitInput(_encoder, surface);
                 if (submitRes == AmfInputFull)
                 {
@@ -286,6 +283,14 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
                 if (submitRes != AmfOk)
                 {
                     throw new InvalidOperationException($"AMF SubmitInput zwróciło błąd ({submitRes}).");
+                }
+
+                // Only track textures actually accepted by AMF SubmitInput so rejected frames never evict
+                // active in-flight GPU surfaces from the protection ring.
+                lock (_inFlightLock)
+                {
+                    _recentInFlightGpuTextures[_recentGpuTextureCursor] = texturePtr;
+                    _recentGpuTextureCursor = (_recentGpuTextureCursor + 1) % _recentInFlightGpuTextures.Length;
                 }
 
                 if (requestIdr)
@@ -415,6 +420,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
             throw new InvalidOperationException($"AMF Encoder.Init(NV12, {_width}x{_height}) nie powiodło się (kod {encInitRes}).");
         }
 
+        _encoderInitialized = true;
         TryCaptureSequenceHeader();
 
         _outputDrainThread = new Thread(OutputDrainLoop)
@@ -443,27 +449,44 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
             }
         }
 
-        nint extraBuf = (nint)extraVar.Int64Value;
-        nint* bufVtbl = *(nint**)extraBuf;
-        var bufRelease = (delegate* unmanaged[Stdcall]<nint, int>)bufVtbl[1];
-        var bufGetSize = (delegate* unmanaged[Stdcall]<nint, nuint>)bufVtbl[24];
-        var bufGetNative = (delegate* unmanaged[Stdcall]<nint, nint>)bufVtbl[25];
+        nint rawInterface = (nint)extraVar.Int64Value;
+        nint* rawVtbl = *(nint**)rawInterface;
+        var rawRelease = (delegate* unmanaged[Stdcall]<nint, int>)rawVtbl[1];
+        var rawQueryInterface = (delegate* unmanaged[Stdcall]<nint, Guid*, nint*, int>)rawVtbl[2];
 
+        nint extraBuf = 0;
         try
         {
-            nuint size = bufGetSize(extraBuf);
-            nint ptr = bufGetNative(extraBuf);
-            if (size > 0 && size <= 16384 && ptr != 0)
+            Guid iidBuffer = IidAmfBuffer;
+            if (rawQueryInterface(rawInterface, &iidBuffer, &extraBuf) != AmfOk || extraBuf == 0)
             {
-                byte[] header = new byte[(int)size];
-                Marshal.Copy(ptr, header, 0, header.Length);
-                _sequenceHeader = header;
-                _onSequenceHeader?.Invoke(header);
+                return;
+            }
+
+            nint* bufVtbl = *(nint**)extraBuf;
+            var bufRelease = (delegate* unmanaged[Stdcall]<nint, int>)bufVtbl[1];
+            var bufGetSize = (delegate* unmanaged[Stdcall]<nint, nuint>)bufVtbl[24];
+            var bufGetNative = (delegate* unmanaged[Stdcall]<nint, nint>)bufVtbl[25];
+            try
+            {
+                nuint size = bufGetSize(extraBuf);
+                nint ptr = bufGetNative(extraBuf);
+                if (size > 0 && size <= 16384 && ptr != 0)
+                {
+                    byte[] header = new byte[(int)size];
+                    Marshal.Copy(ptr, header, 0, header.Length);
+                    _sequenceHeader = header;
+                    _onSequenceHeader?.Invoke(header);
+                }
+            }
+            finally
+            {
+                bufRelease(extraBuf);
             }
         }
         finally
         {
-            bufRelease(extraBuf);
+            rawRelease(rawInterface);
         }
     }
 
@@ -508,10 +531,12 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
 
             if (qRes == AmfRepeat)
             {
-                // Older drivers that ignore QueryTimeout return AMF_REPEAT immediately; avoid CPU spin.
+                // Older drivers that ignore QueryTimeout return AMF_REPEAT immediately; sleep longer when idle
+                // (no frames in flight) so a static desktop never causes 500 Hz spin wakeups.
                 if (Stopwatch.GetElapsedTime(beforeQuery).TotalMilliseconds < 2.0)
                 {
-                    Thread.Sleep(2);
+                    bool hasInFlight = Volatile.Read(ref _submittedFrameCount) > Volatile.Read(ref _encodedPacketCount);
+                    Thread.Sleep(hasInFlight ? 2 : 15);
                 }
 
                 continue;
@@ -530,60 +555,78 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
 
     private void EmitEncodedBuffer(nint outData)
     {
-        nint* bufVtbl = *(nint**)outData;
-        var bufRelease = (delegate* unmanaged[Stdcall]<nint, int>)bufVtbl[1];
-        var bufGetProp = (delegate* unmanaged[Stdcall]<nint, char*, AmfVariant*, int>)bufVtbl[4];
-        var bufGetPts = (delegate* unmanaged[Stdcall]<nint, long>)bufVtbl[20];
-        var bufGetDuration = (delegate* unmanaged[Stdcall]<nint, long>)bufVtbl[22];
-        var bufGetSize = (delegate* unmanaged[Stdcall]<nint, nuint>)bufVtbl[24];
-        var bufGetNative = (delegate* unmanaged[Stdcall]<nint, nint>)bufVtbl[25];
+        nint* dataVtbl = *(nint**)outData;
+        var dataRelease = (delegate* unmanaged[Stdcall]<nint, int>)dataVtbl[1];
+        var dataQueryInterface = (delegate* unmanaged[Stdcall]<nint, Guid*, nint*, int>)dataVtbl[2];
 
         EncodedPacket? packet = null;
         try
         {
-            nuint rawSize = bufGetSize(outData);
-            nint nativePtr = bufGetNative(outData);
-            if (rawSize == 0 || rawSize > int.MaxValue || nativePtr == 0)
+            Guid iidBuffer = IidAmfBuffer;
+            nint bufferPtr = 0;
+            if (dataQueryInterface(outData, &iidBuffer, &bufferPtr) != AmfOk || bufferPtr == 0)
             {
                 return;
             }
 
-            int length = (int)rawSize;
-            long duration100Ns = bufGetDuration(outData);
-            if (duration100Ns <= 0)
-            {
-                duration100Ns = _defaultFrameDuration100Ns;
-            }
+            nint* bufVtbl = *(nint**)bufferPtr;
+            var bufRelease = (delegate* unmanaged[Stdcall]<nint, int>)bufVtbl[1];
+            var bufGetProp = (delegate* unmanaged[Stdcall]<nint, char*, AmfVariant*, int>)bufVtbl[4];
+            var bufGetPts = (delegate* unmanaged[Stdcall]<nint, long>)bufVtbl[20];
+            var bufGetDuration = (delegate* unmanaged[Stdcall]<nint, long>)bufVtbl[22];
+            var bufGetSize = (delegate* unmanaged[Stdcall]<nint, nuint>)bufVtbl[24];
+            var bufGetNative = (delegate* unmanaged[Stdcall]<nint, nint>)bufVtbl[25];
 
-            long pts100Ns = NormalizeTimestamp(bufGetPts(outData), duration100Ns);
-
-            bool isIdrProperty = false;
-            AmfVariant dtVar = default;
-            fixed (char* propName = "OutputDataType")
+            try
             {
-                if (bufGetProp(outData, propName, &dtVar) == AmfOk &&
-                    dtVar.Type == AmfVariant.TypeInt64 &&
-                    dtVar.Int64Value == OutputDataTypeIdr)
+                nuint rawSize = bufGetSize(bufferPtr);
+                nint nativePtr = bufGetNative(bufferPtr);
+                if (rawSize == 0 || rawSize > int.MaxValue || nativePtr == 0)
                 {
-                    isIdrProperty = true;
+                    return;
                 }
+
+                int length = (int)rawSize;
+                long duration100Ns = bufGetDuration(bufferPtr);
+                if (duration100Ns <= 0)
+                {
+                    duration100Ns = _defaultFrameDuration100Ns;
+                }
+
+                long pts100Ns = NormalizeTimestamp(bufGetPts(bufferPtr), duration100Ns);
+
+                bool isIdrProperty = false;
+                AmfVariant dtVar = default;
+                fixed (char* propName = "OutputDataType")
+                {
+                    if (bufGetProp(bufferPtr, propName, &dtVar) == AmfOk &&
+                        dtVar.Type == AmfVariant.TypeInt64 &&
+                        dtVar.Int64Value == OutputDataTypeIdr)
+                    {
+                        isIdrProperty = true;
+                    }
+                }
+
+                var nativeSpan = new ReadOnlySpan<byte>((void*)nativePtr, length);
+                bool hasAnnexBIdr = AnnexBHelper.ContainsKeyframeNal(nativeSpan);
+                bool isKeyframe = isIdrProperty || hasAnnexBIdr;
+
+                packet = EncodedPacket.CreateFromNativeMemory(
+                    MediaTrackType.Video,
+                    nativePtr,
+                    length,
+                    pts100Ns,
+                    duration100Ns,
+                    isKeyframe);
             }
-
-            var nativeSpan = new ReadOnlySpan<byte>((void*)nativePtr, length);
-            bool hasAnnexBIdr = AnnexBHelper.ContainsKeyframeNal(nativeSpan);
-            bool isKeyframe = isIdrProperty || hasAnnexBIdr;
-
-            packet = EncodedPacket.CreateFromNativeMemory(
-                MediaTrackType.Video,
-                nativePtr,
-                length,
-                pts100Ns,
-                duration100Ns,
-                isKeyframe);
+            finally
+            {
+                bufRelease(bufferPtr);
+            }
         }
         finally
         {
-            bufRelease(outData);
+            dataRelease(outData);
         }
 
         if (packet is null)
@@ -655,7 +698,7 @@ public sealed unsafe class AmfH264Encoder : IVideoEncoder
         bool lockAcquired = Monitor.TryEnter(_submitLock, 1500);
         try
         {
-            if (_encoder != 0 && _encDrain != null)
+            if (lockAcquired && _encoderInitialized && _encoder != 0 && _encDrain != null)
             {
                 try
                 {

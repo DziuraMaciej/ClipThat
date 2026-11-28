@@ -75,7 +75,7 @@ if not defined DOTNET_EXE (
         echo.
         echo Instalacja .NET 8 SDK zakonczona. Uruchom ponownie Start_ClipThat.bat.
         pause
-        exit /b 0
+        exit /b 1
     )
 )
 
@@ -116,11 +116,12 @@ if exist "%APP_EXE%" (
     "%APP_EXE%" --exit >nul 2>&1
 )
 
-tasklist /FI "IMAGENAME eq ClipThat.exe" 2>nul | find /I "ClipThat.exe" >nul
-if errorlevel 1 exit /b 0
+for /L %%I in (1,1,4) do (
+    tasklist /FI "IMAGENAME eq ClipThat.exe" 2>nul | find /I "ClipThat.exe" >nul
+    if errorlevel 1 exit /b 0
+    timeout /t 1 /nobreak >nul 2>&1
+)
 
-taskkill /IM ClipThat.exe >nul 2>&1
-timeout /t 2 /nobreak >nul 2>&1
 tasklist /FI "IMAGENAME eq ClipThat.exe" 2>nul | find /I "ClipThat.exe" >nul
 if not errorlevel 1 (
     taskkill /F /IM ClipThat.exe >nul 2>&1

@@ -238,7 +238,7 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
         }
     }
 
-    private static void ConfigureCaptureSessionOptions(GraphicsCaptureSession captureSession)
+    private void ConfigureCaptureSessionOptions(GraphicsCaptureSession captureSession)
     {
         try
         {
@@ -269,9 +269,13 @@ public sealed class WgcFrameCapture : IFrameCaptureSource
         {
             if (ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "MinUpdateInterval"))
             {
-                if (CaptureInterop.TrySetMinUpdateInterval(captureSession, TimeSpan.FromMilliseconds(1)))
+                // Request frames near the target pacing interval (minus tolerance so 144Hz monitors do not alias),
+                // cutting unnecessary full-screen DWM GPU copies 2-4x on 240Hz/360Hz displays.
+                long minIntervalTicks = Math.Max(TimeSpan.TicksPerMillisecond, _frameIntervalTicks - _pacingToleranceTicks);
+                TimeSpan minInterval = TimeSpan.FromTicks(minIntervalTicks);
+                if (CaptureInterop.TrySetMinUpdateInterval(captureSession, minInterval))
                 {
-                    EngineLogger.Info("WgcFrameCapture", "Configured WGC MinUpdateInterval=1ms (unthrottled high-refresh capture).");
+                    EngineLogger.Info("WgcFrameCapture", $"Configured WGC MinUpdateInterval={minInterval.TotalMilliseconds:F1}ms.");
                 }
             }
         }

@@ -48,10 +48,10 @@ public sealed class ClipItem
 
     public string AudioTrackBadge => AudioTrackCount switch
     {
-        >= 3 => "3 ścieżki audio",
-        2 => "2 ścieżki audio",
+        <= 0 => "Brak audio",
         1 => "1 ścieżka audio",
-        _ => "Brak audio"
+        2 or 3 or 4 => $"{AudioTrackCount} ścieżki audio",
+        _ => $"{AudioTrackCount} ścieżek audio"
     };
 
     /// <summary>
@@ -59,6 +59,14 @@ public sealed class ClipItem
     /// falling back to the file creation timestamp when the filename does not match.
     /// </summary>
     public static DateTime ParseRecordedAt(string filePath)
+        => ParseRecordedAt(filePath, fallbackCreationTime: null);
+
+    /// <summary>
+    /// Parses the recording timestamp from ClipThat's <c>ssmmHHddMMyyyy.mp4</c> filename convention,
+    /// using <paramref name="fallbackCreationTime"/> (when already available from <see cref="FileInfo"/>)
+    /// to avoid an extra filesystem metadata syscall.
+    /// </summary>
+    public static DateTime ParseRecordedAt(string filePath, DateTime? fallbackCreationTime)
     {
         string baseName = Path.GetFileNameWithoutExtension(filePath);
         if (DateTime.TryParseExact(
@@ -71,14 +79,28 @@ public sealed class ClipItem
             return parsedTimestamp;
         }
 
+        if (fallbackCreationTime.HasValue && fallbackCreationTime.Value.Year > 1601)
+        {
+            return fallbackCreationTime.Value;
+        }
+
         try
         {
-            return File.GetCreationTime(filePath);
+            if (File.Exists(filePath))
+            {
+                DateTime created = File.GetCreationTime(filePath);
+                if (created.Year > 1601)
+                {
+                    return created;
+                }
+            }
         }
         catch
         {
-            return DateTime.Now;
+            // Ignore filesystem metadata errors.
         }
+
+        return DateTime.Now;
     }
 
     /// <summary>

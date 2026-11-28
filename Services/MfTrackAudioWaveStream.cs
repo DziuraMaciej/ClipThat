@@ -23,6 +23,7 @@ public sealed class MfTrackAudioWaveStream : WaveStream
     private readonly IMFSourceReader _reader;
     private readonly int _streamIndex;
     private readonly bool _mfStarted;
+    private readonly TimeSpan _knownDuration;
 
     private WaveFormat _waveFormat;
     private int _blockAlign;
@@ -90,6 +91,7 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                 ? knownDuration
                 : TryReadPresentationDuration(reader);
 
+            _knownDuration = effectiveDuration;
             _lengthBytes = effectiveDuration > TimeSpan.Zero
                 ? AlignToBlock((long)Math.Round(effectiveDuration.TotalSeconds * _avgBytesPerSecond), _blockAlign)
                 : 0L;
@@ -119,7 +121,16 @@ public sealed class MfTrackAudioWaveStream : WaveStream
     /// </summary>
     public int FileAudioStreamCount { get; }
 
-    public override WaveFormat WaveFormat => _waveFormat;
+    public override WaveFormat WaveFormat
+    {
+        get
+        {
+            lock (_syncLock)
+            {
+                return _waveFormat;
+            }
+        }
+    }
 
     public override long Length
     {
@@ -162,6 +173,10 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                 catch (Exception ex)
                 {
                     EngineLogger.Warn("MfTrackAudioWaveStream", $"IMFSourceReader seek failed (stream {_streamIndex}): {ex.Message}");
+                    _pendingOffset = 0;
+                    _pendingCount = 0;
+                    _needsSeekTrim = false;
+                    _positionBytes = clamped;
                     _endOfStream = true;
                     return;
                 }
@@ -184,15 +199,10 @@ public sealed class MfTrackAudioWaveStream : WaveStream
             throw new ArgumentOutOfRangeException(nameof(count));
         }
 
-        count -= count % _blockAlign;
-        if (count <= 0)
-        {
-            return 0;
-        }
-
         lock (_syncLock)
         {
-            if (Volatile.Read(ref _disposed) != 0 || _endOfStream)
+            count -= count % _blockAlign;
+            if (count <= 0 || Volatile.Read(ref _disposed) != 0 || _endOfStream)
             {
                 return 0;
             }
@@ -251,6 +261,12 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                         _waveFormat = updatedFormat;
                         _blockAlign = Math.Max(1, updatedFormat.BlockAlign);
                         _avgBytesPerSecond = Math.Max(_blockAlign, updatedFormat.AverageBytesPerSecond);
+                        if (_knownDuration > TimeSpan.Zero)
+                        {
+                            _lengthBytes = AlignToBlock((long)Math.Round(_knownDuration.TotalSeconds * _avgBytesPerSecond), _blockAlign);
+                        }
+
+                        count -= (count - totalCopied) % _blockAlign;
                     }
                     catch (Exception ex)
                     {
@@ -270,7 +286,20 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                     continue;
                 }
 
+                // Fast-skip samples completely prior to the seek target before locking/copying PCM memory.
+                if (_needsSeekTrim && seekTrimFrames < MaxSeekTrimFrames)
+                {
+                    long rawSampleDuration = TryGetSampleDuration(sample);
+                    if (rawSampleDuration > 0 && sampleTime100Ns + rawSampleDuration <= _seekTargetTime100Ns)
+                    {
+                        sample.Dispose();
+                        seekTrimFrames++;
+                        continue;
+                    }
+                }
+
                 int decodedLength;
+                bool copiedDirectlyToCaller = false;
                 try
                 {
                     using (sample)
@@ -284,12 +313,23 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                                 continue;
                             }
 
-                            if (_pendingBuffer.Length < decodedLength)
+                            int alignedDecoded = decodedLength - (decodedLength % _blockAlign);
+                            if (!_needsSeekTrim && alignedDecoded > 0 && alignedDecoded <= count - totalCopied)
                             {
-                                _pendingBuffer = new byte[Math.Max(decodedLength, 16384)];
+                                // Hot-path fast copy directly into NAudio caller buffer without intermediate _pendingBuffer copy.
+                                Marshal.Copy(dataPtr, buffer, offset + totalCopied, alignedDecoded);
+                                totalCopied += alignedDecoded;
+                                copiedDirectlyToCaller = true;
                             }
+                            else
+                            {
+                                if (_pendingBuffer.Length < decodedLength)
+                                {
+                                    _pendingBuffer = new byte[Math.Max(decodedLength, 16384)];
+                                }
 
-                            Marshal.Copy(dataPtr, _pendingBuffer, 0, decodedLength);
+                                Marshal.Copy(dataPtr, _pendingBuffer, 0, decodedLength);
+                            }
                         }
                         finally
                         {
@@ -302,6 +342,11 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                     Debug.WriteLine($"Błąd kopiowania bufora PCM z IMFSourceReader: {ex.Message}");
                     _endOfStream = true;
                     break;
+                }
+
+                if (copiedDirectlyToCaller)
+                {
+                    continue;
                 }
 
                 int sampleOffset = 0;
@@ -400,6 +445,11 @@ public sealed class MfTrackAudioWaveStream : WaveStream
         }
     }
 
+    ~MfTrackAudioWaveStream()
+    {
+        Dispose(disposing: false);
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -414,13 +464,16 @@ public sealed class MfTrackAudioWaveStream : WaveStream
             _pendingOffset = 0;
             _pendingCount = 0;
 
-            try
+            if (disposing)
             {
-                _reader.Dispose();
-            }
-            catch
-            {
-                // Ignore COM teardown errors.
+                try
+                {
+                    _reader.Dispose();
+                }
+                catch
+                {
+                    // Ignore COM teardown errors.
+                }
             }
 
             if (_mfStarted)
@@ -436,7 +489,24 @@ public sealed class MfTrackAudioWaveStream : WaveStream
             }
         }
 
+        if (disposing)
+        {
+            GC.SuppressFinalize(this);
+        }
+
         base.Dispose(disposing);
+    }
+
+    private static long TryGetSampleDuration(IMFSample sample)
+    {
+        try
+        {
+            return sample.SampleDuration;
+        }
+        catch
+        {
+            return 0L;
+        }
     }
 
     private static WaveFormat ReadCurrentWaveFormat(IMFSourceReader reader, int streamIndex)

@@ -60,14 +60,20 @@ public sealed class AppSettings
         else
         {
             string trimmedDir = OutputDirectory.Trim();
-            try
-            {
-                _ = Path.GetFullPath(trimmedDir);
-                OutputDirectory = trimmedDir;
-            }
-            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            if (HasInvalidWindowsPathChars(trimmedDir))
             {
                 OutputDirectory = DefaultOutputDirectory;
+            }
+            else
+            {
+                try
+                {
+                    OutputDirectory = Path.GetFullPath(trimmedDir);
+                }
+                catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+                {
+                    OutputDirectory = DefaultOutputDirectory;
+                }
             }
         }
 
@@ -114,4 +120,24 @@ public sealed class AppSettings
         StartWithWindows = StartWithWindows,
         StartRecordingOnLaunch = StartRecordingOnLaunch
     };
+
+    private static bool HasInvalidWindowsPathChars(string path)
+    {
+        for (int i = 0; i < path.Length; i++)
+        {
+            char c = path[i];
+            if (c < 0x20 || c is '<' or '>' or '"' or '|' or '?' or '*')
+            {
+                return true;
+            }
+
+            // Allow ':' only as a Windows drive specifier at index 1 (e.g. "C:\...").
+            if (c == ':' && i != 1)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }

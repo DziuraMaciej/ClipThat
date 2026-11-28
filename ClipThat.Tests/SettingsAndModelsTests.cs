@@ -78,6 +78,12 @@ public sealed class SettingsAndModelsTests : IDisposable
         string backupPath = path + ".corrupt.bak";
         Assert.True(File.Exists(backupPath));
         Assert.Equal(brokenJson, File.ReadAllText(backupPath));
+
+        // Main settings file on disk should be reset to clean defaults so future reloads stay healthy.
+        string repairedJson = File.ReadAllText(path);
+        Assert.NotEqual(brokenJson, repairedJson);
+        var freshService = new SettingsService(path);
+        Assert.Equal(5, freshService.Load().BufferDurationMinutes);
     }
 
     [Fact]
@@ -153,6 +159,10 @@ public sealed class SettingsAndModelsTests : IDisposable
 
         DateTime fallbackParsed = ClipItem.ParseRecordedAt(fallbackFile);
         Assert.Equal(expectedCreation, fallbackParsed);
+
+        string missingFile = Path.Combine(_tempDir, "does_not_exist.mp4");
+        DateTime missingParsed = ClipItem.ParseRecordedAt(missingFile);
+        Assert.True(missingParsed.Year >= 2020, $"Expected recent fallback date instead of Windows epoch {missingParsed:O}");
     }
 
     [Theory]
@@ -192,6 +202,11 @@ public sealed class SettingsAndModelsTests : IDisposable
         Assert.Equal("2 ścieżki audio", dual.AudioTrackBadge);
         Assert.True(triple.HasSeparateAudioTracks);
         Assert.Equal("3 ścieżki audio", triple.AudioTrackBadge);
+
+        var quad = new ClipItem("e.mp4", "e.mp4", DateTime.Now, TimeSpan.FromSeconds(10), 1024, audioTrackCount: 4);
+        var five = new ClipItem("f.mp4", "f.mp4", DateTime.Now, TimeSpan.FromSeconds(10), 1024, audioTrackCount: 5);
+        Assert.Equal("4 ścieżki audio", quad.AudioTrackBadge);
+        Assert.Equal("5 ścieżek audio", five.AudioTrackBadge);
     }
 
     [Theory]

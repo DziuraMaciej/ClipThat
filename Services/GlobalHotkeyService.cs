@@ -253,7 +253,23 @@ public sealed class GlobalHotkeyService : IDisposable
 
         try
         {
-            InvokeOnDispatcher(DisposeOnDispatcher);
+            if (_dispatcher.CheckAccess())
+            {
+                DisposeOnDispatcher();
+            }
+            else if (!_dispatcher.HasShutdownStarted && !_dispatcher.HasShutdownFinished)
+            {
+                _dispatcher.Invoke(DisposeOnDispatcher);
+            }
+            else
+            {
+                // Best-effort unregister if the WPF dispatcher has already entered shutdown on another thread.
+                HwndSource? source = _hwndSource;
+                if (source is not null && source.Handle != nint.Zero)
+                {
+                    _ = UnregisterHotKey(source.Handle, ReplayHotkeyId);
+                }
+            }
         }
         catch (Exception ex)
         {

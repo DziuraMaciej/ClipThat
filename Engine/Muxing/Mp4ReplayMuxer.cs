@@ -658,8 +658,7 @@ public sealed class Mp4ReplayMuxer
             {
                 case MediaTrackType.Video:
                 {
-                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastVideoTs);
-                    long pts90k = ToMpegTsPts90k(relTs100Ns);
+                    long pts90k = EnsureStrictlyMonotonicPts90k(ToMpegTsPts90k(relTs100Ns), ref lastVideoTs);
 
                     if (packet.IsKeyframe && wroteVideoHeader)
                     {
@@ -672,7 +671,7 @@ public sealed class Mp4ReplayMuxer
 
                     if ((!wroteVideoHeader || packet.IsKeyframe) &&
                         videoSequenceHeader is { Length: > 0 } &&
-                        TryExtractAnnexBSpsPps(packet.Data) is null)
+                        !AnnexBHelper.ContainsSpsPps(packet.Data))
                     {
                         pesBuffer.Write(videoSequenceHeader, 0, videoSequenceHeader.Length);
                     }
@@ -687,22 +686,22 @@ public sealed class Mp4ReplayMuxer
 
                 case MediaTrackType.SystemAudio when hasSystemAudio:
                 {
-                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastSysTs);
-                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, SysAudioPid, AudioPesStreamId, packet.Data, ToMpegTsPts90k(relTs100Ns), ref sysCc);
+                    long pts90k = EnsureStrictlyMonotonicPts90k(ToMpegTsPts90k(relTs100Ns), ref lastSysTs);
+                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, SysAudioPid, AudioPesStreamId, packet.Data, pts90k, ref sysCc);
                     break;
                 }
 
                 case MediaTrackType.MicrophoneAudio when hasMicrophoneAudio:
                 {
-                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastMicTs);
-                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, MicAudioPid, AudioPesStreamId, packet.Data, ToMpegTsPts90k(relTs100Ns), ref micCc);
+                    long pts90k = EnsureStrictlyMonotonicPts90k(ToMpegTsPts90k(relTs100Ns), ref lastMicTs);
+                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, MicAudioPid, AudioPesStreamId, packet.Data, pts90k, ref micCc);
                     break;
                 }
 
                 case MediaTrackType.CombinedMixAudio when includeCombinedMix:
                 {
-                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastMixTs);
-                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, MixAudioPid, AudioPesStreamId, packet.Data, ToMpegTsPts90k(relTs100Ns), ref mixCc);
+                    long pts90k = EnsureStrictlyMonotonicPts90k(ToMpegTsPts90k(relTs100Ns), ref lastMixTs);
+                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, MixAudioPid, AudioPesStreamId, packet.Data, pts90k, ref mixCc);
                     break;
                 }
             }
@@ -713,6 +712,17 @@ public sealed class Mp4ReplayMuxer
 
     private static long ToMpegTsPts90k(long time100Ns)
         => ((time100Ns * 9L) / 1000L) & 0x1_FFFF_FFFFL;
+
+    private static long EnsureStrictlyMonotonicPts90k(long candidatePts90k, ref long lastPts90k)
+    {
+        if (lastPts90k >= 0 && candidatePts90k <= lastPts90k)
+        {
+            candidatePts90k = (lastPts90k + 1L) & 0x1_FFFF_FFFFL;
+        }
+
+        lastPts90k = candidatePts90k;
+        return candidatePts90k;
+    }
 
     private static void WriteAudioPesToTs(
         FileStream tsStream,

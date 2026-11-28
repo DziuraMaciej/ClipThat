@@ -42,7 +42,8 @@
                             <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
 
-                        <Border Grid.Column="0"
+                        <Border x:Name="DialogIconBorder"
+                                Grid.Column="0"
                                 Width="38"
                                 Height="38"
                                 CornerRadius="8"

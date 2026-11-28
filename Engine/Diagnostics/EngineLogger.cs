@@ -14,12 +14,14 @@ public static class EngineLogger
 {
     private const long MaxLogBytes = 5L * 1024L * 1024L;
     private static readonly object WriteLock = new();
-
-    public static string LogDirectory => Path.Combine(
+    private static readonly string CachedLogDirectory = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "ClipThat");
+    private static readonly string CachedLogFilePath = Path.Combine(CachedLogDirectory, "engine.log");
 
-    public static string LogFilePath => Path.Combine(LogDirectory, "engine.log");
+    public static string LogDirectory => CachedLogDirectory;
+
+    public static string LogFilePath => CachedLogFilePath;
 
     public static void Info(string component, string message)
         => WriteEntry("INFO", component, message, exception: null);

@@ -76,13 +76,17 @@ public partial class App : Application
             return;
         }
 
-        if (!TryAcquireSingleInstance())
+        bool startMinimized = e.Args.Any(arg =>
+            string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
+
+        if (!TryAcquireSingleInstance(wakeExistingWindow: !startMinimized))
         {
             Shutdown();
             return;
         }
 
         SubscribeGlobalExceptionHandlers();
+        SessionEnding += OnSessionEnding;
 
         try
         {
@@ -114,9 +118,7 @@ public partial class App : Application
 
             InitializeTrayIcon();
             InitializeGlobalHotkey(settings);
-
-            bool startMinimized = e.Args.Any(arg =>
-                string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
+            SmoothScrollBehavior.RegisterGlobally();
 
             // Show the main window immediately on explicit manual launch so UI appears without waiting
             // for GPU/encoder/WASAPI hardware initialization to finish.
@@ -191,7 +193,7 @@ public partial class App : Application
         }
     }
 
-    private bool TryAcquireSingleInstance()
+    private bool TryAcquireSingleInstance(bool wakeExistingWindow)
     {
         try
         {
@@ -199,19 +201,22 @@ public partial class App : Application
             if (!createdNew)
             {
                 mutex.Dispose();
-                try
+                if (wakeExistingWindow)
                 {
-                    if (EventWaitHandle.TryOpenExisting(ShowWindowEventName, out EventWaitHandle? existingEvent))
+                    try
                     {
-                        using (existingEvent)
+                        if (EventWaitHandle.TryOpenExisting(ShowWindowEventName, out EventWaitHandle? existingEvent))
                         {
-                            existingEvent.Set();
+                            using (existingEvent)
+                            {
+                                existingEvent.Set();
+                            }
                         }
                     }
-                }
-                catch
-                {
-                    // Ignore cross-process wake signaling errors.
+                    catch
+                    {
+                        // Ignore cross-process wake signaling errors.
+                    }
                 }
 
                 return false;
@@ -444,26 +449,27 @@ public partial class App : Application
                 _replayEngine,
                 _clipEditorService);
 
-            _mainWindow = window;
+            Volatile.Write(ref _mainWindow, window);
             window.Closed += OnMainWindowClosed;
             window.Show();
             window.Activate();
         }
         catch (Exception ex)
         {
-            if (_mainWindow is not null)
+            MainWindow? failedWindow = Volatile.Read(ref _mainWindow);
+            if (failedWindow is not null)
             {
                 try
                 {
-                    _mainWindow.Closed -= OnMainWindowClosed;
-                    _mainWindow.ForceClose();
+                    failedWindow.Closed -= OnMainWindowClosed;
+                    failedWindow.ForceClose();
                 }
                 catch
                 {
                     // Ignore cleanup errors for a partially initialized window.
                 }
 
-                _mainWindow = null;
+                Volatile.Write(ref _mainWindow, null);
             }
 
             string logPath = LogUiException("ShowMainWindow", ex);
@@ -481,10 +487,11 @@ public partial class App : Application
 
     private void OnMainWindowClosed(object? sender, EventArgs e)
     {
-        if (_mainWindow is not null)
+        MainWindow? closedWindow = Volatile.Read(ref _mainWindow);
+        if (closedWindow is not null)
         {
-            _mainWindow.Closed -= OnMainWindowClosed;
-            _mainWindow = null;
+            closedWindow.Closed -= OnMainWindowClosed;
+            Volatile.Write(ref _mainWindow, null);
         }
 
         if (!IsShuttingDown)
@@ -501,20 +508,26 @@ public partial class App : Application
         }
     }
 
-    private async Task SaveReplayFromTrayAsync()
+    public Task RequestSaveReplayAsync(string context = "SaveReplayFromUiAsync")
     {
         if (IsShuttingDown || !_replayEngine.IsRecording)
         {
-            return;
+            return Task.CompletedTask;
         }
 
         if (Interlocked.CompareExchange(ref _saveReplayInProgress, 1, 0) != 0)
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        await SaveReplayCoordinatedAsync("SaveReplayFromTrayAsync");
+        return SaveReplayCoordinatedAsync(context);
     }
+
+    public Task RequestToggleRecordingAsync() => ToggleRecordingAsync();
+
+    public Task RequestExitForUpdateAsync() => ExitApplicationAsync();
+
+    private Task SaveReplayFromTrayAsync() => RequestSaveReplayAsync("SaveReplayFromTrayAsync");
 
     private async Task ToggleRecordingAsync()
     {
@@ -663,7 +676,6 @@ public partial class App : Application
                 ApplicationTheme.Dark,
                 Wpf.Ui.Controls.WindowBackdropType.Mica,
                 updateAccent: true);
-            ApplicationAccentColorManager.ApplySystemAccent();
 
             ResourceDictionary? resources = Current?.Resources;
             if (resources is null)
@@ -748,12 +760,95 @@ public partial class App : Application
         }
     }
 
+    private void OnSessionEnding(object sender, SessionEndingCancelEventArgs e)
+    {
+        CleanupResourcesSynchronouslyForOsShutdown();
+    }
+
     protected override void OnExit(ExitEventArgs e)
     {
+        SessionEnding -= OnSessionEnding;
+        CleanupResourcesSynchronouslyForOsShutdown();
         UnsubscribeGlobalExceptionHandlers();
         UnsubscribeUserPreferenceChanged();
         ReleaseSingleInstanceHandles();
         base.OnExit(e);
+    }
+
+    private void CleanupResourcesSynchronouslyForOsShutdown()
+    {
+        if (Interlocked.Exchange(ref _shuttingDown, 1) != 0)
+        {
+            return;
+        }
+
+        UnsubscribeGlobalExceptionHandlers();
+        UnsubscribeUserPreferenceChanged();
+
+        MainWindow? window = Interlocked.Exchange(ref _mainWindow, null);
+        if (window is not null)
+        {
+            try
+            {
+                window.Closed -= OnMainWindowClosed;
+                window.ForceClose();
+            }
+            catch
+            {
+                // Ignore UI shutdown errors during OS logoff/restart.
+            }
+        }
+
+        GlobalHotkeyService? hotkey = Interlocked.Exchange(ref _globalHotkeyService, null);
+        if (hotkey is not null)
+        {
+            try
+            {
+                hotkey.HotkeyPressed -= OnGlobalHotkeyPressed;
+                hotkey.Dispose();
+            }
+            catch
+            {
+                // Ignore hotkey cleanup errors during OS shutdown.
+            }
+        }
+
+        _replayEngine.StatusChanged -= OnEngineStatusChanged;
+        _replayEngine.ErrorOccurred -= OnEngineErrorOccurred;
+        _replayEngine.ReplaySaved -= OnEngineReplaySaved;
+
+        try { _replayEngine.Dispose(); } catch { /* ignore */ }
+        DisposeTrayAndServices();
+    }
+
+    private void DisposeTrayAndServices()
+    {
+        if (_notifyIcon is not null)
+        {
+            try
+            {
+                _notifyIcon.Visible = false;
+                _notifyIcon.Dispose();
+            }
+            catch
+            {
+                // Ignore tray cleanup errors.
+            }
+
+            _notifyIcon = null;
+        }
+
+        _trayMenu?.Dispose();
+        _trayMenu = null;
+
+        _recordingTrayIcon?.Dispose();
+        _recordingTrayIcon = null;
+
+        _pausedTrayIcon?.Dispose();
+        _pausedTrayIcon = null;
+
+        _audioDeviceService.Dispose();
+        _clipEditorService.Dispose();
     }
 
     private void ReleaseSingleInstanceHandles()
@@ -821,23 +916,40 @@ public partial class App : Application
             return;
         }
 
+        SessionEnding -= OnSessionEnding;
         UnsubscribeGlobalExceptionHandlers();
         UnsubscribeUserPreferenceChanged();
 
         try
         {
-            if (_globalHotkeyService is not null)
+            // Close MainWindow BEFORE disposing GlobalHotkeyService so HotkeyBox.Cleanup() never hits
+            // ObjectDisposedException if the user was mid-capture when shutdown/--exit arrived.
+            MainWindow? window = Interlocked.Exchange(ref _mainWindow, null);
+            if (window is not null)
             {
-                _globalHotkeyService.HotkeyPressed -= OnGlobalHotkeyPressed;
-                _globalHotkeyService.Dispose();
-                _globalHotkeyService = null;
+                try
+                {
+                    window.Closed -= OnMainWindowClosed;
+                    window.ForceClose();
+                }
+                catch (Exception ex)
+                {
+                    LogUiException("ExitApplicationAsync.ForceClose", ex);
+                }
             }
 
-            if (_mainWindow is not null)
+            GlobalHotkeyService? hotkey = Interlocked.Exchange(ref _globalHotkeyService, null);
+            if (hotkey is not null)
             {
-                _mainWindow.Closed -= OnMainWindowClosed;
-                _mainWindow.ForceClose();
-                _mainWindow = null;
+                try
+                {
+                    hotkey.HotkeyPressed -= OnGlobalHotkeyPressed;
+                    hotkey.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    LogUiException("ExitApplicationAsync.HotkeyDispose", ex);
+                }
             }
 
             _replayEngine.StatusChanged -= OnEngineStatusChanged;
@@ -864,25 +976,7 @@ public partial class App : Application
         }
         finally
         {
-            if (_notifyIcon is not null)
-            {
-                _notifyIcon.Visible = false;
-                _notifyIcon.Dispose();
-                _notifyIcon = null;
-            }
-
-            _trayMenu?.Dispose();
-            _trayMenu = null;
-
-            _recordingTrayIcon?.Dispose();
-            _recordingTrayIcon = null;
-
-            _pausedTrayIcon?.Dispose();
-            _pausedTrayIcon = null;
-
-            _audioDeviceService.Dispose();
-            _clipEditorService.Dispose();
-
+            DisposeTrayAndServices();
             Shutdown();
         }
     }
