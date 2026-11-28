@@ -40,6 +40,10 @@ public sealed class AppSettings
     /// </summary>
     public void Normalize()
     {
+        SelectedMonitorDeviceName = string.IsNullOrWhiteSpace(SelectedMonitorDeviceName)
+            ? null
+            : SelectedMonitorDeviceName.Trim();
+
         BufferDurationMinutes = Math.Clamp(BufferDurationMinutes, 1, 10);
         Fps = Fps == 30 ? 30 : 60;
 
@@ -67,7 +71,8 @@ public sealed class AppSettings
         }
 
         HotkeyModifiers &= 0x000Fu;
-        if (HotkeyVirtualKey == 0u || HotkeyVirtualKey > 0xFFu)
+        bool isFunctionKey = HotkeyVirtualKey is >= 0x70u and <= 0x87u;
+        if (HotkeyVirtualKey == 0u || HotkeyVirtualKey > 0xFFu || (HotkeyModifiers == 0u && !isFunctionKey))
         {
             HotkeyModifiers = DefaultHotkeyModifiers;
             HotkeyVirtualKey = DefaultHotkeyVirtualKey;

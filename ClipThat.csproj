@@ -24,8 +24,8 @@
   </ItemGroup>
 
   <Target Name="EnsureFfmpegAsset" BeforeTargets="BeforeBuild;AssignTargetPaths;PrepareResourceNames" Condition="!Exists('Assets\ffmpeg.exe')">
-    <Message Text="Pobieranie ffmpeg.exe do folderu Assets..." Importance="high" />
-    <Exec Command="powershell -NoProfile -Command &quot;$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; New-Item -ItemType Directory -Force -Path 'Assets' | Out-Null; $id = [Guid]::NewGuid().ToString('N'); $zip = Join-Path $env:TEMP ('ffmpeg-clipthat-' + $id + '.zip'); $extract = Join-Path $env:TEMP ('ffmpeg-clipthat-extract-' + $id); try { Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip -UseBasicParsing; Expand-Archive -Path $zip -DestinationPath $extract -Force; $exe = Get-ChildItem -Path $extract -Filter 'ffmpeg.exe' -Recurse | Select-Object -First 1; if (-not $exe -or $exe.Length -lt 10485760) { throw 'Pobrany plik ffmpeg.exe jest nieprawidlowy.' }; Copy-Item $exe.FullName 'Assets\ffmpeg.exe' -Force } finally { Remove-Item $zip, $extract -Recurse -Force -ErrorAction SilentlyContinue }&quot;" />
+    <Message Text="Pobieranie i weryfikacja SHA-256 dla ffmpeg.exe w folderze Assets..." Importance="high" />
+    <Exec Command="powershell -NoProfile -Command &quot;$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; New-Item -ItemType Directory -Force -Path 'Assets' | Out-Null; $id = [Guid]::NewGuid().ToString('N'); $zip = Join-Path $env:TEMP ('ffmpeg-clipthat-' + $id + '.zip'); $extract = Join-Path $env:TEMP ('ffmpeg-clipthat-extract-' + $id); try { Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile $zip -UseBasicParsing; $shaRaw = (Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256' -UseBasicParsing).Content.Trim(); $expectedSha = ($shaRaw -split '\s+')[0].ToUpperInvariant(); if ($expectedSha -notmatch '^[0-9A-F]{64}$') { throw 'Nieprawidlowa odpowiedz SHA-256 dla archiwum FFmpeg.' }; $actualSha = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToUpperInvariant(); if ($actualSha -ne $expectedSha) { throw ('Niezgodnosc sumy kontrolnej SHA-256 dla ffmpeg.zip: oczekiwano ' + $expectedSha + ', otrzymano ' + $actualSha) }; Expand-Archive -Path $zip -DestinationPath $extract -Force; $exe = Get-ChildItem -Path $extract -Filter 'ffmpeg.exe' -Recurse | Select-Object -First 1; if (-not $exe -or $exe.Length -lt 10485760) { throw 'Pobrany plik ffmpeg.exe jest nieprawidlowy.' }; Copy-Item $exe.FullName 'Assets\ffmpeg.exe' -Force } finally { Remove-Item $zip, $extract -Recurse -Force -ErrorAction SilentlyContinue }&quot;" />
   </Target>
 
   <!-- Embed ffmpeg.exe only for self-contained single-file publishing; copy next to output for regular builds. -->
@@ -43,8 +43,20 @@
     <PackageReference Include="WPF-UI" Version="4.3.0" />
   </ItemGroup>
 
-  <Target Name="SignOutputs" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+  <Target Name="SignOutputs"
+          AfterTargets="Build"
+          Inputs="$(TargetPath);$(TargetDir)$(TargetName).exe"
+          Outputs="$(IntermediateOutputPath)SignOutputs.stamp"
+          Condition="'$(DesignTimeBuild)' != 'true'">
     <Exec Command="powershell -NoProfile -Command &quot;$now = Get-Date; $certs = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -in @('CN=ClipThatDev', 'CN=ClipThat Local') -and $_.HasPrivateKey -and $_.NotAfter -gt $now }; $cert = ($certs | Where-Object { $_.Subject -eq 'CN=ClipThatDev' } | Sort-Object NotAfter -Descending | Select-Object -First 1); if (-not $cert) { $cert = $certs | Sort-Object NotAfter -Descending | Select-Object -First 1 }; if (-not $cert -and '$(Configuration)' -eq 'Release') { $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject 'CN=ClipThat Local' -CertStoreLocation Cert:\CurrentUser\My; if (-not (Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Thumbprint -eq $cert.Thumbprint })) { $store = New-Object System.Security.Cryptography.X509Certificates.X509Store('Root', 'CurrentUser'); $store.Open('ReadWrite'); $store.Add($cert); $store.Close() } }; if ($cert) { if (Test-Path '$(TargetPath)') { Set-AuthenticodeSignature -FilePath '$(TargetPath)' -Certificate $cert | Out-Null }; if (Test-Path '$(TargetDir)$(TargetName).exe') { Set-AuthenticodeSignature -FilePath '$(TargetDir)$(TargetName).exe' -Certificate $cert | Out-Null } }&quot;"
+          IgnoreExitCode="true" />
+    <Touch Files="$(IntermediateOutputPath)SignOutputs.stamp" AlwaysCreate="true" />
+  </Target>
+
+  <Target Name="SignPublishedOutputs"
+          AfterTargets="Publish"
+          Condition="'$(DesignTimeBuild)' != 'true' and Exists('$(PublishDir)$(AssemblyName).exe')">
+    <Exec Command="powershell -NoProfile -Command &quot;$now = Get-Date; $certs = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -in @('CN=ClipThatDev', 'CN=ClipThat Local') -and $_.HasPrivateKey -and $_.NotAfter -gt $now }; $cert = ($certs | Where-Object { $_.Subject -eq 'CN=ClipThatDev' } | Sort-Object NotAfter -Descending | Select-Object -First 1); if (-not $cert) { $cert = $certs | Sort-Object NotAfter -Descending | Select-Object -First 1 }; if ($cert) { foreach ($f in @('$(PublishDir)$(AssemblyName).exe', '$(PublishDir)$(AssemblyName).dll')) { if (Test-Path $f) { Set-AuthenticodeSignature -FilePath $f -Certificate $cert | Out-Null } } }&quot;"
           IgnoreExitCode="true" />
   </Target>
 

@@ -87,6 +87,11 @@ public sealed class StartupService
     /// </summary>
     public void EnsureStartupPathUpToDate()
     {
+        if (IsDisabledInStartupApproved())
+        {
+            return;
+        }
+
         string desiredCommand = BuildStartupCommand();
 
         using RegistryKey? readKey = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);

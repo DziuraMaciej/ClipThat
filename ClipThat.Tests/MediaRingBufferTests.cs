@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Runtime.InteropServices;
 using ClipThat.Engine.Buffer;
 using Xunit;
 
@@ -161,5 +163,82 @@ public sealed class MediaRingBufferTests
         Assert.Null(workerException);
         Assert.Equal(0, buffer.PacketCount);
         Assert.Equal(0, buffer.BufferedBytes);
+    }
+
+    [Fact]
+    public unsafe void CreateFromNativeMemory_UsesSlabPoolAndDedicatedSlabsSafelyAcrossSnapshotAndClear()
+    {
+        using var buffer = new MediaRingBuffer(bufferDurationMinutes: 2);
+
+        const int smallCount = 250;
+        const int smallSize = 16_384; // 250 * 16 KB = ~4 MB -> spans multiple 2 MiB slabs
+        const int oversizedSize = 600_000; // > 512 KB -> dedicated slab path
+
+        void* smallSrc = NativeMemory.Alloc(smallSize);
+        void* largeSrc = NativeMemory.Alloc(oversizedSize);
+        try
+        {
+            for (int i = 0; i < smallCount; i++)
+            {
+                byte fill = (byte)((i * 37) & 0xFF);
+                new Span<byte>(smallSrc, smallSize).Fill(fill);
+                EncodedPacket packet = EncodedPacket.CreateFromNativeMemory(
+                    MediaTrackType.Video,
+                    (nint)smallSrc,
+                    smallSize,
+                    timestamp100Ns: i * (TicksPerSecond / 10),
+                    duration100Ns: TicksPerSecond / 10,
+                    isKeyframe: i % 30 == 0);
+                buffer.AddPacket(packet);
+            }
+
+            new Span<byte>(largeSrc, oversizedSize).Fill(0xAB);
+            EncodedPacket largeKeyframe = EncodedPacket.CreateFromNativeMemory(
+                MediaTrackType.Video,
+                (nint)largeSrc,
+                oversizedSize,
+                timestamp100Ns: smallCount * (TicksPerSecond / 10),
+                duration100Ns: TicksPerSecond / 10,
+                isKeyframe: true);
+            buffer.AddPacket(largeKeyframe);
+        }
+        finally
+        {
+            NativeMemory.Free(smallSrc);
+            NativeMemory.Free(largeSrc);
+        }
+
+        using EncodedPacketSnapshot snapshot = buffer.SnapshotPackets();
+        buffer.Clear();
+
+        Assert.Equal(0, buffer.PacketCount);
+        Assert.Equal(smallCount + 1, snapshot.Count);
+
+        for (int i = 0; i < smallCount; i++)
+        {
+            byte expected = (byte)((i * 37) & 0xFF);
+            ReadOnlySpan<byte> data = snapshot[i].Data;
+            Assert.Equal(smallSize, data.Length);
+            Assert.Equal(expected, data[0]);
+            Assert.Equal(expected, data[^1]);
+        }
+
+        ReadOnlySpan<byte> largeData = snapshot[^1].Data;
+        Assert.Equal(oversizedSize, largeData.Length);
+        Assert.Equal((byte)0xAB, largeData[0]);
+        Assert.Equal((byte)0xAB, largeData[^1]);
+    }
+
+    [Fact]
+    public void AddAudioPacket_ThrowsOnInvalidLengthAndInvalidTrackTypeWithoutLeaking()
+    {
+        using var buffer = new MediaRingBuffer(bufferDurationMinutes: 1);
+        byte[] rented1 = ArrayPool<byte>.Shared.Rent(64);
+        Assert.Throws<ArgumentException>(() =>
+            buffer.AddAudioPacket(MediaTrackType.Video, rented1, 32, 0, 213_333));
+
+        byte[] rented2 = ArrayPool<byte>.Shared.Rent(64);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            buffer.AddAudioPacket(MediaTrackType.SystemAudio, rented2, rented2.Length + 10, 0, 213_333));
     }
 }

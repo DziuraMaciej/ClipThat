@@ -18,6 +18,9 @@ namespace ClipThat.Engine.Capture;
 internal sealed class DxgiCursorCompositor : IDisposable
 {
     private const uint ModeFullscreenCopy = 0u;
+    private const uint HdrModeNone = 0u;
+    private const uint HdrModeScRgbLinear = 1u;
+    private const uint HdrModePq2084 = 2u;
 
     private static readonly ID3D11RenderTargetView[] NullRenderTargets = { null! };
     private static readonly ID3D11ShaderResourceView[] NullShaderResources = { null!, null! };
@@ -28,7 +31,7 @@ cbuffer CursorParams : register(b0)
     float4 CursorRectPx;
     float2 ScreenSizePx;
     uint   CursorType;
-    uint   IsHdrLinear;
+    uint   HdrMode;
 };
 
 Texture2D<float4> DesktopTex : register(t0);
@@ -66,10 +69,21 @@ VSOut VSMain(uint id : SV_VertexID)
 float3 SampleDesktopSdr(float2 uv)
 {
     float4 rawBg = DesktopTex.Sample(PointSampler, uv);
-    if (IsHdrLinear != 0u)
+    if (HdrMode == 1u)
     {
         // Windows scRGB HDR (1.0 = 80 nits): soft Reinhard tone-map + linear-to-sRGB gamma.
         float3 hdr = max(rawBg.rgb, 0.0) * 0.4;
+        float3 mapped = hdr / (1.0 + hdr);
+        return pow(saturate(mapped), 1.0 / 2.2);
+    }
+    if (HdrMode == 2u)
+    {
+        // HDR10 ST.2084 PQ (R10G10B10A2_UNorm) -> linear nits -> Reinhard tone-map -> sRGB.
+        float3 p = pow(max(rawBg.rgb, 0.0), 1.0 / 78.84375);
+        float3 num = max(p - 0.8359375, 0.0);
+        float3 den = max(18.8515625 - 18.6875 * p, 1e-5);
+        float3 linearNits = pow(num / den, 1.0 / 0.1593017578125) * 10000.0;
+        float3 hdr = (linearNits / 80.0) * 0.4;
         float3 mapped = hdr / (1.0 + hdr);
         return pow(saturate(mapped), 1.0 / 2.2);
     }
@@ -147,8 +161,9 @@ float4 PSMain(VSOut input) : SV_Target
 
         try
         {
-            byte[] vsBytecode = CompileHlsl(HlslSource, "VSMain", "vs_5_0");
-            byte[] psBytecode = CompileHlsl(HlslSource, "PSMain", "ps_5_0");
+            // Use Shader Model 4.0 so D3D11 Feature Level 10_0 / 10_1 adapters also support GPU cursor compositing.
+            byte[] vsBytecode = CompileHlsl(HlslSource, "VSMain", "vs_4_0");
+            byte[] psBytecode = CompileHlsl(HlslSource, "PSMain", "ps_4_0");
 
             _vertexShader = _device.CreateVertexShader(vsBytecode);
             _pixelShader = _device.CreatePixelShader(psBytecode);
@@ -313,7 +328,7 @@ float4 PSMain(VSOut input) : SV_Target
     /// Produces the BGRA GPU texture ready for <see cref="Video.GpuVideoProcessor"/>, compositing
     /// the current hardware pointer onto the copy when visible.
     /// </summary>
-    public ID3D11Texture2D ComposeFrame(bool cursorVisible, int cursorX, int cursorY)
+    public ID3D11Texture2D ComposeFrame(bool cursorVisible, int cursorX, int cursorY, bool isHdrPqOutput = false)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
@@ -342,7 +357,9 @@ float4 PSMain(VSOut input) : SV_Target
 
         EnsureCompositedTarget();
 
-        uint isHdrLinear = _desktopFormat == Format.R16G16B16A16_Float ? 1u : 0u;
+        uint hdrMode = _desktopFormat == Format.R16G16B16A16_Float
+            ? HdrModeScRgbLinear
+            : (isHdrPqOutput && _desktopFormat == Format.R10G10B10A2_UNorm ? HdrModePq2084 : HdrModeNone);
 
         if (isNativeBgra)
         {
@@ -351,7 +368,7 @@ float4 PSMain(VSOut input) : SV_Target
         }
         else
         {
-            // Normalize non-BGRA desktop formats (e.g., 10-bit / HDR) into BGRA via fullscreen pass.
+            // Normalize non-BGRA desktop formats (e.g., 10-bit SDR / HDR10 PQ / scRGB HDR) into BGRA via fullscreen pass.
             DrawPass(new CursorConstantBuffer
             {
                 CursorRectLeft = 0f,
@@ -361,7 +378,7 @@ float4 PSMain(VSOut input) : SV_Target
                 ScreenWidth = _desktopWidth,
                 ScreenHeight = _desktopHeight,
                 CursorType = ModeFullscreenCopy,
-                IsHdrLinear = isHdrLinear
+                HdrMode = hdrMode
             }, bindCursorSrv: false);
         }
 
@@ -376,7 +393,7 @@ float4 PSMain(VSOut input) : SV_Target
                 ScreenWidth = _desktopWidth,
                 ScreenHeight = _desktopHeight,
                 CursorType = _cursorShapeType,
-                IsHdrLinear = isHdrLinear
+                HdrMode = hdrMode
             }, bindCursorSrv: true);
         }
 
@@ -699,7 +716,7 @@ float4 PSMain(VSOut input) : SV_Target
         public float ScreenWidth;
         public float ScreenHeight;
         public uint CursorType;
-        public uint IsHdrLinear;
+        public uint HdrMode;
     }
 
     [DllImport("d3dcompiler_47.dll", CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Ansi)]

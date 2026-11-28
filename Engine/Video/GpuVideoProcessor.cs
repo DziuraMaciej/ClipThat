@@ -31,6 +31,10 @@ public sealed class GpuVideoProcessor : IDisposable
     private ID3D11VideoProcessorOutputView?[] _nv12OutputViews;
     private ID3D11Texture2D? _fallbackBgraInputTexture;
     private ID3D11VideoProcessorInputView? _cachedFallbackInputView;
+    private nint _cachedDirectInputPtr0;
+    private ID3D11VideoProcessorInputView? _cachedDirectInputView0;
+    private nint _cachedDirectInputPtr1;
+    private ID3D11VideoProcessorInputView? _cachedDirectInputView1;
     private bool _preferFallbackBgraInput;
     private ID3D11Texture2D? _cpuStagingNv12Texture;
     private ID3D11Texture2D? _cpuStagingBgraTexture;
@@ -237,7 +241,9 @@ public sealed class GpuVideoProcessor : IDisposable
         ID3D11Texture2D inputBgraTexture,
         ID3D11Texture2D? busyTexture1 = null,
         ID3D11Texture2D? busyTexture2 = null,
-        Func<ID3D11Texture2D, bool>? isTextureBusy = null)
+        Func<ID3D11Texture2D, bool>? isTextureBusy = null,
+        ID3D11Texture2D? busyTexture3 = null,
+        bool cacheInputView = false)
     {
         ArgumentNullException.ThrowIfNull(inputBgraTexture);
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -268,13 +274,13 @@ public sealed class GpuVideoProcessor : IDisposable
             return inputBgraTexture;
         }
 
-        int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2, isTextureBusy);
+        int poolIndex = SelectAvailablePoolIndex(busyTexture1, busyTexture2, busyTexture3, isTextureBusy);
 
         ID3D11Texture2D outputTexture = _nv12OutputTextures[poolIndex];
         ID3D11VideoProcessorOutputView outputView = _nv12OutputViews[poolIndex]
             ?? throw new InvalidOperationException("Widok wyjściowy procesora wideo (VPOV) nie został zainicjalizowany.");
 
-        ID3D11VideoProcessorInputView inputView = AcquireInputView(inputBgraTexture, inputDesc, out bool ownsInputView);
+        ID3D11VideoProcessorInputView inputView = AcquireInputView(inputBgraTexture, inputDesc, cacheInputView, out bool ownsInputView);
         try
         {
             _streams[0] = new VideoProcessorStream
@@ -436,36 +442,99 @@ public sealed class GpuVideoProcessor : IDisposable
                 nint uvPlanePtr = dstPtr + (dstW * dstH);
                 int uvH = dstH / 2;
                 int uvW = dstW / 2;
+                bool isDirect1To1Bgra =
+                    srcW == dstW &&
+                    srcH == dstH &&
+                    srcDesc.Format is Format.B8G8R8A8_UNorm or Format.B8G8R8A8_UNorm_SRgb or Format.Unknown;
+                bool isFp16 = srcDesc.Format == Format.R16G16B16A16_Float;
+                bool isR10G10B10A2 = srcDesc.Format == Format.R10G10B10A2_UNorm;
 
-                // Fixed-point BT.709 studio-range (16..235 / 16..240) BGRA -> NV12 conversion
-                // using precomputed scale lookup tables (avoiding per-pixel 64-bit divisions) and parallel rows.
-                void ConvertYRow(int dy)
+                // Fixed-point BT.709 studio-range (16..235 / 16..240) conversion processing 2 Y rows + 1 UV row
+                // per strip in a single Parallel.For dispatch for better cache locality and lower scheduling overhead.
+                void ConvertStrip(int uy)
                 {
-                    byte* srcRow = (byte*)srcBasePtr + ((long)srcYMap[dy] * srcPitch);
-                    byte* yRow = (byte*)yPlanePtr + ((long)dy * dstW);
+                    int dy0 = uy * 2;
+                    int dy1 = dy0 + 1;
+                    byte* yRow0 = (byte*)yPlanePtr + ((long)dy0 * dstW);
+                    byte* yRow1 = (byte*)yPlanePtr + ((long)dy1 * dstW);
+                    byte* uvRow = (byte*)uvPlanePtr + ((long)uy * dstW);
+
+                    if (isDirect1To1Bgra)
+                    {
+                        byte* srcRow0 = (byte*)srcBasePtr + ((long)dy0 * srcPitch);
+                        byte* srcRow1 = (byte*)srcBasePtr + ((long)dy1 * srcPitch);
+
+                        for (int ux = 0; ux < uvW; ux++)
+                        {
+                            int dx = ux * 2;
+                            byte* p00 = srcRow0 + (dx * 4);
+                            byte* p01 = p00 + 4;
+                            byte* p10 = srcRow1 + (dx * 4);
+                            byte* p11 = p10 + 4;
+
+                            int b0 = p00[0], g0 = p00[1], r0 = p00[2];
+                            int b1 = p01[0], g1 = p01[1], r1 = p01[2];
+                            int b2 = p10[0], g2 = p10[1], r2 = p10[2];
+                            int b3 = p11[0], g3 = p11[1], r3 = p11[2];
+
+                            yRow0[dx] = (byte)(((47 * r0 + 157 * g0 + 16 * b0 + 128) >> 8) + 16);
+                            yRow0[dx + 1] = (byte)(((47 * r1 + 157 * g1 + 16 * b1 + 128) >> 8) + 16);
+                            yRow1[dx] = (byte)(((47 * r2 + 157 * g2 + 16 * b2 + 128) >> 8) + 16);
+                            yRow1[dx + 1] = (byte)(((47 * r3 + 157 * g3 + 16 * b3 + 128) >> 8) + 16);
+
+                            int avgR = (r0 + r1 + r2 + r3 + 2) >> 2;
+                            int avgG = (g0 + g1 + g2 + g3 + 2) >> 2;
+                            int avgB = (b0 + b1 + b2 + b3 + 2) >> 2;
+                            int u = ((-26 * avgR - 86 * avgG + 112 * avgB + 128) >> 8) + 128;
+                            int v = ((112 * avgR - 102 * avgG - 10 * avgB + 128) >> 8) + 128;
+                            uvRow[dx] = (byte)Math.Clamp(u, 16, 240);
+                            uvRow[dx + 1] = (byte)Math.Clamp(v, 16, 240);
+                        }
+
+                        return;
+                    }
+
+                    byte* srcRowY0 = (byte*)srcBasePtr + ((long)srcYMap[dy0] * srcPitch);
+                    byte* srcRowY1 = (byte*)srcBasePtr + ((long)srcYMap[dy1] * srcPitch);
+                    byte* srcRowUv = (byte*)srcBasePtr + ((long)uvSrcYMap[uy] * srcPitch);
+
+                    if (!isFp16 && !isR10G10B10A2)
+                    {
+                        for (int dx = 0; dx < dstW; dx++)
+                        {
+                            int xOff = srcXMap[dx];
+                            byte* px0 = srcRowY0 + xOff;
+                            byte* px1 = srcRowY1 + xOff;
+                            yRow0[dx] = (byte)(((47 * px0[2] + 157 * px0[1] + 16 * px0[0] + 128) >> 8) + 16);
+                            yRow1[dx] = (byte)(((47 * px1[2] + 157 * px1[1] + 16 * px1[0] + 128) >> 8) + 16);
+                        }
+
+                        for (int ux = 0; ux < uvW; ux++)
+                        {
+                            byte* px = srcRowUv + uvSrcXMap[ux];
+                            int b = px[0], g = px[1], r = px[2];
+                            int u = ((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128;
+                            int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+                            uvRow[ux * 2] = (byte)Math.Clamp(u, 16, 240);
+                            uvRow[ux * 2 + 1] = (byte)Math.Clamp(v, 16, 240);
+                        }
+
+                        return;
+                    }
 
                     for (int dx = 0; dx < dstW; dx++)
                     {
-                        byte* px = srcRow + srcXMap[dx];
-                        int b = px[0];
-                        int g = px[1];
-                        int r = px[2];
-                        yRow[dx] = (byte)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
+                        int srcPxIdx = srcXMap[dx] >> 2;
+                        ReadRgb8(srcRowY0, srcPxIdx, isFp16, isR10G10B10A2, out int r0, out int g0, out int b0);
+                        ReadRgb8(srcRowY1, srcPxIdx, isFp16, isR10G10B10A2, out int r1, out int g1, out int b1);
+                        yRow0[dx] = (byte)(((47 * r0 + 157 * g0 + 16 * b0 + 128) >> 8) + 16);
+                        yRow1[dx] = (byte)(((47 * r1 + 157 * g1 + 16 * b1 + 128) >> 8) + 16);
                     }
-                }
-
-                void ConvertUvRow(int uy)
-                {
-                    byte* srcRow = (byte*)srcBasePtr + ((long)uvSrcYMap[uy] * srcPitch);
-                    byte* uvRow = (byte*)uvPlanePtr + ((long)uy * dstW);
 
                     for (int ux = 0; ux < uvW; ux++)
                     {
-                        byte* px = srcRow + uvSrcXMap[ux];
-                        int b = px[0];
-                        int g = px[1];
-                        int r = px[2];
-                        // Zero-sum BT.709 chroma coefficients (-26 - 86 + 112 == 0; 112 - 102 - 10 == 0).
+                        int srcPxIdx = uvSrcXMap[ux] >> 2;
+                        ReadRgb8(srcRowUv, srcPxIdx, isFp16, isR10G10B10A2, out int r, out int g, out int b);
                         int u = ((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128;
                         int v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
                         uvRow[ux * 2] = (byte)Math.Clamp(u, 16, 240);
@@ -475,13 +544,11 @@ public sealed class GpuVideoProcessor : IDisposable
 
                 if (dstH >= 360)
                 {
-                    Parallel.For(0, dstH, ConvertYRow);
-                    Parallel.For(0, uvH, ConvertUvRow);
+                    Parallel.For(0, uvH, ConvertStrip);
                 }
                 else
                 {
-                    for (int dy = 0; dy < dstH; dy++) ConvertYRow(dy);
-                    for (int uy = 0; uy < uvH; uy++) ConvertUvRow(uy);
+                    for (int uy = 0; uy < uvH; uy++) ConvertStrip(uy);
                 }
             }
             finally
@@ -572,9 +639,39 @@ public sealed class GpuVideoProcessor : IDisposable
         return _cpuStagingBgraTexture;
     }
 
+    private static unsafe void ReadRgb8(byte* row, int pixelIndex, bool isFp16, bool isR10G10B10A2, out int r, out int g, out int b)
+    {
+        if (isFp16)
+        {
+            Half* h = (Half*)(row + ((long)pixelIndex * 8));
+            float rf = Math.Max(0f, (float)h[0]) * 0.4f;
+            float gf = Math.Max(0f, (float)h[1]) * 0.4f;
+            float bf = Math.Max(0f, (float)h[2]) * 0.4f;
+            r = (int)Math.Clamp(MathF.Pow(rf / (1f + rf), 1f / 2.2f) * 255f, 0f, 255f);
+            g = (int)Math.Clamp(MathF.Pow(gf / (1f + gf), 1f / 2.2f) * 255f, 0f, 255f);
+            b = (int)Math.Clamp(MathF.Pow(bf / (1f + bf), 1f / 2.2f) * 255f, 0f, 255f);
+            return;
+        }
+
+        if (isR10G10B10A2)
+        {
+            uint packed = *((uint*)row + pixelIndex);
+            r = (int)((packed & 0x3FFu) >> 2);
+            g = (int)(((packed >> 10) & 0x3FFu) >> 2);
+            b = (int)(((packed >> 20) & 0x3FFu) >> 2);
+            return;
+        }
+
+        byte* px = row + ((long)pixelIndex * 4);
+        b = px[0];
+        g = px[1];
+        r = px[2];
+    }
+
     private int SelectAvailablePoolIndex(
         ID3D11Texture2D? busyTexture1,
         ID3D11Texture2D? busyTexture2,
+        ID3D11Texture2D? busyTexture3,
         Func<ID3D11Texture2D, bool>? isTextureBusy)
     {
         for (int attempt = 0; attempt < OutputSurfacePoolSize; attempt++)
@@ -585,6 +682,7 @@ public sealed class GpuVideoProcessor : IDisposable
             ID3D11Texture2D candidate = _nv12OutputTextures[candidateIndex];
             if (!ReferenceEquals(candidate, busyTexture1) &&
                 !ReferenceEquals(candidate, busyTexture2) &&
+                !ReferenceEquals(candidate, busyTexture3) &&
                 (isTextureBusy is null || !isTextureBusy(candidate)))
             {
                 return candidateIndex;
@@ -631,6 +729,7 @@ public sealed class GpuVideoProcessor : IDisposable
     private ID3D11VideoProcessorInputView AcquireInputView(
         ID3D11Texture2D inputTexture,
         Texture2DDescription inputDesc,
+        bool cacheInputView,
         out bool ownsInputView)
     {
         var inputViewDesc = new VideoProcessorInputViewDescription
@@ -646,10 +745,50 @@ public sealed class GpuVideoProcessor : IDisposable
 
         if (!_preferFallbackBgraInput)
         {
+            if (cacheInputView)
+            {
+                nint texPtr = inputTexture.NativePointer;
+                if (texPtr != nint.Zero)
+                {
+                    if (texPtr == _cachedDirectInputPtr0 && _cachedDirectInputView0 is not null)
+                    {
+                        ownsInputView = false;
+                        return _cachedDirectInputView0;
+                    }
+
+                    if (texPtr == _cachedDirectInputPtr1 && _cachedDirectInputView1 is not null)
+                    {
+                        ownsInputView = false;
+                        return _cachedDirectInputView1;
+                    }
+                }
+            }
+
             try
             {
+                ID3D11VideoProcessorInputView created = _videoDevice!.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
+                if (cacheInputView && inputTexture.NativePointer != nint.Zero)
+                {
+                    // Cache up to 2 persistent DXGI compositor textures (clean desktop + composited cursor target)
+                    // so we avoid 60 COM view create/release cycles per second without retaining transient WGC frames.
+                    if (_cachedDirectInputView0 is null)
+                    {
+                        _cachedDirectInputPtr0 = inputTexture.NativePointer;
+                        _cachedDirectInputView0 = created;
+                    }
+                    else
+                    {
+                        _cachedDirectInputView1?.Dispose();
+                        _cachedDirectInputPtr1 = inputTexture.NativePointer;
+                        _cachedDirectInputView1 = created;
+                    }
+
+                    ownsInputView = false;
+                    return created;
+                }
+
                 ownsInputView = true;
-                return _videoDevice!.CreateVideoProcessorInputView(inputTexture, _enumerator!, inputViewDesc);
+                return created;
             }
             catch (SharpGenException)
             {
@@ -787,6 +926,14 @@ public sealed class GpuVideoProcessor : IDisposable
 
     private void ReleaseVideoProcessorResources()
     {
+        _cachedDirectInputView0?.Dispose();
+        _cachedDirectInputView0 = null;
+        _cachedDirectInputPtr0 = nint.Zero;
+
+        _cachedDirectInputView1?.Dispose();
+        _cachedDirectInputView1 = null;
+        _cachedDirectInputPtr1 = nint.Zero;
+
         _cachedFallbackInputView?.Dispose();
         _cachedFallbackInputView = null;
 

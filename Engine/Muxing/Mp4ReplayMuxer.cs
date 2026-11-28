@@ -101,7 +101,7 @@ public sealed class Mp4ReplayMuxer
         }
 
         long baseTimestamp100Ns = snapshot[firstKeyframeIndex].Timestamp100Ns;
-        var orderedPackets = new List<IndexedPacket>(snapshot.Count - firstKeyframeIndex);
+        var orderedPackets = new List<IndexedPacket>(snapshot.Count);
         bool hasCombinedMixAudio = false;
         bool hasSystemAudio = false;
         bool hasMicrophoneAudio = false;
@@ -496,87 +496,17 @@ public sealed class Mp4ReplayMuxer
 
         try
         {
-            string videoPath = Path.Combine(tempDir, "video.h264");
-            string? sysAudioPath = hasSystemAudio ? Path.Combine(tempDir, "sys.aac") : null;
-            string? micAudioPath = hasMicrophoneAudio ? Path.Combine(tempDir, "mic.aac") : null;
-            string? mixAudioPath = includeCombinedMix ? Path.Combine(tempDir, "mix.aac") : null;
-
-            bool wroteVideoHeader = false;
-            int videoFrameCount = 0;
-            long lastVideoTimestamp100Ns = baseTimestamp100Ns;
-            long firstSysAudioOffset100Ns = -1;
-            long firstMicAudioOffset100Ns = -1;
-            long firstMixAudioOffset100Ns = -1;
-            Span<byte> adtsHeader = stackalloc byte[7];
-
-            using (var videoStream = new FileStream(videoPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
-            using (FileStream? sysStream = sysAudioPath is not null ? new FileStream(sysAudioPath, FileMode.Create, FileAccess.Write, FileShare.None, 32768) : null)
-            using (FileStream? micStream = micAudioPath is not null ? new FileStream(micAudioPath, FileMode.Create, FileAccess.Write, FileShare.None, 32768) : null)
-            using (FileStream? mixStream = mixAudioPath is not null ? new FileStream(mixAudioPath, FileMode.Create, FileAccess.Write, FileShare.None, 32768) : null)
-            {
-                for (int i = 0; i < orderedPackets.Count; i++)
-                {
-                    EncodedPacket packet = orderedPackets[i].Packet;
-                    switch (packet.TrackType)
-                    {
-                        case MediaTrackType.Video:
-                            if (!wroteVideoHeader)
-                            {
-                                wroteVideoHeader = true;
-                                if (videoSequenceHeader is { Length: > 0 } &&
-                                    TryExtractAnnexBSpsPps(packet.Data) is null)
-                                {
-                                    videoStream.Write(videoSequenceHeader, 0, videoSequenceHeader.Length);
-                                }
-                            }
-
-                            videoStream.Write(packet.Data);
-                            videoFrameCount++;
-                            if (packet.Timestamp100Ns > lastVideoTimestamp100Ns)
-                            {
-                                lastVideoTimestamp100Ns = packet.Timestamp100Ns;
-                            }
-                            break;
-
-                        case MediaTrackType.SystemAudio when sysStream is not null:
-                            if (firstSysAudioOffset100Ns < 0)
-                            {
-                                firstSysAudioOffset100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
-                            }
-                            WriteAdtsAacFrame(sysStream, packet.Data, adtsHeader);
-                            break;
-
-                        case MediaTrackType.MicrophoneAudio when micStream is not null:
-                            if (firstMicAudioOffset100Ns < 0)
-                            {
-                                firstMicAudioOffset100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
-                            }
-                            WriteAdtsAacFrame(micStream, packet.Data, adtsHeader);
-                            break;
-
-                        case MediaTrackType.CombinedMixAudio when mixStream is not null:
-                            if (firstMixAudioOffset100Ns < 0)
-                            {
-                                firstMixAudioOffset100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
-                            }
-                            WriteAdtsAacFrame(mixStream, packet.Data, adtsHeader);
-                            break;
-                    }
-                }
-            }
-
-            // Compute effective average frame rate from actual VFR span so video duration matches audio
-            // instead of fast-forwarding whenever static-desktop gaps or dropped frames occurred.
-            double effectiveFps = fps;
-            double videoSpanSeconds = (lastVideoTimestamp100Ns - baseTimestamp100Ns) / (double)TimeSpan.TicksPerSecond;
-            if (videoFrameCount >= 2 && videoSpanSeconds >= 0.25)
-            {
-                double measuredFps = (videoFrameCount - 1) / videoSpanSeconds;
-                if (measuredFps >= 1.0 && measuredFps <= fps * 1.1)
-                {
-                    effectiveFps = measuredFps;
-                }
-            }
+            // Write an MPEG-TS intermediate stream with exact 90 kHz PTS timestamps per video and audio packet
+            // so FFmpeg remuxes VFR desktop/game recordings and mid-stream audio gaps with frame-exact A/V sync.
+            string tsPath = Path.Combine(tempDir, "replay.ts");
+            int expectedAudioTracks = WriteMpegTsIntermediate(
+                tsPath,
+                orderedPackets,
+                baseTimestamp100Ns,
+                videoSequenceHeader,
+                hasSystemAudio,
+                hasMicrophoneAudio,
+                includeCombinedMix);
 
             var startInfo = new ProcessStartInfo
             {
@@ -591,51 +521,27 @@ public sealed class Mp4ReplayMuxer
             startInfo.ArgumentList.Add("-loglevel");
             startInfo.ArgumentList.Add("error");
             startInfo.ArgumentList.Add("-y");
-            startInfo.ArgumentList.Add("-fflags");
-            startInfo.ArgumentList.Add("+genpts");
-            startInfo.ArgumentList.Add("-r");
-            startInfo.ArgumentList.Add(effectiveFps.ToString("0.###", CultureInfo.InvariantCulture));
             startInfo.ArgumentList.Add("-f");
-            startInfo.ArgumentList.Add("h264");
+            startInfo.ArgumentList.Add("mpegts");
             startInfo.ArgumentList.Add("-i");
-            startInfo.ArgumentList.Add(videoPath);
-
-            var audioInputIndices = new List<int>(3);
-            int nextInputIndex = 1;
-
-            void AddAudioInputIfValid(string? path, long initialOffset100Ns)
-            {
-                if (path is not null && File.Exists(path) && new FileInfo(path).Length > 0)
-                {
-                    if (initialOffset100Ns > TimeSpan.TicksPerMillisecond * 20)
-                    {
-                        double offsetSeconds = initialOffset100Ns / (double)TimeSpan.TicksPerSecond;
-                        startInfo.ArgumentList.Add("-itsoffset");
-                        startInfo.ArgumentList.Add(offsetSeconds.ToString("0.###", CultureInfo.InvariantCulture));
-                    }
-
-                    startInfo.ArgumentList.Add("-f");
-                    startInfo.ArgumentList.Add("aac");
-                    startInfo.ArgumentList.Add("-i");
-                    startInfo.ArgumentList.Add(path);
-                    audioInputIndices.Add(nextInputIndex++);
-                }
-            }
-
-            AddAudioInputIfValid(sysAudioPath, firstSysAudioOffset100Ns);
-            AddAudioInputIfValid(micAudioPath, firstMicAudioOffset100Ns);
-            AddAudioInputIfValid(mixAudioPath, firstMixAudioOffset100Ns);
+            startInfo.ArgumentList.Add(tsPath);
 
             startInfo.ArgumentList.Add("-map");
             startInfo.ArgumentList.Add("0:v:0");
-            for (int i = 0; i < audioInputIndices.Count; i++)
+            for (int i = 0; i < expectedAudioTracks; i++)
             {
                 startInfo.ArgumentList.Add("-map");
-                startInfo.ArgumentList.Add($"{audioInputIndices[i]}:a:0");
+                startInfo.ArgumentList.Add($"0:a:{i}");
             }
 
             startInfo.ArgumentList.Add("-c");
             startInfo.ArgumentList.Add("copy");
+            if (expectedAudioTracks > 0)
+            {
+                startInfo.ArgumentList.Add("-bsf:a");
+                startInfo.ArgumentList.Add("aac_adtstoasc");
+            }
+
             startInfo.ArgumentList.Add("-movflags");
             startInfo.ArgumentList.Add("+faststart");
             startInfo.ArgumentList.Add("-f");
@@ -660,6 +566,7 @@ public sealed class Mp4ReplayMuxer
                     // Process may have already exited.
                 }
 
+                try { _ = stderrTask.Wait(500); } catch { /* ignore */ }
                 throw new TimeoutException("Zapasowy zapis MP4 przez FFmpeg przekroczył limit czasu.");
             }
 
@@ -691,18 +598,344 @@ public sealed class Mp4ReplayMuxer
         }
     }
 
-    private static void WriteAdtsAacFrame(FileStream stream, ReadOnlySpan<byte> rawAacPayload, Span<byte> headerBuffer)
+    internal static int WriteMpegTsIntermediate(
+        string tsPath,
+        IReadOnlyList<IndexedPacket> orderedPackets,
+        long baseTimestamp100Ns,
+        byte[]? videoSequenceHeader,
+        bool hasSystemAudio,
+        bool hasMicrophoneAudio,
+        bool includeCombinedMix)
+    {
+        const ushort PmtPid = 0x1000;
+        const ushort VideoPid = 0x0100;
+        const ushort SysAudioPid = 0x0101;
+        const ushort MicAudioPid = 0x0102;
+        const ushort MixAudioPid = 0x0103;
+        const byte StreamTypeH264 = 0x1B;
+        const byte StreamTypeAacAdts = 0x0F;
+        const byte VideoPesStreamId = 0xE0;
+        const byte AudioPesStreamId = 0xC0;
+
+        var pmtStreams = new List<(byte StreamType, ushort Pid)>(4)
+        {
+            (StreamTypeH264, VideoPid)
+        };
+        int audioCount = 0;
+        if (hasSystemAudio)
+        {
+            pmtStreams.Add((StreamTypeAacAdts, SysAudioPid));
+            audioCount++;
+        }
+        if (hasMicrophoneAudio)
+        {
+            pmtStreams.Add((StreamTypeAacAdts, MicAudioPid));
+            audioCount++;
+        }
+        if (includeCombinedMix)
+        {
+            pmtStreams.Add((StreamTypeAacAdts, MixAudioPid));
+            audioCount++;
+        }
+
+        byte patCc = 0, pmtCc = 0, videoCc = 0, sysCc = 0, micCc = 0, mixCc = 0;
+        long lastVideoTs = -1, lastSysTs = -1, lastMicTs = -1, lastMixTs = -1;
+        bool wroteVideoHeader = false;
+
+        Span<byte> tsPacket = stackalloc byte[188];
+        Span<byte> adtsHeader = stackalloc byte[7];
+        using var pesBuffer = new MemoryStream(65536);
+        using var tsStream = new FileStream(tsPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
+
+        WritePatPacket(tsStream, tsPacket, PmtPid, ref patCc);
+        WritePmtPacket(tsStream, tsPacket, PmtPid, VideoPid, pmtStreams, ref pmtCc);
+
+        for (int i = 0; i < orderedPackets.Count; i++)
+        {
+            EncodedPacket packet = orderedPackets[i].Packet;
+            long relTs100Ns = Math.Max(0L, packet.Timestamp100Ns - baseTimestamp100Ns);
+
+            switch (packet.TrackType)
+            {
+                case MediaTrackType.Video:
+                {
+                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastVideoTs);
+                    long pts90k = ToMpegTsPts90k(relTs100Ns);
+
+                    if (packet.IsKeyframe && wroteVideoHeader)
+                    {
+                        WritePatPacket(tsStream, tsPacket, PmtPid, ref patCc);
+                        WritePmtPacket(tsStream, tsPacket, PmtPid, VideoPid, pmtStreams, ref pmtCc);
+                    }
+
+                    pesBuffer.SetLength(0);
+                    WritePesHeader(pesBuffer, VideoPesStreamId, pts90k, payloadLength: 0);
+
+                    if ((!wroteVideoHeader || packet.IsKeyframe) &&
+                        videoSequenceHeader is { Length: > 0 } &&
+                        TryExtractAnnexBSpsPps(packet.Data) is null)
+                    {
+                        pesBuffer.Write(videoSequenceHeader, 0, videoSequenceHeader.Length);
+                    }
+
+                    wroteVideoHeader = true;
+                    pesBuffer.Write(packet.Data);
+
+                    ReadOnlySpan<byte> pesSpan = pesBuffer.GetBuffer().AsSpan(0, (int)pesBuffer.Length);
+                    WriteTsPesPackets(tsStream, tsPacket, VideoPid, pesSpan, pts90k, includePcr: packet.IsKeyframe, ref videoCc);
+                    break;
+                }
+
+                case MediaTrackType.SystemAudio when hasSystemAudio:
+                {
+                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastSysTs);
+                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, SysAudioPid, AudioPesStreamId, packet.Data, ToMpegTsPts90k(relTs100Ns), ref sysCc);
+                    break;
+                }
+
+                case MediaTrackType.MicrophoneAudio when hasMicrophoneAudio:
+                {
+                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastMicTs);
+                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, MicAudioPid, AudioPesStreamId, packet.Data, ToMpegTsPts90k(relTs100Ns), ref micCc);
+                    break;
+                }
+
+                case MediaTrackType.CombinedMixAudio when includeCombinedMix:
+                {
+                    relTs100Ns = EnsureStrictlyMonotonic(relTs100Ns, ref lastMixTs);
+                    WriteAudioPesToTs(tsStream, tsPacket, pesBuffer, adtsHeader, MixAudioPid, AudioPesStreamId, packet.Data, ToMpegTsPts90k(relTs100Ns), ref mixCc);
+                    break;
+                }
+            }
+        }
+
+        return audioCount;
+    }
+
+    private static long ToMpegTsPts90k(long time100Ns)
+        => ((time100Ns * 9L) / 1000L) & 0x1_FFFF_FFFFL;
+
+    private static void WriteAudioPesToTs(
+        FileStream tsStream,
+        Span<byte> tsPacket,
+        MemoryStream pesBuffer,
+        Span<byte> adtsHeader,
+        ushort pid,
+        byte streamId,
+        ReadOnlySpan<byte> rawAacPayload,
+        long pts90k,
+        ref byte continuityCounter)
     {
         if (rawAacPayload.IsEmpty)
         {
             return;
         }
 
+        BuildAdtsAacHeader(rawAacPayload.Length, adtsHeader);
+        int adtsFrameLength = rawAacPayload.Length + 7;
+
+        pesBuffer.SetLength(0);
+        WritePesHeader(pesBuffer, streamId, pts90k, payloadLength: adtsFrameLength);
+        pesBuffer.Write(adtsHeader);
+        pesBuffer.Write(rawAacPayload);
+
+        ReadOnlySpan<byte> pesSpan = pesBuffer.GetBuffer().AsSpan(0, (int)pesBuffer.Length);
+        WriteTsPesPackets(tsStream, tsPacket, pid, pesSpan, pts90k, includePcr: false, ref continuityCounter);
+    }
+
+    private static void WritePesHeader(MemoryStream stream, byte streamId, long pts90k, int payloadLength)
+    {
+        // PES header with 5-byte PTS only (optional header length = 3 + 5 = 8 bytes)
+        int pesLength = payloadLength > 0 && payloadLength + 8 <= ushort.MaxValue
+            ? payloadLength + 8
+            : 0;
+
+        Span<byte> header = stackalloc byte[14];
+        header[0] = 0x00;
+        header[1] = 0x00;
+        header[2] = 0x01;
+        header[3] = streamId;
+        header[4] = (byte)((pesLength >> 8) & 0xFF);
+        header[5] = (byte)(pesLength & 0xFF);
+        header[6] = 0x80; // MPEG-2 PES marker bits '10'
+        header[7] = 0x80; // PTS_DTS_flags = '10' (PTS only)
+        header[8] = 0x05; // PES_header_data_length = 5 bytes
+        header[9] = (byte)(0x21 | (((pts90k >> 30) & 0x07) << 1));
+        header[10] = (byte)((pts90k >> 22) & 0xFF);
+        header[11] = (byte)(0x01 | (((pts90k >> 15) & 0x7F) << 1));
+        header[12] = (byte)((pts90k >> 7) & 0xFF);
+        header[13] = (byte)(0x01 | ((pts90k & 0x7F) << 1));
+        stream.Write(header);
+    }
+
+    private static void WriteTsPesPackets(
+        FileStream tsStream,
+        Span<byte> tsPacket,
+        ushort pid,
+        ReadOnlySpan<byte> pesData,
+        long pcr90k,
+        bool includePcr,
+        ref byte continuityCounter)
+    {
+        int offset = 0;
+        bool isFirst = true;
+
+        while (offset < pesData.Length)
+        {
+            tsPacket.Clear();
+            tsPacket[0] = 0x47;
+            tsPacket[1] = (byte)((isFirst ? 0x40 : 0x00) | ((pid >> 8) & 0x1F));
+            tsPacket[2] = (byte)(pid & 0xFF);
+
+            int remaining = pesData.Length - offset;
+            bool writePcr = isFirst && includePcr;
+            int minAdaptationBytes = writePcr ? 8 : 0; // 1 length + 1 flags + 6 PCR
+            int maxPayload = 184 - minAdaptationBytes;
+
+            if (remaining < maxPayload || writePcr)
+            {
+                int payloadSize = Math.Min(remaining, maxPayload);
+                int adaptationTotal = 184 - payloadSize; // includes 1-byte adaptation_field_length
+
+                tsPacket[3] = (byte)(0x30 | (continuityCounter & 0x0F));
+                tsPacket[4] = (byte)(adaptationTotal - 1);
+
+                if (adaptationTotal >= 2)
+                {
+                    tsPacket[5] = writePcr ? (byte)0x10 : (byte)0x00; // PCR_flag
+                    int stuffStart = 6;
+                    if (writePcr)
+                    {
+                        tsPacket[6] = (byte)((pcr90k >> 25) & 0xFF);
+                        tsPacket[7] = (byte)((pcr90k >> 17) & 0xFF);
+                        tsPacket[8] = (byte)((pcr90k >> 9) & 0xFF);
+                        tsPacket[9] = (byte)((pcr90k >> 1) & 0xFF);
+                        tsPacket[10] = (byte)(((pcr90k & 0x01) << 7) | 0x7E);
+                        tsPacket[11] = 0x00;
+                        stuffStart = 12;
+                    }
+
+                    int payloadStart = 4 + adaptationTotal;
+                    for (int s = stuffStart; s < payloadStart; s++)
+                    {
+                        tsPacket[s] = 0xFF;
+                    }
+                }
+
+                pesData.Slice(offset, payloadSize).CopyTo(tsPacket.Slice(4 + adaptationTotal, payloadSize));
+                offset += payloadSize;
+            }
+            else
+            {
+                tsPacket[3] = (byte)(0x10 | (continuityCounter & 0x0F));
+                pesData.Slice(offset, 184).CopyTo(tsPacket.Slice(4, 184));
+                offset += 184;
+            }
+
+            continuityCounter = (byte)((continuityCounter + 1) & 0x0F);
+            isFirst = false;
+            tsStream.Write(tsPacket);
+        }
+    }
+
+    private static void WritePatPacket(FileStream tsStream, Span<byte> tsPacket, ushort pmtPid, ref byte cc)
+    {
+        tsPacket.Fill(0xFF);
+        tsPacket[0] = 0x47;
+        tsPacket[1] = 0x40; // PUSI=1, PID=0
+        tsPacket[2] = 0x00;
+        tsPacket[3] = (byte)(0x10 | (cc & 0x0F));
+        cc = (byte)((cc + 1) & 0x0F);
+
+        tsPacket[4] = 0x00; // pointer_field
+        int s = 5;
+        tsPacket[s + 0] = 0x00; // table_id = PAT
+        tsPacket[s + 1] = 0xB0; // section_syntax_indicator=1, section_length=13
+        tsPacket[s + 2] = 0x0D;
+        tsPacket[s + 3] = 0x00; // transport_stream_id = 1
+        tsPacket[s + 4] = 0x01;
+        tsPacket[s + 5] = 0xC1; // version=0, current_next=1
+        tsPacket[s + 6] = 0x00; // section_number
+        tsPacket[s + 7] = 0x00; // last_section_number
+        tsPacket[s + 8] = 0x00; // program_number = 1
+        tsPacket[s + 9] = 0x01;
+        tsPacket[s + 10] = (byte)(0xE0 | ((pmtPid >> 8) & 0x1F));
+        tsPacket[s + 11] = (byte)(pmtPid & 0xFF);
+
+        uint crc = ComputeMpeg2Crc32(tsPacket.Slice(s, 12));
+        BinaryPrimitives.WriteUInt32BigEndian(tsPacket.Slice(s + 12, 4), crc);
+        tsStream.Write(tsPacket);
+    }
+
+    private static void WritePmtPacket(
+        FileStream tsStream,
+        Span<byte> tsPacket,
+        ushort pmtPid,
+        ushort pcrPid,
+        List<(byte StreamType, ushort Pid)> streams,
+        ref byte cc)
+    {
+        tsPacket.Fill(0xFF);
+        tsPacket[0] = 0x47;
+        tsPacket[1] = (byte)(0x40 | ((pmtPid >> 8) & 0x1F));
+        tsPacket[2] = (byte)(pmtPid & 0xFF);
+        tsPacket[3] = (byte)(0x10 | (cc & 0x0F));
+        cc = (byte)((cc + 1) & 0x0F);
+
+        tsPacket[4] = 0x00; // pointer_field
+        int s = 5;
+        int sectionLength = 9 + (streams.Count * 5) + 4;
+        tsPacket[s + 0] = 0x02; // table_id = PMT
+        tsPacket[s + 1] = (byte)(0xB0 | ((sectionLength >> 8) & 0x0F));
+        tsPacket[s + 2] = (byte)(sectionLength & 0xFF);
+        tsPacket[s + 3] = 0x00; // program_number = 1
+        tsPacket[s + 4] = 0x01;
+        tsPacket[s + 5] = 0xC1; // version=0, current_next=1
+        tsPacket[s + 6] = 0x00; // section_number
+        tsPacket[s + 7] = 0x00; // last_section_number
+        tsPacket[s + 8] = (byte)(0xE0 | ((pcrPid >> 8) & 0x1F));
+        tsPacket[s + 9] = (byte)(pcrPid & 0xFF);
+        tsPacket[s + 10] = 0xF0; // program_info_length = 0
+        tsPacket[s + 11] = 0x00;
+
+        int pos = s + 12;
+        for (int i = 0; i < streams.Count; i++)
+        {
+            tsPacket[pos + 0] = streams[i].StreamType;
+            tsPacket[pos + 1] = (byte)(0xE0 | ((streams[i].Pid >> 8) & 0x1F));
+            tsPacket[pos + 2] = (byte)(streams[i].Pid & 0xFF);
+            tsPacket[pos + 3] = 0xF0; // ES_info_length = 0
+            tsPacket[pos + 4] = 0x00;
+            pos += 5;
+        }
+
+        uint crc = ComputeMpeg2Crc32(tsPacket.Slice(s, pos - s));
+        BinaryPrimitives.WriteUInt32BigEndian(tsPacket.Slice(pos, 4), crc);
+        tsStream.Write(tsPacket);
+    }
+
+    private static uint ComputeMpeg2Crc32(ReadOnlySpan<byte> data)
+    {
+        uint crc = 0xFFFFFFFFu;
+        for (int i = 0; i < data.Length; i++)
+        {
+            crc ^= (uint)data[i] << 24;
+            for (int bit = 0; bit < 8; bit++)
+            {
+                crc = (crc & 0x80000000u) != 0 ? (crc << 1) ^ 0x04C11DB7u : crc << 1;
+            }
+        }
+
+        return crc;
+    }
+
+    private static void BuildAdtsAacHeader(int rawAacPayloadLength, Span<byte> headerBuffer)
+    {
         // Standard 7-byte ISO 14496-3 ADTS header for AAC-LC (profile=1), 48000 Hz (freqIdx=3), Stereo (chanCfg=2).
         const int profile = 1;
         const int freqIdx = 3;
         const int chanCfg = 2;
-        int frameLength = rawAacPayload.Length + 7;
+        int frameLength = rawAacPayloadLength + 7;
 
         headerBuffer[0] = 0xFF;
         headerBuffer[1] = 0xF1;
@@ -711,9 +944,6 @@ public sealed class Mp4ReplayMuxer
         headerBuffer[4] = (byte)((frameLength >> 3) & 0xFF);
         headerBuffer[5] = (byte)(((frameLength & 0x07) << 5) | 0x1F);
         headerBuffer[6] = 0xFC;
-
-        stream.Write(headerBuffer);
-        stream.Write(rawAacPayload);
     }
 
     private static unsafe void WritePacketSample(
@@ -773,6 +1003,10 @@ public sealed class Mp4ReplayMuxer
             mediaType.Set(MediaTypeAttributeKeys.FrameSize, PackUInt64((uint)width, (uint)height)).CheckError();
             mediaType.Set(MediaTypeAttributeKeys.FrameRate, PackUInt64((uint)fps, 1u)).CheckError();
             mediaType.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUInt64(1u, 1u)).CheckError();
+            mediaType.Set(MediaTypeAttributeKeys.VideoPrimaries, (uint)VideoPrimaries.Bt709);
+            mediaType.Set(MediaTypeAttributeKeys.YuvMatrix, (uint)VideoTransferMatrix.Bt709);
+            mediaType.Set(MediaTypeAttributeKeys.TransferFunction, (uint)VideoTransferFunction.Func709);
+            mediaType.Set(MediaTypeAttributeKeys.VideoNominalRange, (uint)NominalRange.Range16_235);
 
             if (sequenceHeader is { Length: > 0 })
             {
@@ -842,10 +1076,12 @@ public sealed class Mp4ReplayMuxer
         return candidateTimestamp;
     }
 
-    private static byte[]? TryExtractAnnexBSpsPps(ReadOnlySpan<byte> data)
+    internal static byte[]? TryExtractAnnexBSpsPps(ReadOnlySpan<byte> data)
     {
         using var stream = new MemoryStream();
         int pos = FindNextStartCode(data, 0, out int startCodeLen);
+        bool hasSps = false;
+        bool hasPps = false;
 
         while (pos >= 0 && pos + startCodeLen < data.Length)
         {
@@ -856,6 +1092,8 @@ public sealed class Mp4ReplayMuxer
             int nalType = data[nalStart] & 0x1F;
             if (nalType is 7 or 8)
             {
+                if (nalType == 7) hasSps = true;
+                else hasPps = true;
                 stream.Write(data.Slice(pos, nalEnd - pos));
             }
 
@@ -863,7 +1101,7 @@ public sealed class Mp4ReplayMuxer
             startCodeLen = nextStartCodeLen;
         }
 
-        return stream.Length > 0 ? stream.ToArray() : null;
+        return (hasSps && hasPps && stream.Length > 0) ? stream.ToArray() : null;
     }
 
     private static int FindNextStartCode(ReadOnlySpan<byte> data, int startIndex, out int startCodeLength)
@@ -903,7 +1141,7 @@ public sealed class Mp4ReplayMuxer
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Nie udało się usunąć niekompletnego pliku MP4 '{path}': {ex.Message}");
+            EngineLogger.Warn("Mp4ReplayMuxer", $"Failed to delete partial MP4 file '{path}': {ex.Message}");
         }
     }
 
@@ -1000,7 +1238,7 @@ public sealed class Mp4ReplayMuxer
             offset = child.BoxEnd;
         }
 
-        if (audioTrackPatchTargets.Count == 0)
+        if (audioTrackPatchTargets.Count <= 1)
         {
             return;
         }
@@ -1132,7 +1370,7 @@ public sealed class Mp4ReplayMuxer
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Nie udało się zaktualizować flag ścieżek audio w pliku MP4 '{mp4FilePath}': {ex.Message}");
+            EngineLogger.Warn("Mp4ReplayMuxer", $"Failed to patch MP4 audio track flags for '{mp4FilePath}': {ex.Message}");
         }
     }
 
@@ -1284,7 +1522,7 @@ public sealed class Mp4ReplayMuxer
         _ => 4
     };
 
-    private readonly record struct IndexedPacket(EncodedPacket Packet, int OriginalIndex);
+    internal readonly record struct IndexedPacket(EncodedPacket Packet, int OriginalIndex);
 
     private readonly record struct Mp4BoxHeader(uint Type, long BoxStart, long PayloadStart, long BoxEnd)
     {

@@ -7,6 +7,8 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using ClipThat.Engine;
+using ClipThat.Engine.Audio;
+using ClipThat.Engine.Diagnostics;
 using ClipThat.Models;
 using ClipThat.Services;
 using ClipThat.UI.Controls;
@@ -69,8 +71,10 @@ public partial class ClipsPage : Page
     private double _lastNonZeroSystemVolume = 100.0;
     private double _lastNonZeroMicVolume = 100.0;
     private long _lastTrimSeekTimestamp;
+    private long _lastScrubSeekTimestamp;
     private double? _pendingTrimSeekSeconds;
     private double? _lastTrimDragSeconds;
+    private double _suspendedPositionSeconds;
 
     private bool _isClipsListCollapsed;
     private int _sidebarAnimationGeneration;
@@ -80,9 +84,13 @@ public partial class ClipsPage : Page
     private bool _isDraggingTrimHandle;
     private bool _isRefreshingClipsList;
     private bool _isUpdatingVolumeSliders;
+    private bool _isPopulatingExportFileName;
+    private bool _userEditedExportFileName;
+    private bool _isPreviewSuspendedForClip;
     private bool _isExtractingPreviewAudio;
     private bool _isPreviewAudioReady;
     private bool _isExporting;
+    private bool _isDeletingClip;
     private bool _isDetached;
 
     public ClipsPage(
@@ -207,6 +215,27 @@ public partial class ClipsPage : Page
             PausePlayback();
         }
 
+        // Close MediaElement while hidden in tray or navigated away so we release the MP4 file handle
+        // and video decoder memory while keeping trim markers and playhead position ready to restore.
+        if (_selectedClip is not null && PreviewMediaElement.Source is not null)
+        {
+            _suspendedPositionSeconds = _clipDurationSeconds > 0.0
+                ? Math.Clamp(GetSafeMediaPosition().TotalSeconds, 0.0, _clipDurationSeconds)
+                : 0.0;
+            _isPreviewSuspendedForClip = true;
+
+            try
+            {
+                PreviewMediaElement.Stop();
+                PreviewMediaElement.Close();
+                PreviewMediaElement.Source = null;
+            }
+            catch
+            {
+                // Ignore MediaElement teardown errors during suspend.
+            }
+        }
+
         // Dispose NAudio playback objects and delete temporary preview .wav files when hidden or navigated away.
         DisposeAudioMixerAndDeleteTempFiles();
         HideAudioLoadingOverlay();
@@ -240,13 +269,14 @@ public partial class ClipsPage : Page
             watcher.Deleted += OnDirectoryFileChanged;
             watcher.Renamed += OnDirectoryFileRenamed;
             watcher.Changed += OnDirectoryFileChanged;
+            watcher.Error += OnDirectoryWatcherError;
             watcher.EnableRaisingEvents = true;
 
             _directoryWatcher = watcher;
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Nie udało się uruchomić obserwatora folderu '{directoryPath}': {ex.Message}");
+            EngineLogger.Warn("ClipsPage", $"Nie udało się uruchomić obserwatora folderu '{directoryPath}': {ex.Message}", ex);
         }
     }
 
@@ -266,12 +296,35 @@ public partial class ClipsPage : Page
             watcher.Deleted -= OnDirectoryFileChanged;
             watcher.Renamed -= OnDirectoryFileRenamed;
             watcher.Changed -= OnDirectoryFileChanged;
+            watcher.Error -= OnDirectoryWatcherError;
             watcher.Dispose();
         }
         catch
         {
             // Ignore disposal errors when tearing down FileSystemWatcher.
         }
+    }
+
+    private void OnDirectoryWatcherError(object sender, ErrorEventArgs e)
+    {
+        Exception? ex = e.GetException();
+        EngineLogger.Warn("ClipsPage", $"Błąd obserwatora folderu nagrań (odtwarzanie): {ex?.Message ?? "nieznany"}", ex);
+
+        if (_isDetached)
+        {
+            return;
+        }
+
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (_isDetached || !IsLoaded)
+            {
+                return;
+            }
+
+            ConfigureDirectoryWatcher(GetConfiguredOutputDirectory());
+            ScheduleDebouncedRefresh();
+        });
     }
 
     private void OnDirectoryFileChanged(object sender, FileSystemEventArgs e)
@@ -391,9 +444,31 @@ public partial class ClipsPage : Page
                 // Keep playback and trim state undisturbed while keeping metadata fresh.
                 _selectedClip = matchingClip;
                 UpdateSelectedClipSubtitleAndAudioHint(matchingClip);
-                if (!ExportFileNameTextBox.IsKeyboardFocusWithin)
+                if (!_userEditedExportFileName && !ExportFileNameTextBox.IsKeyboardFocusWithin)
                 {
                     PopulateDefaultExportFileName(matchingClip);
+                }
+
+                // Restore MediaElement source if it was closed while hidden in tray or navigated away.
+                if (_isPreviewSuspendedForClip && PreviewMediaElement.Source is null && File.Exists(matchingClip.FilePath))
+                {
+                    _isPreviewSuspendedForClip = false;
+                    try
+                    {
+                        if (_clipDurationSeconds > 0.0)
+                        {
+                            TrimRangeSlider.CurrentPosition = Math.Clamp(_suspendedPositionSeconds, 0.0, _clipDurationSeconds);
+                        }
+
+                        PreviewMediaElement.IsMuted = true;
+                        PreviewMediaElement.Volume = 0.0;
+                        PreviewMediaElement.Source = new Uri(matchingClip.FilePath, UriKind.Absolute);
+                        PreviewMediaElement.Pause();
+                    }
+                    catch (Exception ex)
+                    {
+                        EngineLogger.Warn("ClipsPage", $"Nie udało się wznowić podglądu wideo: {ex.Message}", ex);
+                    }
                 }
 
                 // If preview audio was cleaned up when navigating away from ClipsPage, re-extract it cleanly.
@@ -450,13 +525,16 @@ public partial class ClipsPage : Page
         if (!File.Exists(clip.FilePath))
         {
             _selectedClip = null;
-            ExportFileNameTextBox.Text = string.Empty;
+            _userEditedExportFileName = false;
+            SetExportFileNameProgrammatically(string.Empty);
             SetEditorControlsEnabled(hasClip: false);
             ShowExportStatus("Wybrany plik nagrania nie istnieje już na dysku.", ErrorStatusBrush);
             return;
         }
 
         _selectedClip = clip;
+        _userEditedExportFileName = false;
+        _isPreviewSuspendedForClip = false;
         _clipDurationSeconds = Math.Max(0.0, clip.Duration.TotalSeconds);
         NoPreviewOverlay.Visibility = Visibility.Collapsed;
 
@@ -747,10 +825,7 @@ public partial class ClipsPage : Page
         }
         else if (chain.WaveFormat.Channels > PreviewMixerChannels)
         {
-            var stereoMux = new MultiplexingSampleProvider(new[] { chain }, PreviewMixerChannels);
-            stereoMux.ConnectInputToOutput(0, 0);
-            stereoMux.ConnectInputToOutput(1, 1);
-            chain = stereoMux;
+            chain = new DualAudioCaptureService.AudioPcmConverter.DownmixToStereoSampleProvider(chain);
         }
 
         if (chain.WaveFormat.SampleRate != PreviewMixerSampleRate)
@@ -839,6 +914,8 @@ public partial class ClipsPage : Page
         _isScrubbingTimeline = false;
         _wasPlayingBeforeTimelineScrub = false;
         _isDraggingTrimHandle = false;
+        _isPreviewSuspendedForClip = false;
+        _suspendedPositionSeconds = 0.0;
 
         DisposeAudioMixerAndDeleteTempFiles();
         HideAudioLoadingOverlay();
@@ -859,11 +936,12 @@ public partial class ClipsPage : Page
         if (clearSelectionField)
         {
             _selectedClip = null;
+            _userEditedExportFileName = false;
             _clipDurationSeconds = 0.0;
             NoPreviewOverlay.Visibility = Visibility.Visible;
             SelectedClipSubtitleText.Text = "Wybierz nagranie z listy po lewej stronie";
             AudioTracksHintText.Text = string.Empty;
-            ExportFileNameTextBox.Text = string.Empty;
+            SetExportFileNameProgrammatically(string.Empty);
             InitializeTimelineAndTrimRange(0.0, resetRangeToFull: true);
             SetEditorControlsEnabled(hasClip: false);
         }
@@ -877,7 +955,28 @@ public partial class ClipsPage : Page
 
     private void PopulateDefaultExportFileName(ClipItem clip)
     {
-        ExportFileNameTextBox.Text = Path.GetFileNameWithoutExtension(clip.FileName) + "_edited";
+        SetExportFileNameProgrammatically(Path.GetFileNameWithoutExtension(clip.FileName) + "_edited");
+    }
+
+    private void SetExportFileNameProgrammatically(string value)
+    {
+        _isPopulatingExportFileName = true;
+        try
+        {
+            ExportFileNameTextBox.Text = value;
+        }
+        finally
+        {
+            _isPopulatingExportFileName = false;
+        }
+    }
+
+    private void ExportFileNameTextBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!_isPopulatingExportFileName && _selectedClip is not null)
+        {
+            _userEditedExportFileName = true;
+        }
     }
 
     private void ResetAudioSlidersForClip(ClipItem clip)
@@ -1299,6 +1398,7 @@ public partial class ClipsPage : Page
     private void TrimRangeSlider_PositionSeekStarted(object? sender, EventArgs e)
     {
         _isScrubbingTimeline = true;
+        _lastScrubSeekTimestamp = 0;
         _wasPlayingBeforeTimelineScrub = _isPlaying;
 
         if (_isPlaying)
@@ -1328,8 +1428,15 @@ public partial class ClipsPage : Page
 
         if (_isScrubbingTimeline)
         {
-            // While scrubbing the unified bar, update video frames live; audio resyncs cleanly on release.
-            SeekVideoOnlyToSeconds(clamped);
+            // Throttle live MediaElement seeks while dragging on high-polling-rate mice;
+            // exact final position and audio streams resync cleanly on PositionSeekCompleted.
+            long now = Stopwatch.GetTimestamp();
+            if (_lastScrubSeekTimestamp == 0 ||
+                Stopwatch.GetElapsedTime(_lastScrubSeekTimestamp, now).TotalMilliseconds >= 35.0)
+            {
+                _lastScrubSeekTimestamp = now;
+                SeekVideoOnlyToSeconds(clamped);
+            }
         }
         else
         {
@@ -1410,42 +1517,37 @@ public partial class ClipsPage : Page
     {
         lock (_audioSyncLock)
         {
-            SeekWaveStreamLocked(_systemWaveStream, position);
-            SeekWaveStreamLocked(_micWaveStream, position);
+            SeekWaveStreamLocked(_systemWaveStream, _systemSampleProvider, position);
+            SeekWaveStreamLocked(_micWaveStream, _micSampleProvider, position);
         }
     }
 
     private (TimeSpan? CurrentTime, TimeSpan? TotalTime) GetAudioTiming()
     {
-        lock (_audioSyncLock)
+        // Read lock-free cached timing snapshots updated on the NAudio playback thread and on seek
+        // so the 30 Hz UI PlaybackTimer_Tick never contends with _audioSyncLock.
+        LockedSampleProvider? sysProvider = Volatile.Read(ref _systemSampleProvider);
+        LockedSampleProvider? micProvider = Volatile.Read(ref _micSampleProvider);
+
+        LockedSampleProvider? activeProvider = sysProvider;
+        if (activeProvider is null)
         {
-            WaveStream? activeStream = _systemWaveStream;
-            if (activeStream is null)
-            {
-                activeStream = _micWaveStream;
-            }
-            else if (_micWaveStream is not null && _micWaveStream.TotalTime > activeStream.TotalTime)
-            {
-                activeStream = _micWaveStream;
-            }
-
-            if (activeStream is null)
-            {
-                return (null, null);
-            }
-
-            try
-            {
-                return (activeStream.CurrentTime, activeStream.TotalTime);
-            }
-            catch
-            {
-                return (null, null);
-            }
+            activeProvider = micProvider;
         }
+        else if (micProvider is not null && micProvider.TotalTime > activeProvider.TotalTime)
+        {
+            activeProvider = micProvider;
+        }
+
+        return activeProvider is null
+            ? (null, null)
+            : (activeProvider.LastCurrentTime, activeProvider.TotalTime);
     }
 
-    private static void SeekWaveStreamLocked(WaveStream? stream, TimeSpan position)
+    private static void SeekWaveStreamLocked(
+        WaveStream? stream,
+        LockedSampleProvider? provider,
+        TimeSpan position)
     {
         if (stream is null)
         {
@@ -1470,6 +1572,7 @@ public partial class ClipsPage : Page
             targetByte -= targetByte % blockAlign;
             long maxValidByte = Math.Max(0L, stream.Length - (stream.Length % blockAlign));
             stream.Position = Math.Clamp(targetByte, 0L, maxValidByte);
+            provider?.UpdateCachedPosition(stream.CurrentTime);
         }
         catch
         {
@@ -1977,56 +2080,73 @@ public partial class ClipsPage : Page
     {
         e.Handled = true;
 
-        if (_isExporting || sender is not FrameworkElement { Tag: ClipItem clip })
+        if (_isExporting || _isDeletingClip || _isDetached || sender is not FrameworkElement { Tag: ClipItem clip })
         {
             return;
         }
 
-        Window? owner = Window.GetWindow(this);
-        var confirmDialog = new ConfirmDialog(
-            title: "Usuń nagranie",
-            message: $"Czy na pewno chcesz trwale usunąć nagranie \"{clip.FileName}\"? Tej operacji nie można cofnąć.",
-            confirmText: "Usuń",
-            cancelText: "Anuluj",
-            icon: SymbolRegular.Delete24);
-
-        if (owner is not null)
-        {
-            confirmDialog.Owner = owner;
-        }
-        else
-        {
-            confirmDialog.WindowStartupLocation = WindowStartupLocation.CenterScreen;
-        }
-
-        if (confirmDialog.ShowDialog() != true)
-        {
-            return;
-        }
-
-        bool deletingSelectedClip =
-            (_selectedClip is not null &&
-             string.Equals(_selectedClip.FilePath, clip.FilePath, StringComparison.OrdinalIgnoreCase)) ||
-            (PreviewMediaElement.Source is { IsFile: true } sourceUri &&
-             string.Equals(sourceUri.LocalPath, clip.FilePath, StringComparison.OrdinalIgnoreCase));
-
-        if (deletingSelectedClip)
-        {
-            // Stop playback and release MediaElement source + NAudio .wav streams before deleting the file.
-            UnloadMediaPreview(clearSelectionField: true);
-        }
-
+        _isDeletingClip = true;
         try
         {
-            await DeleteFileWithRetryAsync(clip.FilePath);
-            ShowExportStatus($"Usunięto nagranie: {clip.FileName}", NeutralStatusBrush);
-        }
-        catch (Exception ex)
-        {
-            ShowExportStatus($"Nie udało się usunąć pliku \"{clip.FileName}\": {ex.Message}", ErrorStatusBrush);
-        }
+            Window? owner = Window.GetWindow(this);
+            var confirmDialog = new ConfirmDialog(
+                title: "Usuń nagranie",
+                message: $"Czy na pewno chcesz trwale usunąć nagranie \"{clip.FileName}\"? Tej operacji nie można cofnąć.",
+                confirmText: "Usuń",
+                cancelText: "Anuluj",
+                icon: SymbolRegular.Delete24);
 
-        await RefreshClipsAsync(preferredSelectionPath: deletingSelectedClip ? null : _selectedClip?.FilePath);
+            if (owner is { IsVisible: true })
+            {
+                confirmDialog.Owner = owner;
+            }
+            else
+            {
+                confirmDialog.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            }
+
+            if (confirmDialog.ShowDialog() != true || _isDetached)
+            {
+                return;
+            }
+
+            bool deletingSelectedClip =
+                (_selectedClip is not null &&
+                 string.Equals(_selectedClip.FilePath, clip.FilePath, StringComparison.OrdinalIgnoreCase)) ||
+                (PreviewMediaElement.Source is { IsFile: true } sourceUri &&
+                 string.Equals(sourceUri.LocalPath, clip.FilePath, StringComparison.OrdinalIgnoreCase));
+
+            if (deletingSelectedClip)
+            {
+                // Stop playback and release MediaElement source + NAudio .wav streams before deleting the file.
+                UnloadMediaPreview(clearSelectionField: true);
+            }
+
+            try
+            {
+                await DeleteFileWithRetryAsync(clip.FilePath);
+                if (!_isDetached)
+                {
+                    ShowExportStatus($"Usunięto nagranie: {clip.FileName}", NeutralStatusBrush);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!_isDetached)
+                {
+                    ShowExportStatus($"Nie udało się usunąć pliku \"{clip.FileName}\": {ex.Message}", ErrorStatusBrush);
+                }
+            }
+
+            if (!_isDetached)
+            {
+                await RefreshClipsAsync(preferredSelectionPath: deletingSelectedClip ? null : _selectedClip?.FilePath);
+            }
+        }
+        finally
+        {
+            _isDeletingClip = false;
+        }
     }
 
     private static async Task DeleteFileWithRetryAsync(string filePath)
@@ -2119,20 +2239,33 @@ public partial class ClipsPage : Page
     /// </summary>
     private sealed class LockedSampleProvider : ISampleProvider
     {
+        private readonly WaveStream _waveStream;
         private readonly ISampleProvider _inner;
         private readonly object _syncLock;
+        private readonly long _totalTimeTicks;
+        private long _lastCurrentTimeTicks;
         private volatile bool _isStopped;
 
         public LockedSampleProvider(WaveStream waveStream, object syncLock)
         {
+            _waveStream = waveStream;
             _inner = waveStream.ToSampleProvider();
             _syncLock = syncLock;
             WaveFormat = _inner.WaveFormat;
+            _totalTimeTicks = waveStream.TotalTime.Ticks;
+            _lastCurrentTimeTicks = waveStream.CurrentTime.Ticks;
         }
 
         public WaveFormat WaveFormat { get; }
 
+        public TimeSpan LastCurrentTime => TimeSpan.FromTicks(Volatile.Read(ref _lastCurrentTimeTicks));
+
+        public TimeSpan TotalTime => TimeSpan.FromTicks(_totalTimeTicks);
+
         public void MarkStopped() => _isStopped = true;
+
+        public void UpdateCachedPosition(TimeSpan currentTime)
+            => Volatile.Write(ref _lastCurrentTimeTicks, currentTime.Ticks);
 
         public int Read(float[] buffer, int offset, int count)
         {
@@ -2154,6 +2287,7 @@ public partial class ClipsPage : Page
                 try
                 {
                     samplesRead = _inner.Read(buffer, offset, count);
+                    Volatile.Write(ref _lastCurrentTimeTicks, _waveStream.CurrentTime.Ticks);
                 }
                 catch
                 {

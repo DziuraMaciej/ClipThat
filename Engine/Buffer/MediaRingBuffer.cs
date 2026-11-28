@@ -156,6 +156,7 @@ public sealed unsafe class EncodedPacket : IDisposable
 
     private sealed class PacketBacking
     {
+        private NativeSlab? _slab;
         private nint _nativePtr;
         private byte[]? _managedArray;
         private readonly bool _returnToArrayPool;
@@ -166,29 +167,24 @@ public sealed unsafe class EncodedPacket : IDisposable
         {
             _managedArray = array;
             _returnToArrayPool = returnToArrayPool;
-            GC.SuppressFinalize(this);
         }
 
-        private PacketBacking(nint nativePtr, bool isEmpty)
+        private PacketBacking(NativeSlab? slab, nint nativePtr, bool isEmpty)
         {
+            _slab = slab;
             _nativePtr = nativePtr;
             _isEmpty = isEmpty;
-            if (isEmpty)
-            {
-                GC.SuppressFinalize(this);
-            }
         }
 
         public static PacketBacking AllocateNativeCopy(nint sourcePtr, int length)
         {
             if (length == 0)
             {
-                return new PacketBacking(nint.Zero, isEmpty: true);
+                return new PacketBacking(slab: null, nint.Zero, isEmpty: true);
             }
 
-            void* dest = NativeMemory.Alloc((nuint)length);
-            System.Buffer.MemoryCopy((void*)sourcePtr, dest, (nuint)length, (nuint)length);
-            return new PacketBacking((nint)dest, isEmpty: false);
+            (NativeSlab slab, nint destPtr) = NativePacketSlabPool.AllocateCopy(sourcePtr, length);
+            return new PacketBacking(slab, destPtr, isEmpty: false);
         }
 
         public ReadOnlySpan<byte> GetSpan(int length)
@@ -259,17 +255,14 @@ public sealed unsafe class EncodedPacket : IDisposable
             if (Interlocked.Decrement(ref _refCount) == 0)
             {
                 FreeResources();
-                GC.SuppressFinalize(this);
             }
         }
 
         private void FreeResources()
         {
-            nint ptr = Interlocked.Exchange(ref _nativePtr, nint.Zero);
-            if (ptr != nint.Zero)
-            {
-                NativeMemory.Free((void*)ptr);
-            }
+            Interlocked.Exchange(ref _nativePtr, nint.Zero);
+            NativeSlab? slab = Interlocked.Exchange(ref _slab, null);
+            slab?.Release();
 
             byte[]? toReturn = Interlocked.Exchange(ref _managedArray, null);
             if (toReturn is not null && _returnToArrayPool)
@@ -277,10 +270,143 @@ public sealed unsafe class EncodedPacket : IDisposable
                 ArrayPool<byte>.Shared.Return(toReturn);
             }
         }
+    }
 
-        ~PacketBacking()
+    /// <summary>
+    /// Ref-counted unmanaged memory slab (default 2 MiB) holding hundreds of sequential compressed packets.
+    /// Eliminates per-packet <c>NativeMemory.Alloc/Free</c> syscalls and reduces GC Finalization Queue
+    /// entries from ~120,000 live packets down to ~1 finalizer per 2 MiB slab.
+    /// </summary>
+    internal sealed class NativeSlab
+    {
+        private nint _basePtr;
+        private readonly int _capacity;
+        private int _offset;
+        private int _refCount;
+
+        public NativeSlab(int capacity, int initialRefCount)
         {
-            FreeResources();
+            _capacity = capacity;
+            _refCount = initialRefCount;
+            _basePtr = (nint)NativeMemory.Alloc((nuint)capacity);
+        }
+
+        public bool TryBumpAllocateLocked(int byteLength, out nint slicePtr)
+        {
+            int alignedLength = (byteLength + 7) & ~7;
+            if (alignedLength < byteLength || _offset > _capacity - alignedLength)
+            {
+                slicePtr = nint.Zero;
+                return false;
+            }
+
+            nint basePtr = Volatile.Read(ref _basePtr);
+            if (basePtr == nint.Zero)
+            {
+                slicePtr = nint.Zero;
+                return false;
+            }
+
+            Interlocked.Increment(ref _refCount);
+            slicePtr = basePtr + _offset;
+            _offset += alignedLength;
+            return true;
+        }
+
+        public nint BasePointer => Volatile.Read(ref _basePtr);
+
+        public void Release()
+        {
+            if (Interlocked.Decrement(ref _refCount) == 0)
+            {
+                Free();
+                GC.SuppressFinalize(this);
+            }
+        }
+
+        private void Free()
+        {
+            nint ptr = Interlocked.Exchange(ref _basePtr, nint.Zero);
+            if (ptr != nint.Zero)
+            {
+                NativeMemory.Free((void*)ptr);
+            }
+        }
+
+        ~NativeSlab()
+        {
+            Free();
+        }
+    }
+
+    internal static class NativePacketSlabPool
+    {
+        private const int DefaultSlabBytes = 2 * 1024 * 1024; // 2 MiB per native slab
+        private const int MaxPooledPacketBytes = 512 * 1024;  // Oversized keyframes get a dedicated slab
+
+        private static readonly object PoolLock = new();
+        private static NativeSlab? _activeSlab;
+
+        public static (NativeSlab Slab, nint Ptr) AllocateCopy(nint sourcePtr, int length)
+        {
+            NativeSlab slab;
+            nint destPtr;
+
+            if (length > MaxPooledPacketBytes)
+            {
+                slab = new NativeSlab(length, initialRefCount: 1);
+                destPtr = slab.BasePointer;
+            }
+            else
+            {
+                NativeSlab? retiredSlab = null;
+                lock (PoolLock)
+                {
+                    if (_activeSlab is not null && _activeSlab.TryBumpAllocateLocked(length, out destPtr))
+                    {
+                        slab = _activeSlab;
+                    }
+                    else
+                    {
+                        retiredSlab = _activeSlab;
+                        // Initial refCount = 2: one held by _activeSlab, one for this allocated packet.
+                        var freshSlab = new NativeSlab(DefaultSlabBytes, initialRefCount: 1);
+                        if (!freshSlab.TryBumpAllocateLocked(length, out destPtr))
+                        {
+                            freshSlab.Release();
+                            throw new OutOfMemoryException("Nie udało się przydzielić pamięci w bloku natywnym.");
+                        }
+
+                        _activeSlab = freshSlab;
+                        slab = freshSlab;
+                    }
+                }
+
+                retiredSlab?.Release();
+            }
+
+            try
+            {
+                System.Buffer.MemoryCopy((void*)sourcePtr, (void*)destPtr, (nuint)length, (nuint)length);
+                return (slab, destPtr);
+            }
+            catch
+            {
+                slab.Release();
+                throw;
+            }
+        }
+
+        public static void TrimActiveSlab()
+        {
+            NativeSlab? toRelease;
+            lock (PoolLock)
+            {
+                toRelease = _activeSlab;
+                _activeSlab = null;
+            }
+
+            toRelease?.Release();
         }
     }
 }
@@ -613,19 +739,30 @@ public sealed class MediaRingBuffer : IDisposable
         long timestamp100Ns,
         long duration100Ns)
     {
+        ArgumentNullException.ThrowIfNull(rentedBuffer);
+
         if (trackType is not (MediaTrackType.CombinedMixAudio or MediaTrackType.SystemAudio or MediaTrackType.MicrophoneAudio))
         {
             ArrayPool<byte>.Shared.Return(rentedBuffer);
             throw new ArgumentException("Oczekiwano ścieżki audio (CombinedMixAudio, SystemAudio lub MicrophoneAudio).", nameof(trackType));
         }
 
-        var packet = new EncodedPacket(
-            trackType,
-            rentedBuffer,
-            length,
-            timestamp100Ns,
-            duration100Ns,
-            isKeyframe: true);
+        EncodedPacket packet;
+        try
+        {
+            packet = new EncodedPacket(
+                trackType,
+                rentedBuffer,
+                length,
+                timestamp100Ns,
+                duration100Ns,
+                isKeyframe: true);
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(rentedBuffer);
+            throw;
+        }
 
         AddPacket(packet);
     }
@@ -756,6 +893,7 @@ public sealed class MediaRingBuffer : IDisposable
         _videoKeyframes.Clear();
         _latestTimestamp100Ns = long.MinValue;
         Volatile.Write(ref _bufferedBytes, 0);
+        EncodedPacket.NativePacketSlabPool.TrimActiveSlab();
     }
 
     private void RemoveFirstLocked()

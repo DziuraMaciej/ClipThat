@@ -5,6 +5,7 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
   </PropertyGroup>
@@ -22,9 +23,14 @@
     <ProjectReference Include="..\ClipThat.csproj" />
   </ItemGroup>
 
-  <Target Name="SignTestOutputs" AfterTargets="Build" Condition="'$(DesignTimeBuild)' != 'true'">
+  <Target Name="SignTestOutputs"
+          AfterTargets="Build"
+          Inputs="$(TargetPath);$(TargetDir)ClipThat.dll"
+          Outputs="$(IntermediateOutputPath)SignTestOutputs.stamp"
+          Condition="'$(DesignTimeBuild)' != 'true'">
     <Exec Command="powershell -NoProfile -Command &quot;$now = Get-Date; $certs = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.Subject -in @('CN=ClipThatDev', 'CN=ClipThat Local') -and $_.HasPrivateKey -and $_.NotAfter -gt $now }; $cert = ($certs | Where-Object { $_.Subject -eq 'CN=ClipThatDev' } | Sort-Object NotAfter -Descending | Select-Object -First 1); if (-not $cert) { $cert = $certs | Sort-Object NotAfter -Descending | Select-Object -First 1 }; if ($cert) { foreach ($f in @('$(TargetPath)', '$(TargetDir)ClipThat.dll')) { if (Test-Path $f) { Set-AuthenticodeSignature -FilePath $f -Certificate $cert | Out-Null } } }&quot;"
           IgnoreExitCode="true" />
+    <Touch Files="$(IntermediateOutputPath)SignTestOutputs.stamp" AlwaysCreate="true" />
   </Target>
 
 </Project>

@@ -34,7 +34,6 @@ public partial class SettingsPage : Page
     private readonly IReplayEngine _replayEngine;
 
     private readonly DispatcherTimer _sliderDebounceTimer;
-    private readonly DispatcherTimer _filenamePreviewTimer;
     private readonly DispatcherTimer _audioDevicesDebounceTimer;
 
     private AppSettings _workingSettings;
@@ -44,6 +43,8 @@ public partial class SettingsPage : Page
     private bool _isApplyingEngineUpdate;
     private bool _hasPendingEngineUpdate;
     private bool _hasPendingSliderSave;
+    private bool _isSavingReplay;
+    private bool _isTogglingRecording;
     private bool _isDetached;
 
     public SettingsPage(
@@ -69,12 +70,6 @@ public partial class SettingsPage : Page
             Interval = TimeSpan.FromMilliseconds(150)
         };
         _sliderDebounceTimer.Tick += SliderDebounceTimer_Tick;
-
-        _filenamePreviewTimer = new DispatcherTimer
-        {
-            Interval = TimeSpan.FromSeconds(1)
-        };
-        _filenamePreviewTimer.Tick += FilenamePreviewTimer_Tick;
 
         _audioDevicesDebounceTimer = new DispatcherTimer
         {
@@ -113,9 +108,6 @@ public partial class SettingsPage : Page
         }
 
         _isDetached = true;
-
-        _filenamePreviewTimer.Stop();
-        _filenamePreviewTimer.Tick -= FilenamePreviewTimer_Tick;
 
         _sliderDebounceTimer.Stop();
         _sliderDebounceTimer.Tick -= SliderDebounceTimer_Tick;
@@ -162,14 +154,12 @@ public partial class SettingsPage : Page
 
         if (!isVisible)
         {
-            _filenamePreviewTimer.Stop();
             _audioDevicesDebounceTimer.Stop();
         }
         else if (IsLoaded)
         {
             UpdateEngineControls(_replayEngine.IsRecording, _replayEngine.LastError, _replayEngine.CurrentStatus);
             UpdateFilenamePreview();
-            _filenamePreviewTimer.Start();
             ScheduleAudioDevicesRefresh();
         }
     }
@@ -183,23 +173,18 @@ public partial class SettingsPage : Page
 
         UpdateEngineControls(_replayEngine.IsRecording, _replayEngine.LastError, _replayEngine.CurrentStatus);
         UpdateFilenamePreview();
-        _filenamePreviewTimer.Start();
     }
 
     private void SettingsPage_Unloaded(object sender, RoutedEventArgs e)
     {
-        _filenamePreviewTimer.Stop();
         _audioDevicesDebounceTimer.Stop();
     }
 
     private void LoadSettingsIntoControls()
     {
+        // Keep null SelectedMonitorDeviceName ("automatic primary monitor") intact until the user
+        // explicitly clicks a monitor tile so unrelated setting edits never trigger a capture restart.
         MonitorLayout.Initialize(_displayService, _workingSettings.SelectedMonitorDeviceName);
-        if (!string.IsNullOrWhiteSpace(MonitorLayout.SelectedMonitorDeviceName) &&
-            string.IsNullOrWhiteSpace(_workingSettings.SelectedMonitorDeviceName))
-        {
-            _workingSettings.SelectedMonitorDeviceName = MonitorLayout.SelectedMonitorDeviceName;
-        }
 
         RefreshAudioDeviceLists();
 
@@ -258,11 +243,17 @@ public partial class SettingsPage : Page
         _isRefreshingAudioDevices = true;
         try
         {
-            IReadOnlyList<AudioDeviceInfo> playbackDevices = _audioDeviceService.GetPlaybackDevices();
+            IReadOnlyList<AudioDeviceInfo> playbackDevices = EnsureConfiguredDevicePresent(
+                _audioDeviceService.GetPlaybackDevices(),
+                _workingSettings.SystemAudioDeviceId,
+                disconnectedLabel: "Odłączone urządzenie audio (zapisane)");
             SystemAudioComboBox.ItemsSource = playbackDevices;
             SystemAudioComboBox.SelectedItem = FindMatchingAudioDevice(playbackDevices, _workingSettings.SystemAudioDeviceId);
 
-            IReadOnlyList<AudioDeviceInfo> captureDevices = _audioDeviceService.GetCaptureDevices();
+            IReadOnlyList<AudioDeviceInfo> captureDevices = EnsureConfiguredDevicePresent(
+                _audioDeviceService.GetCaptureDevices(),
+                _workingSettings.MicrophoneDeviceId,
+                disconnectedLabel: "Odłączony mikrofon (zapisany)");
             MicrophoneComboBox.ItemsSource = captureDevices;
             MicrophoneComboBox.SelectedItem = FindMatchingAudioDevice(captureDevices, _workingSettings.MicrophoneDeviceId);
         }
@@ -270,6 +261,41 @@ public partial class SettingsPage : Page
         {
             _isRefreshingAudioDevices = false;
         }
+    }
+
+    private static IReadOnlyList<AudioDeviceInfo> EnsureConfiguredDevicePresent(
+        IReadOnlyList<AudioDeviceInfo> devices,
+        string? configuredDeviceId,
+        string disconnectedLabel)
+    {
+        if (string.IsNullOrWhiteSpace(configuredDeviceId) ||
+            AudioDeviceService.IsDisabledDeviceId(configuredDeviceId))
+        {
+            return devices;
+        }
+
+        for (int i = 0; i < devices.Count; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(devices[i].DeviceId) &&
+                string.Equals(devices[i].DeviceId, configuredDeviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                return devices;
+            }
+        }
+
+        // Preserve a temporarily unplugged device ID as a visible placeholder so changing the other
+        // audio selector never silently overwrites this saved device selection.
+        var augmented = new List<AudioDeviceInfo>(devices.Count + 1);
+        augmented.AddRange(devices);
+        augmented.Add(new AudioDeviceInfo
+        {
+            DeviceId = configuredDeviceId,
+            FriendlyName = disconnectedLabel,
+            IsDefaultOption = false,
+            IsDisabledOption = false,
+            IsSystemDefault = false
+        });
+        return augmented;
     }
 
     private static AudioDeviceInfo? FindMatchingAudioDevice(
@@ -555,9 +581,12 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                string errorMessage = $"Błąd stosowania ustawień: {ex.Message}";
+                string errorMessage = _replayEngine.LastError ?? $"Błąd stosowania ustawień: {ex.Message}";
                 UpdateEngineControls(_replayEngine.IsRecording, errorMessage);
-                (Application.Current as App)?.NotifyTrayError(errorMessage);
+                if (string.IsNullOrWhiteSpace(_replayEngine.LastError))
+                {
+                    (Application.Current as App)?.NotifyTrayError(errorMessage);
+                }
             }
         }
         finally
@@ -582,11 +611,6 @@ public partial class SettingsPage : Page
         BitrateEstimateText.Text = string.Format(PolishCulture, "{0:0.0} Mbps", estimate.VideoBitrateMbps);
     }
 
-    private void FilenamePreviewTimer_Tick(object? sender, EventArgs e)
-    {
-        UpdateFilenamePreview();
-    }
-
     private void UpdateFilenamePreview()
     {
         string exampleName = DateTime.Now.ToString("ssmmHHddMMyyyy", CultureInfo.InvariantCulture) + ".mp4";
@@ -595,6 +619,12 @@ public partial class SettingsPage : Page
 
     private async void SaveReplayButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isSavingReplay || _isTogglingRecording || _isDetached)
+        {
+            return;
+        }
+
+        _isSavingReplay = true;
         SaveReplayButton.IsEnabled = false;
         try
         {
@@ -604,49 +634,73 @@ public partial class SettingsPage : Page
         {
             if (!_isDetached)
             {
-                string errorMessage = $"Błąd zapisu powtórki: {ex.Message}";
+                string errorMessage = _replayEngine.LastError ?? $"Błąd zapisu powtórki: {ex.Message}";
                 ShowStatusError(errorMessage);
-                (Application.Current as App)?.NotifyTrayError(errorMessage);
+                if (string.IsNullOrWhiteSpace(_replayEngine.LastError))
+                {
+                    (Application.Current as App)?.NotifyTrayError(errorMessage);
+                }
             }
         }
         finally
         {
+            _isSavingReplay = false;
             if (!_isDetached)
             {
-                SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
+                SaveReplayButton.IsEnabled = _replayEngine.IsRecording && !_isTogglingRecording;
             }
         }
     }
 
     private async void ToggleRecordingButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isTogglingRecording || _isDetached)
+        {
+            return;
+        }
+
+        _isTogglingRecording = true;
         ToggleRecordingButton.IsEnabled = false;
+        SaveReplayButton.IsEnabled = false;
         try
         {
+            if (_hasPendingSliderSave)
+            {
+                _sliderDebounceTimer.Stop();
+                _hasPendingSliderSave = false;
+                SaveWorkingSettingsOnly();
+            }
+
             if (_replayEngine.IsRecording)
             {
                 await _replayEngine.StopAsync();
             }
             else
             {
-                await _replayEngine.StartAsync(_settingsService.Load());
+                AppSettings snapshot = _workingSettings.Clone();
+                snapshot.Normalize();
+                await _replayEngine.StartAsync(snapshot);
             }
         }
         catch (Exception ex)
         {
             if (!_isDetached)
             {
-                string errorMessage = $"Błąd zmiany stanu nagrywania: {ex.Message}";
+                string errorMessage = _replayEngine.LastError ?? $"Błąd zmiany stanu nagrywania: {ex.Message}";
                 UpdateEngineControls(_replayEngine.IsRecording, errorMessage);
-                (Application.Current as App)?.NotifyTrayError(errorMessage);
+                if (string.IsNullOrWhiteSpace(_replayEngine.LastError))
+                {
+                    (Application.Current as App)?.NotifyTrayError(errorMessage);
+                }
             }
         }
         finally
         {
+            _isTogglingRecording = false;
             if (!_isDetached)
             {
                 ToggleRecordingButton.IsEnabled = true;
-                SaveReplayButton.IsEnabled = _replayEngine.IsRecording;
+                SaveReplayButton.IsEnabled = _replayEngine.IsRecording && !_isSavingReplay;
             }
         }
     }
@@ -695,8 +749,10 @@ public partial class SettingsPage : Page
             return;
         }
 
-        string? errorDetail = IsErrorStatusMessage(status) ? status : _replayEngine.LastError;
-        string? infoDetail = IsErrorStatusMessage(status) ? null : status;
+        EngineStatusLevel level = _replayEngine.StatusLevel;
+        bool isError = level == EngineStatusLevel.Error;
+        string? errorDetail = isError ? status : _replayEngine.LastError;
+        string? infoDetail = isError || level == EngineStatusLevel.Paused ? null : status;
 
         Dispatcher.InvokeAsync(() =>
         {
@@ -732,9 +788,13 @@ public partial class SettingsPage : Page
 
         EngineStatusTitleText.Text = isRecording ? "Nagrywanie w tle aktywne" : "Wstrzymano";
 
-        if (!string.IsNullOrWhiteSpace(statusDetail) &&
-            !IsErrorStatusMessage(statusDetail) &&
-            !string.Equals(statusDetail, "Nagrywanie wstrzymane", StringComparison.OrdinalIgnoreCase))
+        bool isErrorDuplicate = hasError && string.Equals(statusDetail, errorMessage, StringComparison.Ordinal);
+        bool showDetail = !string.IsNullOrWhiteSpace(statusDetail) &&
+                          !isErrorDuplicate &&
+                          _replayEngine.StatusLevel != EngineStatusLevel.Paused &&
+                          _replayEngine.StatusLevel != EngineStatusLevel.Error;
+
+        if (showDetail)
         {
             EngineStatusDetailText.Text = statusDetail;
             EngineStatusDetailText.Visibility = Visibility.Visible;
@@ -756,6 +816,7 @@ public partial class SettingsPage : Page
         }
 
         ToggleRecordingButton.Content = isRecording ? "Wstrzymaj" : "Wznów";
+        ToggleRecordingButton.IsEnabled = !_isTogglingRecording;
         SymbolRegular toggleSymbol = isRecording ? SymbolRegular.Pause24 : SymbolRegular.Play24;
         if (ToggleRecordingButton.Icon is SymbolIcon existingIcon)
         {
@@ -766,7 +827,7 @@ public partial class SettingsPage : Page
             ToggleRecordingButton.Icon = new SymbolIcon(toggleSymbol);
         }
 
-        SaveReplayButton.IsEnabled = isRecording;
+        SaveReplayButton.IsEnabled = isRecording && !_isSavingReplay && !_isTogglingRecording;
     }
 
     private void ShowStatusError(string message)
@@ -777,18 +838,6 @@ public partial class SettingsPage : Page
         {
             StatusDot.Fill = ErrorDotBrush;
         }
-    }
-
-    private static bool IsErrorStatusMessage(string? status)
-    {
-        if (string.IsNullOrWhiteSpace(status))
-        {
-            return false;
-        }
-
-        return status.StartsWith("Błąd", StringComparison.OrdinalIgnoreCase) ||
-               status.StartsWith("Nie udało", StringComparison.OrdinalIgnoreCase) ||
-               status.StartsWith("Przechwytywanie wstrzymane", StringComparison.OrdinalIgnoreCase);
     }
 
     private static Brush CreateFrozenBrush(byte a, byte r, byte g, byte b)

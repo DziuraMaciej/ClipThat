@@ -36,7 +36,9 @@ public sealed class ReplayEngine : IReplayEngine
     private CapturePipelineSession? _activeSession;
     private string? _currentStatus;
     private string? _lastError;
+    private int _statusLevel = (int)EngineStatusLevel.Paused;
     private int _consecutiveDxgiFaults;
+    private long _pipelineGeneration;
     private volatile bool _isRecording;
     private int _disposed;
 
@@ -47,6 +49,8 @@ public sealed class ReplayEngine : IReplayEngine
     }
 
     public bool IsRecording => _isRecording;
+
+    public EngineStatusLevel StatusLevel => (EngineStatusLevel)Volatile.Read(ref _statusLevel);
 
     public string? CurrentStatus => Volatile.Read(ref _currentStatus);
 
@@ -86,6 +90,7 @@ public sealed class ReplayEngine : IReplayEngine
                 TeardownActiveSessionLocked();
             }
 
+            Interlocked.Increment(ref _pipelineGeneration);
             _ringBuffer.Clear();
             _ringBuffer.SetBufferDuration(normalized.BufferDurationMinutes);
             _currentSettings = normalized;
@@ -104,6 +109,7 @@ public sealed class ReplayEngine : IReplayEngine
                 _activeSession.AudioCapture);
 
             Volatile.Write(ref _lastError, null);
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Recording);
             Volatile.Write(ref _currentStatus, statusMessage);
 
             startedSession = _activeSession;
@@ -116,6 +122,7 @@ public sealed class ReplayEngine : IReplayEngine
             startupError = $"Błąd uruchamiania przechwytywania: {ex.Message}";
             EngineLogger.Error("ReplayEngine", startupError, ex);
             Volatile.Write(ref _lastError, startupError);
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Error);
             Volatile.Write(ref _currentStatus, startupError);
             throw;
         }
@@ -159,6 +166,7 @@ public sealed class ReplayEngine : IReplayEngine
             }
 
             wasRecording = _isRecording || _activeSession is not null;
+            Interlocked.Increment(ref _pipelineGeneration);
             TeardownActiveSessionLocked();
             _ringBuffer.Clear();
             _isRecording = false;
@@ -171,6 +179,7 @@ public sealed class ReplayEngine : IReplayEngine
         if (wasRecording)
         {
             const string pausedMessage = "Nagrywanie wstrzymane";
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Paused);
             Volatile.Write(ref _currentStatus, pausedMessage);
             StatusChanged?.Invoke(pausedMessage);
         }
@@ -222,6 +231,7 @@ public sealed class ReplayEngine : IReplayEngine
 
             if (requiresPipelineRestart)
             {
+                Interlocked.Increment(ref _pipelineGeneration);
                 TeardownActiveSessionLocked();
                 _ringBuffer.Clear();
                 Interlocked.Exchange(ref _consecutiveDxgiFaults, 0);
@@ -243,6 +253,7 @@ public sealed class ReplayEngine : IReplayEngine
                     _activeSession.AudioCapture);
 
                 Volatile.Write(ref _lastError, null);
+                Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Recording);
                 Volatile.Write(ref _currentStatus, statusMessage);
             }
         }
@@ -253,6 +264,7 @@ public sealed class ReplayEngine : IReplayEngine
             updateError = $"Błąd aktualizacji potoku wideo: {ex.Message}";
             EngineLogger.Error("ReplayEngine", updateError, ex);
             Volatile.Write(ref _lastError, updateError);
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Error);
             Volatile.Write(ref _currentStatus, updateError);
             throw;
         }
@@ -341,6 +353,7 @@ public sealed class ReplayEngine : IReplayEngine
         {
             snapshot?.Dispose();
             const string pausedNotice = "Nagrywanie jest wstrzymane — brak bufora do zapisania";
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Info);
             Volatile.Write(ref _currentStatus, pausedNotice);
             StatusChanged?.Invoke(pausedNotice);
             return null;
@@ -350,6 +363,7 @@ public sealed class ReplayEngine : IReplayEngine
         {
             snapshot?.Dispose();
             const string noKeyframeNotice = "Bufor powtórki nie zawiera jeszcze gotowej klatki kluczowej";
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Info);
             Volatile.Write(ref _currentStatus, noKeyframeNotice);
             StatusChanged?.Invoke(noKeyframeNotice);
             return null;
@@ -374,6 +388,7 @@ public sealed class ReplayEngine : IReplayEngine
             string fileName = Path.GetFileName(outputFilePath);
             string savedMessage = $"Zapisano powtórkę: {fileName}";
             Volatile.Write(ref _lastError, null);
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Info);
             Volatile.Write(ref _currentStatus, savedMessage);
             StatusChanged?.Invoke(savedMessage);
             ReplaySaved?.Invoke(outputFilePath);
@@ -384,6 +399,7 @@ public sealed class ReplayEngine : IReplayEngine
             string errorMessage = $"Błąd zapisu powtórki: {ex.Message}";
             EngineLogger.Error("ReplayEngine", errorMessage, ex);
             Volatile.Write(ref _lastError, errorMessage);
+            Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Error);
             Volatile.Write(ref _currentStatus, errorMessage);
             StatusChanged?.Invoke(errorMessage);
             ErrorOccurred?.Invoke(errorMessage);
@@ -677,6 +693,7 @@ public sealed class ReplayEngine : IReplayEngine
                     session.AudioCapture);
 
                 Volatile.Write(ref _lastError, null);
+                Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Recording);
                 Volatile.Write(ref _currentStatus, updatedStatus);
                 nextEncoderToMonitor = replacement;
             }
@@ -688,6 +705,7 @@ public sealed class ReplayEngine : IReplayEngine
                 updatedStatus = fatalError;
                 EngineLogger.Error("ReplayEngine", fatalError, ex);
                 Volatile.Write(ref _lastError, fatalError);
+                Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Error);
                 Volatile.Write(ref _currentStatus, fatalError);
             }
         }
@@ -792,6 +810,7 @@ public sealed class ReplayEngine : IReplayEngine
         string? fatalError = null;
         CapturePipelineSession? recoveredSession = null;
         MfH264Encoder? recoveredEncoder = null;
+        long expectedGeneration = 0;
 
         await _gate.WaitAsync().ConfigureAwait(false);
         try
@@ -805,19 +824,39 @@ public sealed class ReplayEngine : IReplayEngine
             }
 
             EngineLogger.Warn("ReplayEngine", $"{notice} (minimumTier={minimumTier}, preferDxgi={preferDxgiDuplication})");
+            expectedGeneration = Interlocked.Increment(ref _pipelineGeneration);
             TeardownActiveSessionLocked();
             _ringBuffer.Clear();
+        }
+        finally
+        {
+            _gate.Release();
+        }
 
-            Exception? lastException = null;
-            for (int attempt = 0; attempt < RecoveryRetryDelaysMs.Length; attempt++)
+        Exception? lastException = null;
+        for (int attempt = 0; attempt < RecoveryRetryDelaysMs.Length; attempt++)
+        {
+            int delayMs = RecoveryRetryDelaysMs[attempt];
+            if (delayMs > 0)
             {
-                int delayMs = RecoveryRetryDelaysMs[attempt];
-                if (delayMs > 0)
-                {
-                    await Task.Delay(delayMs).ConfigureAwait(false);
-                }
+                // Release _gate during retry backoff so StopAsync(), UpdateSettingsAsync(), and Dispose() never stall.
+                await Task.Delay(delayMs).ConfigureAwait(false);
+            }
 
-                if (Volatile.Read(ref _disposed) != 0 || !_isRecording || _currentSettings is null)
+            if (Volatile.Read(ref _disposed) != 0 ||
+                !_isRecording ||
+                Volatile.Read(ref _pipelineGeneration) != expectedGeneration)
+            {
+                return;
+            }
+
+            await _gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (Volatile.Read(ref _disposed) != 0 ||
+                    !_isRecording ||
+                    _currentSettings is null ||
+                    Volatile.Read(ref _pipelineGeneration) != expectedGeneration)
                 {
                     return;
                 }
@@ -837,6 +876,7 @@ public sealed class ReplayEngine : IReplayEngine
                             recoveredEncoder,
                             _activeSession.AudioCapture);
                         Volatile.Write(ref _lastError, null);
+                        Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Recording);
                         Volatile.Write(ref _currentStatus, finalStatus);
                     }
 
@@ -852,21 +892,34 @@ public sealed class ReplayEngine : IReplayEngine
                         $"Pipeline recovery attempt {attempt + 1}/{RecoveryRetryDelaysMs.Length} failed: {ex.Message}");
                 }
             }
-
-            if (lastException is not null)
+            finally
             {
-                TeardownActiveSessionLocked();
-                _isRecording = false;
-                fatalError = $"Przechwytywanie wstrzymane po błędzie potoku: {lastException.Message}";
-                finalStatus = fatalError;
-                EngineLogger.Error("ReplayEngine", fatalError, lastException);
-                Volatile.Write(ref _lastError, fatalError);
-                Volatile.Write(ref _currentStatus, fatalError);
+                _gate.Release();
             }
         }
-        finally
+
+        if (lastException is not null)
         {
-            _gate.Release();
+            await _gate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (Volatile.Read(ref _disposed) == 0 &&
+                    Volatile.Read(ref _pipelineGeneration) == expectedGeneration)
+                {
+                    TeardownActiveSessionLocked();
+                    _isRecording = false;
+                    fatalError = $"Przechwytywanie wstrzymane po błędzie potoku: {lastException.Message}";
+                    finalStatus = fatalError;
+                    EngineLogger.Error("ReplayEngine", fatalError, lastException);
+                    Volatile.Write(ref _lastError, fatalError);
+                    Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Error);
+                    Volatile.Write(ref _currentStatus, fatalError);
+                }
+            }
+            finally
+            {
+                _gate.Release();
+            }
         }
 
         if (recoveredSession is not null && recoveredEncoder is not null)
@@ -899,6 +952,7 @@ public sealed class ReplayEngine : IReplayEngine
             return;
         }
 
+        Volatile.Write(ref _statusLevel, (int)EngineStatusLevel.Warning);
         Volatile.Write(ref _currentStatus, message);
         StatusChanged?.Invoke(message);
     }
@@ -927,6 +981,7 @@ public sealed class ReplayEngine : IReplayEngine
             return;
         }
 
+        Interlocked.Increment(ref _pipelineGeneration);
         _gate.Wait();
         try
         {
@@ -953,6 +1008,7 @@ public sealed class ReplayEngine : IReplayEngine
         private readonly long _frameIntervalTicks;
         private readonly Stopwatch _sessionClock;
         private readonly IFrameCaptureSource _capture;
+        private readonly bool _isDxgiCapture;
         private readonly GpuVideoProcessor _gpuProcessor;
         private readonly DualAudioCaptureService? _audioCapture;
         private readonly Action<Exception> _onEncodeError;
@@ -961,6 +1017,7 @@ public sealed class ReplayEngine : IReplayEngine
         private readonly AutoResetEvent _encodeWorkSignal = new(initialState: false);
 
         private MfH264Encoder? _encoder;
+        private Func<ID3D11Texture2D, bool>? _encoderTextureBusyCheck;
         private Thread? _encodeWorkerThread;
         private PendingVideoFrame? _pendingEncodeFrame;
         private ID3D11Texture2D? _activeEncodeTexture;
@@ -985,8 +1042,10 @@ public sealed class ReplayEngine : IReplayEngine
             _frameIntervalTicks = TimeSpan.TicksPerSecond / normalizedFps;
             _sessionClock = sessionClock;
             _capture = capture;
+            _isDxgiCapture = capture is DxgiFrameCapture;
             _gpuProcessor = gpuProcessor;
             _encoder = encoder;
+            _encoderTextureBusyCheck = encoder.IsTextureInUse;
             _audioCapture = audioCapture;
             _onEncodeError = onEncodeError;
         }
@@ -1056,7 +1115,7 @@ public sealed class ReplayEngine : IReplayEngine
                     busyCached = _lastProcessedFrame;
                 }
 
-                MfH264Encoder? currentEncoder = Volatile.Read(ref _encoder);
+                Func<ID3D11Texture2D, bool>? encoderBusyCheck = Volatile.Read(ref _encoderTextureBusyCheck);
 
                 // Perform only the fast GPU BGRA->NV12 VideoProcessorBlt on the capture thread (<0.2ms)
                 // and offload staging/encoding to ClipThat.VideoEncodeWorker so capture never stalls DWM.
@@ -1064,23 +1123,36 @@ public sealed class ReplayEngine : IReplayEngine
                     bgraTexture,
                     busyActive,
                     busyPending,
-                    candidate => ReferenceEquals(candidate, busyCached) ||
-                                 (currentEncoder is not null && currentEncoder.IsTextureInUse(candidate)));
+                    encoderBusyCheck,
+                    busyCached,
+                    cacheInputView: _isDxgiCapture);
 
-                lock (_encodeQueueLock)
+                // If VideoProcessor fell back to CPU at runtime and returned the transient input texture,
+                // encode synchronously right now so WGC's frame surface is never accessed after disposal.
+                if (_gpuProcessor.SupportsHardwareVideoProcessor && !ReferenceEquals(processed, bgraTexture))
                 {
-                    if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
+                    lock (_encodeQueueLock)
                     {
-                        return;
+                        if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _encodeWorkerStopped) != 0)
+                        {
+                            return;
+                        }
+
+                        long monotonicTs = NextMonotonicTimestampLocked(timestamp100Ns);
+                        _lastProcessedFrame = processed;
+                        _pendingEncodeFrame = new PendingVideoFrame(processed, monotonicTs, frameDuration100Ns);
                     }
 
-                    long monotonicTs = NextMonotonicTimestampLocked(timestamp100Ns);
-                    _lastProcessedFrame = processed;
-                    _pendingEncodeFrame = new PendingVideoFrame(processed, monotonicTs, frameDuration100Ns);
+                    SignalEncodeWorkerSafe();
+                    return;
                 }
 
-                SignalEncodeWorkerSafe();
-                return;
+                // Clear cached GPU surface pointer after runtime fallback so keep-alive timers never touch stale surfaces.
+                lock (_encodeQueueLock)
+                {
+                    _lastProcessedFrame = null;
+                    _pendingEncodeFrame = null;
+                }
             }
 
             // Fallback when GPU VideoProcessor is unavailable: bgraTexture is transient so encode synchronously.
@@ -1212,6 +1284,7 @@ public sealed class ReplayEngine : IReplayEngine
             {
                 oldEncoder = _encoder;
                 _encoder = null;
+                Volatile.Write(ref _encoderTextureBusyCheck, null);
             }
 
             SafeDispose(oldEncoder);
@@ -1226,6 +1299,7 @@ public sealed class ReplayEngine : IReplayEngine
                 }
 
                 _encoder = replacement;
+                Volatile.Write(ref _encoderTextureBusyCheck, replacement.IsTextureInUse);
                 Volatile.Write(ref _primingFramesRemaining, MaxStartupPrimingFrames);
 
                 // Immediately feed the most recent NV12 surface if available so the replacement encoder
@@ -1237,6 +1311,7 @@ public sealed class ReplayEngine : IReplayEngine
                     cachedFrame = _lastProcessedFrame;
                     if (cachedFrame is not null)
                     {
+                        _activeEncodeTexture = cachedFrame;
                         ts = NextMonotonicTimestampLocked(_sessionClock.Elapsed.Ticks);
                     }
                 }
@@ -1250,6 +1325,16 @@ public sealed class ReplayEngine : IReplayEngine
                     catch (Exception ex)
                     {
                         EngineLogger.Warn("ReplayEngine", $"Initial priming submit on replacement encoder failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        lock (_encodeQueueLock)
+                        {
+                            if (ReferenceEquals(_activeEncodeTexture, cachedFrame))
+                            {
+                                _activeEncodeTexture = null;
+                            }
+                        }
                     }
                 }
             }
@@ -1308,6 +1393,7 @@ public sealed class ReplayEngine : IReplayEngine
                     cachedFrame = _lastProcessedFrame;
                     if (cachedFrame is not null && nowTicks - _lastSubmittedTimestamp100Ns >= _frameIntervalTicks)
                     {
+                        _activeEncodeTexture = cachedFrame;
                         ts = NextMonotonicTimestampLocked(nowTicks);
                         shouldSubmit = true;
                     }
@@ -1315,22 +1401,38 @@ public sealed class ReplayEngine : IReplayEngine
 
                 if (cachedFrame is not null)
                 {
-                    if (Interlocked.Decrement(ref _primingFramesRemaining) < 0)
+                    try
                     {
-                        shouldStopTimer = true;
-                        return;
-                    }
-
-                    if (shouldSubmit)
-                    {
-                        try
+                        if (Interlocked.Decrement(ref _primingFramesRemaining) < 0)
                         {
-                            encoder.EncodeFrame(cachedFrame, ts, _frameIntervalTicks);
-                        }
-                        catch (Exception ex)
-                        {
-                            EngineLogger.Warn("ReplayEngine", $"Startup priming frame submit failed: {ex.Message}");
                             shouldStopTimer = true;
+                            return;
+                        }
+
+                        if (shouldSubmit)
+                        {
+                            try
+                            {
+                                encoder.EncodeFrame(cachedFrame, ts, _frameIntervalTicks);
+                            }
+                            catch (Exception ex)
+                            {
+                                EngineLogger.Warn("ReplayEngine", $"Startup priming frame submit failed: {ex.Message}");
+                                shouldStopTimer = true;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (shouldSubmit)
+                        {
+                            lock (_encodeQueueLock)
+                            {
+                                if (ReferenceEquals(_activeEncodeTexture, cachedFrame))
+                                {
+                                    _activeEncodeTexture = null;
+                                }
+                            }
                         }
                     }
                 }
@@ -1395,6 +1497,7 @@ public sealed class ReplayEngine : IReplayEngine
                         _lastSubmittedTimestamp100Ns >= 0 &&
                         nowTicks - _lastSubmittedTimestamp100Ns >= idleThresholdTicks)
                     {
+                        _activeEncodeTexture = cachedFrame;
                         ts = NextMonotonicTimestampLocked(nowTicks);
                         shouldSubmit = true;
                     }
@@ -1411,6 +1514,16 @@ public sealed class ReplayEngine : IReplayEngine
                     catch (Exception ex)
                     {
                         EngineLogger.Warn("ReplayEngine", $"Static keep-alive frame submit failed: {ex.Message}");
+                    }
+                    finally
+                    {
+                        lock (_encodeQueueLock)
+                        {
+                            if (ReferenceEquals(_activeEncodeTexture, cachedFrame))
+                            {
+                                _activeEncodeTexture = null;
+                            }
+                        }
                     }
                 }
             }
@@ -1460,9 +1573,6 @@ public sealed class ReplayEngine : IReplayEngine
             }
         }
 
-        public long GetCurrentSessionTimestamp100Ns()
-            => _sessionClock.IsRunning ? _sessionClock.Elapsed.Ticks : 0L;
-
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -1495,21 +1605,34 @@ public sealed class ReplayEngine : IReplayEngine
             SignalEncodeWorkerSafe();
 
             Thread? encodeWorker = _encodeWorkerThread;
+            bool encodeWorkerExited = true;
             if (encodeWorker is not null && encodeWorker != Thread.CurrentThread)
             {
-                encodeWorker.Join(2000);
+                encodeWorkerExited = encodeWorker.Join(2000);
             }
 
-            _encodeWorkerThread = null;
+            if (encodeWorkerExited)
+            {
+                _encodeWorkerThread = null;
+            }
 
             // 3. Stop audio capture so no further audio packets enter the ring buffer.
             SafeDispose(_audioCapture);
+
+            if (!encodeWorkerExited)
+            {
+                EngineLogger.Warn(
+                    "ReplayEngine",
+                    "VideoEncodeWorker did not exit within 2000 ms during Dispose; skipping unsafe GPU/encoder COM teardown.");
+                return;
+            }
 
             MfH264Encoder? activeEncoder;
             lock (_frameSubmitLock)
             {
                 activeEncoder = _encoder;
                 _encoder = null;
+                Volatile.Write(ref _encoderTextureBusyCheck, null);
             }
 
             // 4. Dispose downstream GPU consumers BEFORE the capture source releases the shared ID3D11Device.

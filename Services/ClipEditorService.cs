@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using ClipThat.Engine.Diagnostics;
 using ClipThat.Engine.Muxing;
@@ -74,6 +75,10 @@ public sealed partial class ClipEditorService
 {
     private const string FfmpegEssentialsDownloadUrl =
         "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+    private const string FfmpegEssentialsSha256Url =
+        "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256";
+    private static readonly string[] HardwareEncoderCandidates =
+        { "h264_nvenc", "h264_amf", "h264_qsv" };
 
     private static readonly HttpClient SharedHttpClient = CreateHttpClient();
     private static readonly SemaphoreSlim FfmpegDownloadGate = new(1, 1);
@@ -86,8 +91,9 @@ public sealed partial class ClipEditorService
     };
 
     private readonly ConcurrentDictionary<string, CachedClipMetadata> _metadataCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _hwEncoderProbeLock = new(1, 1);
+    private readonly HashSet<string> _failedHardwareEncoders = new(StringComparer.Ordinal);
     private volatile string? _preferredHardwareVideoEncoder;
-    private volatile bool _hardwareVideoEncoderProbed;
 
     /// <summary>
     /// Directory storing temporary PCM WAV files extracted for live dual-track preview playback.
@@ -115,10 +121,10 @@ public sealed partial class ClipEditorService
             var results = new List<ClipItem>();
             DirectoryInfo directoryInfo = new(outputDirectory);
 
-            IEnumerable<FileInfo> files;
+            List<FileInfo> files;
             try
             {
-                files = directoryInfo.EnumerateFiles("*.mp4", SearchOption.TopDirectoryOnly);
+                files = directoryInfo.EnumerateFiles("*.mp4", SearchOption.TopDirectoryOnly).ToList();
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -126,6 +132,7 @@ public sealed partial class ClipEditorService
             }
 
             var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var coldEntries = new List<(string FullName, string Name, long FileSizeBytes, long LastWriteTicksUtc, DateTime RecordedAt)>();
 
             foreach (FileInfo file in files)
             {
@@ -138,50 +145,78 @@ public sealed partial class ClipEditorService
                         continue;
                     }
 
-                    seenPaths.Add(file.FullName);
+                    string fullName = file.FullName;
+                    seenPaths.Add(fullName);
 
                     long fileSizeBytes = file.Length;
                     long lastWriteTicksUtc = file.LastWriteTimeUtc.Ticks;
-                    DateTime recordedAt = ClipItem.ParseRecordedAt(file.FullName);
+                    DateTime recordedAt = ClipItem.ParseRecordedAt(fullName);
 
-                    TimeSpan duration;
-                    int audioTrackCount;
-                    if (_metadataCache.TryGetValue(file.FullName, out CachedClipMetadata cached) &&
+                    if (_metadataCache.TryGetValue(fullName, out CachedClipMetadata cached) &&
                         cached.LastWriteTicksUtc == lastWriteTicksUtc &&
                         cached.FileSizeBytes == fileSizeBytes)
                     {
-                        duration = cached.Duration;
-                        audioTrackCount = cached.AudioTrackCount;
+                        results.Add(new ClipItem(
+                            fullName,
+                            file.Name,
+                            recordedAt,
+                            cached.Duration,
+                            fileSizeBytes,
+                            cached.AudioTrackCount));
                     }
                     else
                     {
-                        (duration, audioTrackCount) = await ReadMediaMetadataAsync(
-                            file.FullName,
-                            cancellationToken).ConfigureAwait(false);
-
-                        if (duration > TimeSpan.Zero || audioTrackCount > 0)
-                        {
-                            _metadataCache[file.FullName] = new CachedClipMetadata(
-                                lastWriteTicksUtc,
-                                fileSizeBytes,
-                                duration,
-                                audioTrackCount);
-                        }
+                        coldEntries.Add((fullName, file.Name, fileSizeBytes, lastWriteTicksUtc, recordedAt));
                     }
-
-                    results.Add(new ClipItem(
-                        file.FullName,
-                        file.Name,
-                        recordedAt,
-                        duration,
-                        fileSizeBytes,
-                        audioTrackCount));
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
                     // Skip files that are momentarily locked or removed during enumeration.
-                    Debug.WriteLine($"Pominięto plik podczas skanowania nagrań '{file.FullName}': {ex.Message}");
+                    EngineLogger.Warn("ClipEditorService", $"Pominięto plik podczas skanowania nagrań '{file.FullName}': {ex.Message}");
                 }
+            }
+
+            if (coldEntries.Count > 0)
+            {
+                var coldResults = new ConcurrentBag<ClipItem>();
+                var parallelOptions = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount, 2, 4),
+                    CancellationToken = cancellationToken
+                };
+
+                await Parallel.ForEachAsync(coldEntries, parallelOptions, async (entry, ct) =>
+                {
+                    try
+                    {
+                        (TimeSpan duration, int audioTrackCount) = await ReadMediaMetadataAsync(
+                            entry.FullName,
+                            ct).ConfigureAwait(false);
+
+                        if (duration > TimeSpan.Zero || audioTrackCount > 0)
+                        {
+                            _metadataCache[entry.FullName] = new CachedClipMetadata(
+                                entry.LastWriteTicksUtc,
+                                entry.FileSizeBytes,
+                                duration,
+                                audioTrackCount);
+                        }
+
+                        coldResults.Add(new ClipItem(
+                            entry.FullName,
+                            entry.Name,
+                            entry.RecordedAt,
+                            duration,
+                            entry.FileSizeBytes,
+                            audioTrackCount));
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        EngineLogger.Warn("ClipEditorService", $"Pominięto plik podczas odczytu metadanych '{entry.FullName}': {ex.Message}");
+                    }
+                }).ConfigureAwait(false);
+
+                results.AddRange(coldResults);
             }
 
             foreach (string cachedPath in _metadataCache.Keys)
@@ -203,26 +238,11 @@ public sealed partial class ClipEditorService
     }
 
     /// <summary>
-    /// Resolves <c>ffmpeg.exe</c> from the portable embedded extraction cache
-    /// (<c>%LocalAppData%\ClipThat\bin\ffmpeg.exe</c>), the application directory, <c>Tools\ffmpeg.exe</c>,
-    /// user cache, or the system <c>PATH</c>. Returns <see langword="null"/> if not yet extracted or installed.
+    /// Resolves <c>ffmpeg.exe</c> using a unified deterministic lookup order:
+    /// application directory, <c>Tools\ffmpeg.exe</c>, portable embedded extraction cache
+    /// (<c>%LocalAppData%\ClipThat\bin\ffmpeg.exe</c>), user <c>Tools</c> cache, or system <c>PATH</c>.
     /// </summary>
-    public string? ResolveFfmpegPath()
-    {
-        // Prefer an adjacent copy next to the executable (fast non-embedded build) or already-extracted cache.
-        string? adjacentOrPath = ResolveToolExecutable("ffmpeg.exe");
-        if (adjacentOrPath is not null)
-        {
-            return adjacentOrPath;
-        }
-
-        if (File.Exists(PortableFfmpegProvider.ExtractedFfmpegPath))
-        {
-            return PortableFfmpegProvider.ExtractedFfmpegPath;
-        }
-
-        return null;
-    }
+    public string? ResolveFfmpegPath() => ResolveToolExecutable("ffmpeg.exe");
 
     /// <summary>
     /// Ensures <c>ffmpeg.exe</c> is available locally from the application directory, embedded portable
@@ -232,13 +252,14 @@ public sealed partial class ClipEditorService
         IProgress<ClipExportProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        // Check local app-dir / Tools / PATH first when running non-single-file builds where ffmpeg.exe ships alongside the app.
-        string? localBundled = ResolveLocalAppFfmpegPath();
+        // 1. Prefer an adjacent copy next to the executable (AppContext.BaseDirectory or Tools\).
+        string? localBundled = PortableFfmpegProvider.ResolveAdjacentExecutable("ffmpeg.exe");
         if (localBundled is not null)
         {
             return localBundled;
         }
 
+        // 2. Otherwise extract embedded portable ffmpeg.exe (single-file publish mode).
         try
         {
             bool needsExtraction = !PortableFfmpegProvider.IsAlreadyExtracted();
@@ -269,6 +290,7 @@ public sealed partial class ClipEditorService
                 ex);
         }
 
+        // 3. Fall back to LocalAppData cache or system PATH.
         string? existing = ResolveFfmpegPath();
         if (existing is not null)
         {
@@ -354,6 +376,13 @@ public sealed partial class ClipEditorService
                         }
                     }
                 }
+
+                progress?.Report(new ClipExportProgress(
+                    "Weryfikowanie sumy kontrolnej SHA-256 archiwum FFmpeg...",
+                    null,
+                    IsIndeterminate: true));
+
+                await VerifyDownloadedArchiveSha256Async(tempZipPath, cancellationToken).ConfigureAwait(false);
 
                 progress?.Report(new ClipExportProgress(
                     "Rozpakowywanie ffmpeg.exe...",
@@ -763,12 +792,16 @@ public sealed partial class ClipEditorService
                     0,
                     IsIndeterminate: false));
 
-                string? hwEncoder = await ResolveWorkingHardwareVideoEncoderAsync(ffmpegPath, cancellationToken)
-                    .ConfigureAwait(false);
-
                 bool hwSucceeded = false;
-                if (!string.IsNullOrWhiteSpace(hwEncoder))
+                while (!hwSucceeded)
                 {
+                    string? hwEncoder = await ResolveWorkingHardwareVideoEncoderAsync(ffmpegPath, cancellationToken)
+                        .ConfigureAwait(false);
+                    if (string.IsNullOrWhiteSpace(hwEncoder))
+                    {
+                        break;
+                    }
+
                     try
                     {
                         ProcessStartInfo hwStartInfo = BuildFfmpegStartInfo(
@@ -792,6 +825,10 @@ public sealed partial class ClipEditorService
                             cancellationToken).ConfigureAwait(false);
 
                         hwSucceeded = File.Exists(tempOutputPath);
+                        if (!hwSucceeded)
+                        {
+                            await MarkHardwareVideoEncoderFailedAsync(hwEncoder, cancellationToken).ConfigureAwait(false);
+                        }
                     }
                     catch (OperationCanceledException)
                     {
@@ -801,8 +838,8 @@ public sealed partial class ClipEditorService
                     {
                         EngineLogger.Warn(
                             "ClipEditorService",
-                            $"Hardware FFmpeg re-encode ({hwEncoder}) failed ({hwEx.Message}); falling back to libx264.");
-                        _preferredHardwareVideoEncoder = null;
+                            $"Hardware FFmpeg re-encode ({hwEncoder}) failed ({hwEx.Message}); trying next encoder.");
+                        await MarkHardwareVideoEncoderFailedAsync(hwEncoder, cancellationToken).ConfigureAwait(false);
                         TryDeleteFile(tempOutputPath);
                     }
                 }
@@ -841,9 +878,8 @@ public sealed partial class ClipEditorService
                 Mp4ReplayMuxer.PatchAudioTrackSelectionFlags(tempOutputPath);
             }
 
-            // Re-resolve a non-colliding final output path right before moving in case a file appeared during export.
-            string finalOutputPath = BuildEditOutputPath(options.InputFilePath, sanitizedBaseName);
-            File.Move(tempOutputPath, finalOutputPath, overwrite: false);
+            // Atomically commit the temporary export to a non-colliding final .mp4 path (no TOCTOU race).
+            string finalOutputPath = CommitExportedFile(tempOutputPath, options.InputFilePath, sanitizedBaseName);
 
             progress?.Report(new ClipExportProgress(
                 $"Wyeksportowano: {Path.GetFileName(finalOutputPath)}",
@@ -948,7 +984,7 @@ public sealed partial class ClipEditorService
         }
     }
 
-    private static ProcessStartInfo BuildFfmpegStartInfo(
+    internal static ProcessStartInfo BuildFfmpegStartInfo(
         string ffmpegPath,
         string inputFilePath,
         string tempOutputPath,
@@ -1077,8 +1113,12 @@ public sealed partial class ClipEditorService
             startInfo.ArgumentList.Add("h264_nvenc");
             startInfo.ArgumentList.Add("-preset");
             startInfo.ArgumentList.Add("p4");
+            startInfo.ArgumentList.Add("-rc");
+            startInfo.ArgumentList.Add("vbr");
             startInfo.ArgumentList.Add("-cq");
             startInfo.ArgumentList.Add("19");
+            startInfo.ArgumentList.Add("-b:v");
+            startInfo.ArgumentList.Add("0");
             startInfo.ArgumentList.Add("-pix_fmt");
             startInfo.ArgumentList.Add("yuv420p");
             return;
@@ -1126,27 +1166,64 @@ public sealed partial class ClipEditorService
         string ffmpegPath,
         CancellationToken cancellationToken)
     {
-        if (_hardwareVideoEncoderProbed)
+        string? cached = _preferredHardwareVideoEncoder;
+        if (!string.IsNullOrWhiteSpace(cached))
         {
-            return _preferredHardwareVideoEncoder;
+            return cached;
         }
 
-        string[] candidates = { "h264_nvenc", "h264_amf", "h264_qsv" };
-        foreach (string encoderName in candidates)
+        await _hwEncoderProbeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (await ProbeHardwareVideoEncoderAsync(ffmpegPath, encoderName, cancellationToken).ConfigureAwait(false))
+            if (!string.IsNullOrWhiteSpace(_preferredHardwareVideoEncoder))
             {
-                _preferredHardwareVideoEncoder = encoderName;
-                _hardwareVideoEncoderProbed = true;
-                EngineLogger.Info("ClipEditorService", $"Detected working FFmpeg hardware video encoder: {encoderName}");
-                return encoderName;
+                return _preferredHardwareVideoEncoder;
+            }
+
+            foreach (string encoderName in HardwareEncoderCandidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_failedHardwareEncoders.Contains(encoderName))
+                {
+                    continue;
+                }
+
+                if (await ProbeHardwareVideoEncoderAsync(ffmpegPath, encoderName, cancellationToken).ConfigureAwait(false))
+                {
+                    _preferredHardwareVideoEncoder = encoderName;
+                    EngineLogger.Info("ClipEditorService", $"Detected working FFmpeg hardware video encoder: {encoderName}");
+                    return encoderName;
+                }
+
+                _failedHardwareEncoders.Add(encoderName);
+            }
+
+            _preferredHardwareVideoEncoder = null;
+            return null;
+        }
+        finally
+        {
+            _hwEncoderProbeLock.Release();
+        }
+    }
+
+    private async Task MarkHardwareVideoEncoderFailedAsync(
+        string encoderName,
+        CancellationToken cancellationToken)
+    {
+        await _hwEncoderProbeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _failedHardwareEncoders.Add(encoderName);
+            if (string.Equals(_preferredHardwareVideoEncoder, encoderName, StringComparison.Ordinal))
+            {
+                _preferredHardwareVideoEncoder = null;
             }
         }
-
-        _preferredHardwareVideoEncoder = null;
-        _hardwareVideoEncoderProbed = true;
-        return null;
+        finally
+        {
+            _hwEncoderProbeLock.Release();
+        }
     }
 
     private static async Task<bool> ProbeHardwareVideoEncoderAsync(
@@ -1380,41 +1457,81 @@ public sealed partial class ClipEditorService
         }
     }
 
-    private static string? ResolveLocalAppFfmpegPath()
+    private static async Task VerifyDownloadedArchiveSha256Async(
+        string zipPath,
+        CancellationToken cancellationToken)
     {
-        string baseDirCandidate = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
-        if (File.Exists(baseDirCandidate))
+        using HttpResponseMessage shaResponse = await SharedHttpClient.GetAsync(
+            FfmpegEssentialsSha256Url,
+            cancellationToken).ConfigureAwait(false);
+        shaResponse.EnsureSuccessStatusCode();
+
+        string shaText = await shaResponse.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (!TryParseSha256Text(shaText, out string expectedHex))
         {
-            return baseDirCandidate;
+            throw new InvalidOperationException("Nie udało się odczytać poprawnej sumy kontrolnej SHA-256 archiwum FFmpeg.");
         }
 
-        string appToolsCandidate = Path.Combine(AppContext.BaseDirectory, "Tools", "ffmpeg.exe");
-        if (File.Exists(appToolsCandidate))
+        byte[] actualHashBytes;
+        await using (var verifyStream = new FileStream(
+                         zipPath,
+                         FileMode.Open,
+                         FileAccess.Read,
+                         FileShare.Read,
+                         bufferSize: 131072,
+                         useAsync: true))
         {
-            return appToolsCandidate;
+            actualHashBytes = await SHA256.HashDataAsync(verifyStream, cancellationToken).ConfigureAwait(false);
         }
 
-        return null;
+        string actualHex = Convert.ToHexString(actualHashBytes);
+        if (!string.Equals(actualHex, expectedHex, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Weryfikacja integralności SHA-256 pobranego archiwum FFmpeg nie powiodła się.");
+        }
+    }
+
+    internal static bool TryParseSha256Text(string? content, out string normalizedHex)
+    {
+        normalizedHex = string.Empty;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        string token = content.Trim().Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)[0];
+        if (token.Length != 64)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < token.Length; i++)
+        {
+            char c = token[i];
+            bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!isHex)
+            {
+                return false;
+            }
+        }
+
+        normalizedHex = token.ToUpperInvariant();
+        return true;
     }
 
     private static string? ResolveToolExecutable(string executableName)
     {
+        string? adjacentCandidate = PortableFfmpegProvider.ResolveAdjacentExecutable(executableName);
+        if (adjacentCandidate is not null)
+        {
+            return adjacentCandidate;
+        }
+
         string portableBinCandidate = Path.Combine(PortableFfmpegProvider.BinDirectory, executableName);
         if (File.Exists(portableBinCandidate))
         {
             return portableBinCandidate;
-        }
-
-        string baseDirCandidate = Path.Combine(AppContext.BaseDirectory, executableName);
-        if (File.Exists(baseDirCandidate))
-        {
-            return baseDirCandidate;
-        }
-
-        string appToolsCandidate = Path.Combine(AppContext.BaseDirectory, "Tools", executableName);
-        if (File.Exists(appToolsCandidate))
-        {
-            return appToolsCandidate;
         }
 
         string localAppDataToolsCandidate = Path.Combine(
@@ -1563,26 +1680,31 @@ public sealed partial class ClipEditorService
         return result;
     }
 
-    private static string BuildEditOutputPath(string inputFilePath, string sanitizedBaseName)
+    private static string CommitExportedFile(string tempOutputPath, string inputFilePath, string sanitizedBaseName)
     {
         string directory = Path.GetDirectoryName(inputFilePath) ?? AppSettings.DefaultOutputDirectory;
+        Directory.CreateDirectory(directory);
 
-        string candidate = Path.Combine(directory, $"{sanitizedBaseName}.mp4");
-        if (!File.Exists(candidate))
+        for (int index = 1; index < 10_000; index++)
         {
-            return candidate;
-        }
+            string candidate = index == 1
+                ? Path.Combine(directory, $"{sanitizedBaseName}.mp4")
+                : Path.Combine(directory, $"{sanitizedBaseName}_{index}.mp4");
 
-        for (int index = 2; index < 10_000; index++)
-        {
-            string numberedCandidate = Path.Combine(directory, $"{sanitizedBaseName}_{index}.mp4");
-            if (!File.Exists(numberedCandidate))
+            try
             {
-                return numberedCandidate;
+                File.Move(tempOutputPath, candidate, overwrite: false);
+                return candidate;
+            }
+            catch (IOException) when (File.Exists(candidate))
+            {
+                // Another concurrent export or user file claimed this name; advance atomically.
             }
         }
 
-        return Path.Combine(directory, $"{sanitizedBaseName}_{DateTime.Now:HHmmss}.mp4");
+        string fallbackCandidate = Path.Combine(directory, $"{sanitizedBaseName}_{Guid.NewGuid().ToString("N")[..8]}.mp4");
+        File.Move(tempOutputPath, fallbackCandidate, overwrite: false);
+        return fallbackCandidate;
     }
 
     private static string FormatFfmpegTimestamp(TimeSpan value)
@@ -1601,7 +1723,7 @@ public sealed partial class ClipEditorService
             value.Milliseconds);
     }
 
-    private static bool TryParseFfmpegTime(string stderrLine, out TimeSpan parsedTime)
+    internal static bool TryParseFfmpegTime(string stderrLine, out TimeSpan parsedTime)
     {
         Match match = FfmpegTimeRegex().Match(stderrLine);
         if (match.Success &&

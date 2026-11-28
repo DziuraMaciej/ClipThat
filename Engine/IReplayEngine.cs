@@ -3,11 +3,28 @@ using ClipThat.Models;
 namespace ClipThat.Engine;
 
 /// <summary>
+/// Semantic severity/state classification of the current engine status message.
+/// </summary>
+public enum EngineStatusLevel
+{
+    Paused = 0,
+    Recording = 1,
+    Info = 2,
+    Warning = 3,
+    Error = 4
+}
+
+/// <summary>
 /// Defines the lifecycle and replay-saving contract for background screen capture engines.
 /// </summary>
 public interface IReplayEngine : IDisposable
 {
     bool IsRecording { get; }
+
+    /// <summary>
+    /// Semantic classification of <see cref="CurrentStatus"/> so UI code does not rely on text prefixes.
+    /// </summary>
+    EngineStatusLevel StatusLevel { get; }
 
     /// <summary>
     /// Most recent human-readable engine status message, if any.

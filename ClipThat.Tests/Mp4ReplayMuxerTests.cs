@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO;
 using System.Text;
+using ClipThat.Engine.Buffer;
 using ClipThat.Engine.Muxing;
 using Xunit;
 
@@ -131,6 +132,130 @@ public sealed class Mp4ReplayMuxerTests : IDisposable
         // Last audio track (CombinedMix): enabled (0x000003), alternate_group = 1
         Assert.Equal(new byte[] { 0x00, 0x00, 0x03 }, tkhdList[3][1..4]);
         Assert.Equal((ushort)1, BinaryPrimitives.ReadUInt16BigEndian(tkhdList[3].AsSpan(altGroupRelOffset, 2)));
+    }
+
+    [Fact]
+    public void PatchAudioTrackSelectionFlags_LeavesSingleAudioTrackUntouched()
+    {
+        string path = Path.Combine(_tempDir, "single_audio.mp4");
+        byte[] moov = WrapBox("moov",
+            BuildMvhdV0(1000, 5000),
+            BuildTrak("vide", tkhdVersion: 0),
+            BuildTrak("soun", tkhdVersion: 0));
+        File.WriteAllBytes(path, Concat(WrapBox("ftyp", new byte[8]), moov));
+
+        Mp4ReplayMuxer.PatchAudioTrackSelectionFlags(path);
+
+        var tkhdList = FindAllTkhdPayloads(File.ReadAllBytes(path));
+        Assert.Equal(2, tkhdList.Count);
+        Assert.Equal(new byte[] { 0x00, 0x00, 0x03 }, tkhdList[1][1..4]);
+        Assert.Equal((ushort)0, BinaryPrimitives.ReadUInt16BigEndian(tkhdList[1].AsSpan(34, 2)));
+    }
+
+    [Fact]
+    public void WriteMpegTsIntermediate_PreservesExactVfrPtsAndProducesValid188BytePackets()
+    {
+        string tsPath = Path.Combine(_tempDir, "vfr_replay.ts");
+        byte[] spsPps =
+        {
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x28,
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80
+        };
+        byte[] idrPayload = { 0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x11, 0x22 };
+        byte[] pSlicePayload = { 0x00, 0x00, 0x00, 0x01, 0x41, 0x9A, 0x33, 0x44 };
+        byte[] aacPayload = { 0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C };
+
+        long baseTs = 10_000_000L; // 1.0 s base offset
+        using var v0 = new EncodedPacket(MediaTrackType.Video, idrPayload, idrPayload.Length, baseTs, 166_667, isKeyframe: true, returnToArrayPool: false);
+        using var a0 = new EncodedPacket(MediaTrackType.SystemAudio, aacPayload, aacPayload.Length, baseTs + 5_000_000L, 213_333, isKeyframe: true, returnToArrayPool: false);
+        using var v1 = new EncodedPacket(MediaTrackType.Video, pSlicePayload, pSlicePayload.Length, baseTs + 25_000_000L, 166_667, isKeyframe: false, returnToArrayPool: false);
+
+        var ordered = new List<Mp4ReplayMuxer.IndexedPacket>
+        {
+            new(v0, 0),
+            new(a0, 1),
+            new(v1, 2)
+        };
+
+        int audioStreamCount = Mp4ReplayMuxer.WriteMpegTsIntermediate(
+            tsPath,
+            ordered,
+            baseTimestamp100Ns: baseTs,
+            videoSequenceHeader: spsPps,
+            hasSystemAudio: true,
+            hasMicrophoneAudio: false,
+            includeCombinedMix: false);
+
+        Assert.Equal(1, audioStreamCount);
+
+        byte[] tsBytes = File.ReadAllBytes(tsPath);
+        Assert.True(tsBytes.Length >= 188 * 5);
+        Assert.Equal(0, tsBytes.Length % 188);
+
+        var videoPtsValues = new List<long>();
+        var audioPtsValues = new List<long>();
+
+        for (int offset = 0; offset < tsBytes.Length; offset += 188)
+        {
+            Assert.Equal((byte)0x47, tsBytes[offset]);
+
+            bool pusi = (tsBytes[offset + 1] & 0x40) != 0;
+            ushort pid = (ushort)(((tsBytes[offset + 1] & 0x1F) << 8) | tsBytes[offset + 2]);
+            byte afc = (byte)((tsBytes[offset + 3] >> 4) & 0x03);
+
+            if (offset == 0)
+            {
+                Assert.Equal((ushort)0x0000, pid); // PAT
+                continue;
+            }
+
+            if (offset == 188)
+            {
+                Assert.Equal((ushort)0x1000, pid); // PMT
+                continue;
+            }
+
+            if (!pusi || (pid != 0x0100 && pid != 0x0101))
+            {
+                continue;
+            }
+
+            int payloadStart = offset + 4;
+            if ((afc & 0x02) != 0)
+            {
+                int adaptationLen = tsBytes[payloadStart];
+                payloadStart += 1 + adaptationLen;
+            }
+
+            // PES start code 00 00 01 + stream_id + ... + 5-byte PTS at payloadStart + 9
+            Assert.Equal((byte)0x00, tsBytes[payloadStart]);
+            Assert.Equal((byte)0x00, tsBytes[payloadStart + 1]);
+            Assert.Equal((byte)0x01, tsBytes[payloadStart + 2]);
+
+            long pts90k = DecodePts90k(tsBytes.AsSpan(payloadStart + 9, 5));
+            if (pid == 0x0100)
+            {
+                videoPtsValues.Add(pts90k);
+            }
+            else
+            {
+                audioPtsValues.Add(pts90k);
+            }
+        }
+
+        // Exact VFR spacing: v0 at 0.0 s (0), v1 at +2.5 s (225000 ticks @ 90 kHz), audio at +0.5 s (45000 ticks @ 90 kHz)
+        Assert.Equal(new long[] { 0L, 225_000L }, videoPtsValues);
+        Assert.Equal(new long[] { 45_000L }, audioPtsValues);
+    }
+
+    private static long DecodePts90k(ReadOnlySpan<byte> ptsBytes)
+    {
+        long p32_30 = (ptsBytes[0] >> 1) & 0x07;
+        long p29_22 = ptsBytes[1];
+        long p21_15 = (ptsBytes[2] >> 1) & 0x7F;
+        long p14_7 = ptsBytes[3];
+        long p6_0 = (ptsBytes[4] >> 1) & 0x7F;
+        return (p32_30 << 30) | (p29_22 << 22) | (p21_15 << 15) | (p14_7 << 7) | p6_0;
     }
 
     private static byte[] BuildMvhdV0(uint timescale, uint duration)

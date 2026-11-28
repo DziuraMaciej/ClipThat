@@ -75,15 +75,15 @@ public static class PortableFfmpegProvider
         }
     }
 
-    private static string? ResolveAdjacentFfmpegPath()
+    internal static string? ResolveAdjacentExecutable(string executableName)
     {
-        string baseDirCandidate = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
+        string baseDirCandidate = Path.Combine(AppContext.BaseDirectory, executableName);
         if (File.Exists(baseDirCandidate))
         {
             return baseDirCandidate;
         }
 
-        string toolsCandidate = Path.Combine(AppContext.BaseDirectory, "Tools", "ffmpeg.exe");
+        string toolsCandidate = Path.Combine(AppContext.BaseDirectory, "Tools", executableName);
         if (File.Exists(toolsCandidate))
         {
             return toolsCandidate;
@@ -92,12 +92,20 @@ public static class PortableFfmpegProvider
         return null;
     }
 
+    private static string? ResolveAdjacentFfmpegPath() => ResolveAdjacentExecutable("ffmpeg.exe");
+
     /// <summary>
     /// Asynchronously ensures the embedded <c>ffmpeg.exe</c> is extracted once on demand to
     /// <c>%LocalAppData%\ClipThat\bin\ffmpeg.exe</c>.
     /// </summary>
     public static async Task<string?> TryEnsureExtractedAsync(CancellationToken cancellationToken = default)
     {
+        string? adjacentPath = ResolveAdjacentFfmpegPath();
+        if (adjacentPath is not null)
+        {
+            return adjacentPath;
+        }
+
         Assembly assembly = typeof(PortableFfmpegProvider).Assembly;
         string? resourceName = ResolveEmbeddedResourceName(assembly);
         if (resourceName is null)

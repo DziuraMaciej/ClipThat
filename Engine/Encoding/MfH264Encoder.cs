@@ -255,6 +255,21 @@ public sealed class MfH264Encoder : IDisposable
         {
             if (_isAsync)
             {
+                // Avoid allocating CPU NV12 staging buffers (~3 MB/frame) if Frame #0 is still awaiting
+                // consumption and the async queue is already full.
+                if (!_usesGpuInput && Volatile.Read(ref _submittedFrameCount) == 0)
+                {
+                    lock (_queueLock)
+                    {
+                        if (Volatile.Read(ref _disposed) != 0 ||
+                            Volatile.Read(ref _stopping) != 0 ||
+                            _pendingInputQueue.Count >= MaxPendingAsyncInputSamples)
+                        {
+                            return false;
+                        }
+                    }
+                }
+
                 inputSample = CreateInputSample(frameTexture, timestamp100Ns, effectiveDuration);
                 nint gpuPtr = _usesGpuInput ? frameTexture.NativePointer : nint.Zero;
 
@@ -971,33 +986,51 @@ public sealed class MfH264Encoder : IDisposable
         for (int i = 0; i < profileAttempts.Length; i++)
         {
             uint profile = profileAttempts[i];
-            using IMFMediaType outputType = MediaFactory.MFCreateMediaType();
-            outputType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.H264).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.AvgBitrate, _targetBitrateBps).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.InterlaceMode, (uint)VideoInterlaceMode.Progressive).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.FrameSize, PackUInt64((uint)_width, (uint)_height)).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.FrameRate, PackUInt64((uint)_fps, 1u)).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUInt64(1u, 1u)).CheckError();
-            outputType.Set(MediaTypeAttributeKeys.MaxKeyframeSpacing, (uint)_fps);
+            for (int colorPass = 0; colorPass < 2; colorPass++)
+            {
+                using IMFMediaType outputType = MediaFactory.MFCreateMediaType();
+                outputType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.H264).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.AvgBitrate, _targetBitrateBps).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.InterlaceMode, (uint)VideoInterlaceMode.Progressive).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.FrameSize, PackUInt64((uint)_width, (uint)_height)).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.FrameRate, PackUInt64((uint)_fps, 1u)).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUInt64(1u, 1u)).CheckError();
+                outputType.Set(MediaTypeAttributeKeys.MaxKeyframeSpacing, (uint)_fps);
 
-            if (profile != 0u)
-            {
-                outputType.Set(MediaTypeAttributeKeys.Mpeg2Profile, profile);
-            }
+                if (colorPass == 0)
+                {
+                    // Tag explicit BT.709 studio-range (16-235) colorimetry matching GpuVideoProcessor output
+                    // so players do not misinterpret SD/720p H.264 streams as BT.601.
+                    ApplyBt709StudioColorimetry(outputType);
+                }
 
-            try
-            {
-                transform.SetOutputType(outputStreamId, outputType, 0);
-                return;
-            }
-            catch (Exception ex)
-            {
-                lastError = ex;
+                if (profile != 0u)
+                {
+                    outputType.Set(MediaTypeAttributeKeys.Mpeg2Profile, profile);
+                }
+
+                try
+                {
+                    transform.SetOutputType(outputStreamId, outputType, 0);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
             }
         }
 
         throw lastError ?? new InvalidOperationException("Nie udało się skonfigurować typu wyjściowego H.264.");
+    }
+
+    private static void ApplyBt709StudioColorimetry(IMFMediaType mediaType)
+    {
+        mediaType.Set(MediaTypeAttributeKeys.VideoPrimaries, (uint)VideoPrimaries.Bt709);
+        mediaType.Set(MediaTypeAttributeKeys.YuvMatrix, (uint)VideoTransferMatrix.Bt709);
+        mediaType.Set(MediaTypeAttributeKeys.TransferFunction, (uint)VideoTransferFunction.Func709);
+        mediaType.Set(MediaTypeAttributeKeys.VideoNominalRange, (uint)NominalRange.Range16_235);
     }
 
     private void ConfigureInputMediaType(IMFTransform transform, int inputStreamId)
@@ -1041,6 +1074,7 @@ public sealed class MfH264Encoder : IDisposable
                 available.Set(MediaTypeAttributeKeys.FrameSize, PackUInt64((uint)_width, (uint)_height));
                 available.Set(MediaTypeAttributeKeys.FrameRate, PackUInt64((uint)_fps, 1u));
                 available.Set(MediaTypeAttributeKeys.PixelAspectRatio, PackUInt64(1u, 1u));
+                ApplyBt709StudioColorimetry(available);
 
                 // Ensure any driver-advertised stride/sample-size matches the configured even NV12 frame size.
                 if (available.GetUInt32(MediaTypeAttributeKeys.DefaultStride, out uint advertisedStride).Success &&
@@ -1656,11 +1690,17 @@ public sealed class MfH264Encoder : IDisposable
 
     private void DrainSyncOutputsLocked(ref List<EncodedPacket>? packets)
     {
+        int streamChangeRetries = 0;
         while (true)
         {
             ProcessOutputAttemptResult result = TryProcessSingleOutputLocked(out EncodedPacket? packet, out _);
             if (result == ProcessOutputAttemptResult.StreamChanged)
             {
+                if (++streamChangeRetries >= MaxStreamChangeRetriesPerEvent)
+                {
+                    break;
+                }
+
                 continue;
             }
 
@@ -2225,9 +2265,9 @@ public sealed class MfH264Encoder : IDisposable
 
     /// <summary>
     /// Inspects Annex-B start codes (<c>00 00 01</c> or <c>00 00 00 01</c>) and returns <see langword="true"/>
-    /// when an H.264 IDR slice (<c>nalUnitType == 5</c>) or SPS (<c>nalUnitType == 7</c>) is present.
+    /// when a true H.264 IDR slice (<c>nalUnitType == 5</c>) is present.
     /// </summary>
-    private static bool ContainsAnnexBKeyframeNal(ReadOnlySpan<byte> data)
+    internal static bool ContainsAnnexBKeyframeNal(ReadOnlySpan<byte> data)
     {
         int i = 0;
         while (i + 3 < data.Length)
@@ -2268,10 +2308,12 @@ public sealed class MfH264Encoder : IDisposable
         return false;
     }
 
-    private static byte[]? TryExtractAnnexBSpsPps(ReadOnlySpan<byte> data)
+    internal static byte[]? TryExtractAnnexBSpsPps(ReadOnlySpan<byte> data)
     {
         using var stream = new MemoryStream();
         int pos = FindNextStartCode(data, 0, out int startCodeLen);
+        bool hasSps = false;
+        bool hasPps = false;
 
         while (pos >= 0 && pos + startCodeLen < data.Length)
         {
@@ -2282,6 +2324,8 @@ public sealed class MfH264Encoder : IDisposable
             int nalType = data[nalStart] & 0x1F;
             if (nalType is 7 or 8) // SPS (7) or PPS (8)
             {
+                if (nalType == 7) hasSps = true;
+                else hasPps = true;
                 stream.Write(data.Slice(pos, nalEnd - pos));
             }
 
@@ -2289,7 +2333,7 @@ public sealed class MfH264Encoder : IDisposable
             startCodeLen = nextStartCodeLen;
         }
 
-        return stream.Length > 0 ? stream.ToArray() : null;
+        return (hasSps && hasPps && stream.Length > 0) ? stream.ToArray() : null;
     }
 
     private static int FindNextStartCode(ReadOnlySpan<byte> data, int startIndex, out int startCodeLength)
@@ -2343,22 +2387,27 @@ public sealed class MfH264Encoder : IDisposable
             inputFeederExited = _inputFeederThread.Join(2000);
         }
 
-        _inputFeederThread = null;
-
-        List<EncodedPacket>? remainingSyncPackets = null;
-        try
+        if (inputFeederExited)
         {
-            if (_transform is not null)
+            _inputFeederThread = null;
+        }
+
+        bool acquiredMftLock = false;
+        if (_transform is not null)
+        {
+            // Avoid permanent deadlock if a wedged driver still holds _mftLock inside ProcessInput.
+            int lockTimeoutMs = inputFeederExited ? 2000 : 500;
+            acquiredMftLock = Monitor.TryEnter(_mftLock, lockTimeoutMs);
+            if (acquiredMftLock)
             {
-                lock (_mftLock)
+                try
                 {
                     try
                     {
                         _transform.ProcessMessage(TMessageType.MessageNotifyEndOfStream, nuint.Zero);
-                        _transform.ProcessMessage(TMessageType.MessageCommandDrain, nuint.Zero);
-                        if (!_isAsync)
+                        if (_isAsync)
                         {
-                            DrainSyncOutputsLocked(ref remainingSyncPackets);
+                            _transform.ProcessMessage(TMessageType.MessageCommandDrain, nuint.Zero);
                         }
                     }
                     catch
@@ -2366,51 +2415,64 @@ public sealed class MfH264Encoder : IDisposable
                         // Ignore drain errors during shutdown.
                     }
                 }
+                finally
+                {
+                    Monitor.Exit(_mftLock);
+                }
 
                 if (_isAsync)
                 {
                     _drainCompleteEvent.Wait(250);
                 }
 
-                lock (_mftLock)
+                if (Monitor.TryEnter(_mftLock, lockTimeoutMs))
                 {
                     try
                     {
-                        _transform.ProcessMessage(TMessageType.MessageNotifyEndStreaming, nuint.Zero);
-                    }
-                    catch
-                    {
-                        // Best-effort end streaming notification.
-                    }
-
-                    if (_usesGpuInput)
-                    {
                         try
                         {
-                            _transform.ProcessMessage(TMessageType.MessageSetD3DManager, nuint.Zero);
+                            _transform.ProcessMessage(TMessageType.MessageNotifyEndStreaming, nuint.Zero);
                         }
                         catch
                         {
-                            // Best-effort detachment of IMFDXGIDeviceManager before MFT shutdown.
+                            // Best-effort end streaming notification.
                         }
-                    }
 
-                    try
-                    {
-                        MediaFactory.MFShutdownObject(_transform);
-                    }
-                    catch
-                    {
-                        // Best-effort IMFShutdown call to unblock GetEvent(0).
-                    }
+                        if (_usesGpuInput)
+                        {
+                            try
+                            {
+                                _transform.ProcessMessage(TMessageType.MessageSetD3DManager, nuint.Zero);
+                            }
+                            catch
+                            {
+                                // Best-effort detachment of IMFDXGIDeviceManager before MFT shutdown.
+                            }
+                        }
 
-                    TryShutdownActivate(_activeActivate);
+                        try
+                        {
+                            MediaFactory.MFShutdownObject(_transform);
+                        }
+                        catch
+                        {
+                            // Best-effort IMFShutdown call to unblock GetEvent(0).
+                        }
+
+                        TryShutdownActivate(_activeActivate);
+                    }
+                    finally
+                    {
+                        Monitor.Exit(_mftLock);
+                    }
                 }
             }
-        }
-        finally
-        {
-            DisposePacketList(remainingSyncPackets);
+            else
+            {
+                EngineLogger.Warn(
+                    "MfH264Encoder",
+                    $"Timed out waiting for _mftLock during Dispose on \"{EncoderName}\" (feederExited={inputFeederExited}); skipping unsafe MFT shutdown.");
+            }
         }
 
         bool eventThreadExited = true;
@@ -2419,7 +2481,10 @@ public sealed class MfH264Encoder : IDisposable
             eventThreadExited = _eventThread.Join(2000);
         }
 
-        _eventThread = null;
+        if (eventThreadExited)
+        {
+            _eventThread = null;
+        }
 
         lock (_queueLock)
         {
@@ -2431,11 +2496,11 @@ public sealed class MfH264Encoder : IDisposable
             Array.Clear(_recentInFlightGpuTextures);
         }
 
-        if (!inputFeederExited || !eventThreadExited)
+        if (!inputFeederExited || !eventThreadExited || (_transform is not null && !acquiredMftLock))
         {
             EngineLogger.Warn(
                 "MfH264Encoder",
-                $"Async encoder threads did not exit cleanly (feederExited={inputFeederExited}, eventExited={eventThreadExited}); skipping unsafe COM/MF teardown.");
+                $"Async encoder threads did not exit cleanly (feederExited={inputFeederExited}, eventExited={eventThreadExited}, lockAcquired={acquiredMftLock}); skipping unsafe COM/MF teardown.");
             return;
         }
 

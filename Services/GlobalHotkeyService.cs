@@ -1,8 +1,8 @@
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Threading;
+using ClipThat.Engine.Diagnostics;
 
 namespace ClipThat.Services;
 
@@ -170,10 +170,8 @@ public sealed class GlobalHotkeyService : IDisposable
         }
 
         CreateMessageWindow();
-        UnregisterOnDispatcher();
 
-        _currentModifiers = modifiers & ValidModifierMask;
-        _currentVirtualKey = virtualKey;
+        uint normalizedModifiers = modifiers & ValidModifierMask;
         LastWin32Error = 0;
 
         if (_hwndSource is null || _hwndSource.Handle == nint.Zero || virtualKey == 0)
@@ -181,17 +179,54 @@ public sealed class GlobalHotkeyService : IDisposable
             return false;
         }
 
-        uint nativeModifiers = _currentModifiers | ModNoRepeat;
+        bool hadPrevious = _isRegistered;
+        uint previousModifiers = _currentModifiers;
+        uint previousVirtualKey = _currentVirtualKey;
+
+        if (hadPrevious && previousModifiers == normalizedModifiers && previousVirtualKey == virtualKey)
+        {
+            return true;
+        }
+
+        UnregisterOnDispatcher();
+
+        uint nativeModifiers = normalizedModifiers | ModNoRepeat;
         bool registered = RegisterHotKey(_hwndSource.Handle, ReplayHotkeyId, nativeModifiers, virtualKey);
         if (!registered)
         {
-            LastWin32Error = Marshal.GetLastWin32Error();
-            Debug.WriteLine(
-                $"Nie udało się zarejestrować skrótu globalnego {FormatHotkey(_currentModifiers, virtualKey)} (Win32 error: {LastWin32Error}).");
-            _isRegistered = false;
+            int registrationError = Marshal.GetLastWin32Error();
+            LastWin32Error = registrationError;
+            EngineLogger.Warn(
+                "GlobalHotkeyService",
+                $"Nie udało się zarejestrować skrótu globalnego {FormatHotkey(normalizedModifiers, virtualKey)} (Win32 error: {registrationError}).");
+
+            if (hadPrevious && previousVirtualKey != 0)
+            {
+                bool restored = RegisterHotKey(
+                    _hwndSource.Handle,
+                    ReplayHotkeyId,
+                    previousModifiers | ModNoRepeat,
+                    previousVirtualKey);
+                _currentModifiers = previousModifiers;
+                _currentVirtualKey = previousVirtualKey;
+                _isRegistered = restored;
+                if (!restored)
+                {
+                    EngineLogger.Warn(
+                        "GlobalHotkeyService",
+                        $"Nie udało się przywrócić poprzedniego skrótu globalnego {FormatHotkey(previousModifiers, previousVirtualKey)}.");
+                }
+            }
+            else
+            {
+                _isRegistered = false;
+            }
+
             return false;
         }
 
+        _currentModifiers = normalizedModifiers;
+        _currentVirtualKey = virtualKey;
         _isRegistered = true;
         return true;
     }
@@ -230,7 +265,7 @@ public sealed class GlobalHotkeyService : IDisposable
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"Błąd zwalniania GlobalHotkeyService: {ex.Message}");
+            EngineLogger.Warn("GlobalHotkeyService", $"Błąd zwalniania GlobalHotkeyService: {ex.Message}", ex);
         }
     }
 

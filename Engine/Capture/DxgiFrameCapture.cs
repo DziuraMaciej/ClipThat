@@ -48,6 +48,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
     private bool _cursorVisible;
     private int _cursorX;
     private int _cursorY;
+    private int _captureWidth;
+    private int _captureHeight;
+    private bool _isHdrPqOutput;
     private long _lastSubmittedTimestamp100Ns = -1;
     private int _capturedFrameCount;
     private int _started;
@@ -120,8 +123,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
             _immediateContext = immediateContext;
             _duplication = duplication;
             _cursorCompositor = cursorCompositor;
-            CaptureWidth = (int)duplDesc.ModeDescription.Width;
-            CaptureHeight = (int)duplDesc.ModeDescription.Height;
+            _captureWidth = (int)duplDesc.ModeDescription.Width;
+            _captureHeight = (int)duplDesc.ModeDescription.Height;
+            _isHdrPqOutput = IsHdrPqOutput(matchedOutput);
 
             EngineLogger.Info(
                 "DxgiFrameCapture",
@@ -167,9 +171,9 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
     public string CaptureBackendName => "DXGI Desktop Duplication";
 
-    public int CaptureWidth { get; }
+    public int CaptureWidth => Volatile.Read(ref _captureWidth);
 
-    public int CaptureHeight { get; }
+    public int CaptureHeight => Volatile.Read(ref _captureHeight);
 
     public int CapturedFrameCount => Volatile.Read(ref _capturedFrameCount);
 
@@ -210,10 +214,18 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
             }
         }
 
-        Thread? thread = Interlocked.Exchange(ref _captureThread, null);
+        // Only clear _captureThread after Join confirms exit so Dispose() never tears down COM
+        // resources if an earlier StopCapture() call timed out while the loop was still running.
+        Thread? thread = Volatile.Read(ref _captureThread);
         if (thread is not null && thread != Thread.CurrentThread)
         {
-            return thread.Join(timeoutMs);
+            bool exited = thread.Join(timeoutMs);
+            if (exited)
+            {
+                Interlocked.CompareExchange(ref _captureThread, null, thread);
+            }
+
+            return exited;
         }
 
         return true;
@@ -350,8 +362,13 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                             }
                         }
 
+                        bool hasDesktopImage =
+                            frameInfo.LastPresentTime != 0 ||
+                            frameInfo.AccumulatedFrames > 0 ||
+                            frameInfo.TotalMetadataBufferSize > 0;
+                        // Avoid copying an uninitialized black surface on pure mouse-only updates before the first desktop present.
                         if (desktopResource is not null &&
-                            (frameInfo.LastPresentTime != 0 || !_cursorCompositor.HasDesktopFrame))
+                            (hasDesktopImage || (!_cursorCompositor.HasDesktopFrame && frameInfo.LastMouseUpdateTime == 0)))
                         {
                             using ID3D11Texture2D acquiredTexture = desktopResource.QueryInterface<ID3D11Texture2D>();
                             _cursorCompositor.UpdateDesktopTexture(acquiredTexture);
@@ -393,7 +410,7 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
                 if (_cursorCompositor.HasDesktopFrame &&
                     (hasDesktopUpdate || hasCursorUpdate || Volatile.Read(ref _capturedFrameCount) == 0))
                 {
-                    ID3D11Texture2D outputFrame = _cursorCompositor.ComposeFrame(_cursorVisible, _cursorX, _cursorY);
+                    ID3D11Texture2D outputFrame = _cursorCompositor.ComposeFrame(_cursorVisible, _cursorX, _cursorY, _isHdrPqOutput);
 
                     long timestamp100Ns = afterAcquireTicks;
                     if (timestamp100Ns <= _lastSubmittedTimestamp100Ns)
@@ -520,9 +537,12 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
 
                     _monitorHandle = outputMonitor;
                     _duplication = newDuplication;
+                    Volatile.Write(ref _captureWidth, (int)duplDesc.ModeDescription.Width);
+                    Volatile.Write(ref _captureHeight, (int)duplDesc.ModeDescription.Height);
+                    _isHdrPqOutput = IsHdrPqOutput(output);
                     EngineLogger.Info(
                         "DxgiFrameCapture",
-                        $"Reacquired DXGI Desktop Duplication ({duplDesc.ModeDescription.Width}x{duplDesc.ModeDescription.Height}, {duplDesc.ModeDescription.Format}).");
+                        $"Reacquired DXGI Desktop Duplication ({duplDesc.ModeDescription.Width}x{duplDesc.ModeDescription.Height}, {duplDesc.ModeDescription.Format}, HdrPq={_isHdrPqOutput}).");
                     return true;
                 }
             }
@@ -569,6 +589,20 @@ public sealed class DxgiFrameCapture : IFrameCaptureSource
             {
                 TryRestoreThreadDpiAwareness(previousDpi);
             }
+        }
+    }
+
+    private static bool IsHdrPqOutput(IDXGIOutput output)
+    {
+        try
+        {
+            using IDXGIOutput6? output6 = output.QueryInterfaceOrNull<IDXGIOutput6>();
+            // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 == 12 (HDR10 ST.2084 PQ)
+            return output6 is not null && (int)output6.Description1.ColorSpace == 12;
+        }
+        catch
+        {
+            return false;
         }
     }
 

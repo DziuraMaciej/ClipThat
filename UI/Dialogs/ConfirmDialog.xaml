@@ -4,70 +4,78 @@
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  Title="Usuń nagranie"
                  WindowStartupLocation="CenterOwner"
+                 WindowStyle="None"
                  ResizeMode="NoResize"
-                 SizeToContent="WidthAndHeight"
+                 Width="420"
                  MinWidth="380"
-                 MaxWidth="460"
+                 Height="Auto"
+                 MinHeight="0"
+                 SizeToContent="Height"
                  ShowInTaskbar="False"
-                 WindowBackdropType="Mica"
+                 WindowBackdropType="None"
                  WindowCornerPreference="Round"
-                 ExtendsContentIntoTitleBar="True"
+                 ExtendsContentIntoTitleBar="False"
+                 UseLayoutRounding="True"
+                 SnapsToDevicePixels="True"
+                 KeyboardNavigation.TabNavigation="Cycle"
                  Background="#202020"
                  TextElement.Foreground="#F3F3F3">
 
     <Border Background="#202020"
-            BorderBrush="#323232"
+            BorderBrush="#363636"
             BorderThickness="1">
         <Grid>
             <Grid.RowDefinitions>
-                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
 
-            <!-- Header + Body -->
-            <StackPanel Grid.Row="0"
-                        Background="Transparent"
-                        Margin="22,20,22,20"
-                        MouseLeftButtonDown="HeaderArea_MouseLeftButtonDown">
-                <Grid Margin="0,0,0,12">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="*" />
-                    </Grid.ColumnDefinitions>
+            <!-- Header + Body (full padded area is draggable) -->
+            <Border Grid.Row="0"
+                    Background="Transparent"
+                    Padding="22,20,22,20"
+                    MouseLeftButtonDown="HeaderArea_MouseLeftButtonDown">
+                <StackPanel>
+                    <Grid Margin="0,0,0,12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
 
-                    <Border Grid.Column="0"
-                            Width="38"
-                            Height="38"
-                            CornerRadius="8"
-                            Background="#26EF4444"
-                            BorderBrush="#40EF4444"
-                            BorderThickness="1"
-                            Margin="0,0,12,0"
-                            VerticalAlignment="Center">
-                        <ui:SymbolIcon x:Name="DialogIcon"
-                                       Symbol="Delete24"
-                                       FontSize="20"
-                                       Foreground="#EF4444"
-                                       HorizontalAlignment="Center"
-                                       VerticalAlignment="Center" />
-                    </Border>
+                        <Border Grid.Column="0"
+                                Width="38"
+                                Height="38"
+                                CornerRadius="8"
+                                Background="#26EF4444"
+                                BorderBrush="#40EF4444"
+                                BorderThickness="1"
+                                Margin="0,0,12,0"
+                                VerticalAlignment="Center">
+                            <ui:SymbolIcon x:Name="DialogIcon"
+                                           Symbol="Delete24"
+                                           FontSize="20"
+                                           Foreground="#EF4444"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center" />
+                        </Border>
 
-                    <TextBlock x:Name="TitleTextBlock"
-                               Grid.Column="1"
-                               Text="Usuń nagranie"
-                               FontSize="17"
-                               FontWeight="SemiBold"
-                               Foreground="#F3F3F3"
-                               VerticalAlignment="Center"
+                        <TextBlock x:Name="TitleTextBlock"
+                                   Grid.Column="1"
+                                   Text="Usuń nagranie"
+                                   FontSize="17"
+                                   FontWeight="SemiBold"
+                                   Foreground="#F3F3F3"
+                                   VerticalAlignment="Center"
+                                   TextWrapping="Wrap" />
+                    </Grid>
+
+                    <TextBlock x:Name="MessageTextBlock"
+                               FontSize="13.5"
+                               LineHeight="20"
+                               Foreground="#D4D4D4"
                                TextWrapping="Wrap" />
-                </Grid>
-
-                <TextBlock x:Name="MessageTextBlock"
-                           FontSize="13.5"
-                           LineHeight="20"
-                           Foreground="#D4D4D4"
-                           TextWrapping="Wrap" />
-            </StackPanel>
+                </StackPanel>
+            </Border>
 
             <!-- Footer -->
             <Border Grid.Row="1"

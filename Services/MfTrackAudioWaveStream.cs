@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using ClipThat.Engine.Diagnostics;
 using NAudio.Wave;
 using SharpGen.Runtime;
 using Vortice.MediaFoundation;
@@ -21,10 +22,11 @@ public sealed class MfTrackAudioWaveStream : WaveStream
     private readonly object _syncLock = new();
     private readonly IMFSourceReader _reader;
     private readonly int _streamIndex;
-    private readonly WaveFormat _waveFormat;
-    private readonly int _blockAlign;
-    private readonly int _avgBytesPerSecond;
     private readonly bool _mfStarted;
+
+    private WaveFormat _waveFormat;
+    private int _blockAlign;
+    private int _avgBytesPerSecond;
 
     private byte[] _pendingBuffer = Array.Empty<byte>();
     private int _pendingOffset;
@@ -80,25 +82,7 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                 reader.SetCurrentMediaType(targetStreamIndex, requestedType);
             }
 
-            using IMFMediaType currentType = reader.GetCurrentMediaType(targetStreamIndex);
-
-            uint sampleRate = currentType.GetUInt32(MediaTypeAttributeKeys.AudioSamplesPerSecond, out uint sr).Success && sr > 0
-                ? sr
-                : 48000u;
-            uint channels = currentType.GetUInt32(MediaTypeAttributeKeys.AudioNumChannels, out uint ch).Success && ch > 0
-                ? ch
-                : 2u;
-            uint bitsPerSample = currentType.GetUInt32(MediaTypeAttributeKeys.AudioBitsPerSample, out uint bps).Success && bps > 0
-                ? bps
-                : 16u;
-
-            bool isFloat = currentType.GetGUID(MediaTypeAttributeKeys.Subtype, out Guid subtype).Success &&
-                           subtype == AudioFormatGuids.Float;
-
-            _waveFormat = isFloat
-                ? WaveFormat.CreateIeeeFloatWaveFormat((int)sampleRate, (int)channels)
-                : new WaveFormat((int)sampleRate, (int)bitsPerSample, (int)channels);
-
+            _waveFormat = ReadCurrentWaveFormat(reader, targetStreamIndex);
             _blockAlign = Math.Max(1, _waveFormat.BlockAlign);
             _avgBytesPerSecond = Math.Max(_blockAlign, _waveFormat.AverageBytesPerSecond);
 
@@ -177,7 +161,7 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Błąd przewijania IMFSourceReader (ścieżka {_streamIndex}): {ex.Message}");
+                    EngineLogger.Warn("MfTrackAudioWaveStream", $"IMFSourceReader seek failed (stream {_streamIndex}): {ex.Message}");
                     _endOfStream = true;
                     return;
                 }
@@ -254,9 +238,24 @@ public sealed class MfTrackAudioWaveStream : WaveStream
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"Błąd odczytu próbki IMFSourceReader (ścieżka {_streamIndex}): {ex.Message}");
+                    EngineLogger.Warn("MfTrackAudioWaveStream", $"IMFSourceReader ReadSample failed (stream {_streamIndex}): {ex.Message}");
                     _endOfStream = true;
                     break;
+                }
+
+                if ((flags & SourceReaderFlag.CurrentMediaTypeChanged) != 0)
+                {
+                    try
+                    {
+                        WaveFormat updatedFormat = ReadCurrentWaveFormat(_reader, _streamIndex);
+                        _waveFormat = updatedFormat;
+                        _blockAlign = Math.Max(1, updatedFormat.BlockAlign);
+                        _avgBytesPerSecond = Math.Max(_blockAlign, updatedFormat.AverageBytesPerSecond);
+                    }
+                    catch (Exception ex)
+                    {
+                        EngineLogger.Warn("MfTrackAudioWaveStream", $"Failed to refresh wave format after CurrentMediaTypeChanged: {ex.Message}");
+                    }
                 }
 
                 if ((flags & (SourceReaderFlag.EndOfStream | SourceReaderFlag.Error)) != 0)
@@ -440,6 +439,28 @@ public sealed class MfTrackAudioWaveStream : WaveStream
         }
 
         base.Dispose(disposing);
+    }
+
+    private static WaveFormat ReadCurrentWaveFormat(IMFSourceReader reader, int streamIndex)
+    {
+        using IMFMediaType currentType = reader.GetCurrentMediaType(streamIndex);
+
+        uint sampleRate = currentType.GetUInt32(MediaTypeAttributeKeys.AudioSamplesPerSecond, out uint sr).Success && sr > 0
+            ? sr
+            : 48000u;
+        uint channels = currentType.GetUInt32(MediaTypeAttributeKeys.AudioNumChannels, out uint ch).Success && ch > 0
+            ? ch
+            : 2u;
+        uint bitsPerSample = currentType.GetUInt32(MediaTypeAttributeKeys.AudioBitsPerSample, out uint bps).Success && bps > 0
+            ? bps
+            : 16u;
+
+        bool isFloat = currentType.GetGUID(MediaTypeAttributeKeys.Subtype, out Guid subtype).Success &&
+                       subtype == AudioFormatGuids.Float;
+
+        return isFloat
+            ? WaveFormat.CreateIeeeFloatWaveFormat((int)sampleRate, (int)channels)
+            : new WaveFormat((int)sampleRate, (int)bitsPerSample, (int)channels);
     }
 
     private static List<int> EnumerateAudioStreamIndices(IMFSourceReader reader)

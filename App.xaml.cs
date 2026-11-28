@@ -21,8 +21,12 @@ namespace ClipThat;
 public partial class App : Application
 {
     private const long HotkeyDebounceMs = 1500;
+    private const long MaxUiLogBytes = 2L * 1024L * 1024L;
     private const string SingleInstanceMutexName = "Local\\ClipThat_SingleInstance_Mutex";
     private const string ShowWindowEventName = "Local\\ClipThat_ShowWindow_Event";
+    private const string ExitApplicationEventName = "Local\\ClipThat_Exit_Event";
+
+    private static readonly object UiLogLock = new();
 
     private readonly SettingsService _settingsService = new();
     private readonly DisplayService _displayService = new();
@@ -40,6 +44,8 @@ public partial class App : Application
     private Mutex? _singleInstanceMutex;
     private EventWaitHandle? _showWindowEvent;
     private RegisteredWaitHandle? _showWindowWaitRegistration;
+    private EventWaitHandle? _exitApplicationEvent;
+    private RegisteredWaitHandle? _exitApplicationWaitRegistration;
     private MainWindow? _mainWindow;
     private GlobalHotkeyService? _globalHotkeyService;
     private WinForms.NotifyIcon? _notifyIcon;
@@ -53,13 +59,22 @@ public partial class App : Application
     private string? _lastTrayErrorMessage;
     private int _saveReplayInProgress;
     private int _toggleRecordingInProgress;
-    private bool _isShuttingDown;
+    private int _shuttingDown;
     private bool _userPreferenceEventsSubscribed;
     private bool _globalExceptionHandlersSubscribed;
+
+    private bool IsShuttingDown => Volatile.Read(ref _shuttingDown) != 0;
 
     protected override async void OnStartup(StartupEventArgs e)
     {
         base.OnStartup(e);
+
+        if (e.Args.Any(arg => string.Equals(arg, "--exit", StringComparison.OrdinalIgnoreCase)))
+        {
+            RequestExistingInstanceExitAndWait(timeoutMs: 5000);
+            Shutdown();
+            return;
+        }
 
         if (!TryAcquireSingleInstance())
         {
@@ -103,6 +118,15 @@ public partial class App : Application
             bool startMinimized = e.Args.Any(arg =>
                 string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
 
+            // Show the main window immediately on explicit manual launch so UI appears without waiting
+            // for GPU/encoder/WASAPI hardware initialization to finish.
+            if (!startMinimized)
+            {
+                ShowMainWindow();
+            }
+
+            SyncTrayState();
+
             if (startMinimized || settings.StartRecordingOnLaunch)
             {
                 try
@@ -114,13 +138,6 @@ public partial class App : Application
                     EngineLogger.Error("App", $"Fatal startup capture failure: {ex.Message}", ex);
                     NotifyTrayError(_replayEngine.LastError ?? $"Nie udało się uruchomić nagrywania: {ex.Message}");
                 }
-            }
-
-            // Always show the main window on explicit manual launch (without --minimized) so
-            // first-time users can configure settings instead of ClipThat vanishing silently to tray.
-            if (!startMinimized)
-            {
-                ShowMainWindow();
             }
 
             SyncTrayState();
@@ -135,6 +152,42 @@ public partial class App : Application
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             await ExitApplicationAsync();
+        }
+    }
+
+    private static void RequestExistingInstanceExitAndWait(int timeoutMs)
+    {
+        try
+        {
+            if (EventWaitHandle.TryOpenExisting(ExitApplicationEventName, out EventWaitHandle? exitEvent))
+            {
+                using (exitEvent)
+                {
+                    exitEvent.Set();
+                }
+            }
+            else
+            {
+                return;
+            }
+
+            // Wait briefly until the running instance releases the single-instance mutex and exits cleanly.
+            Stopwatch waitClock = Stopwatch.StartNew();
+            while (waitClock.ElapsedMilliseconds < timeoutMs)
+            {
+                using var probe = new Mutex(initiallyOwned: true, SingleInstanceMutexName, out bool createdNew);
+                if (createdNew)
+                {
+                    try { probe.ReleaseMutex(); } catch { /* ignore */ }
+                    return;
+                }
+
+                Thread.Sleep(50);
+            }
+        }
+        catch
+        {
+            // Ignore cross-process signaling errors during clean-exit probe.
         }
     }
 
@@ -170,7 +223,7 @@ public partial class App : Application
                 _showWindowEvent,
                 static (state, _) =>
                 {
-                    if (state is App app && !app._isShuttingDown)
+                    if (state is App app && !app.IsShuttingDown)
                     {
                         app.Dispatcher.InvokeAsync(app.ShowMainWindow);
                     }
@@ -178,6 +231,20 @@ public partial class App : Application
                 this,
                 Timeout.Infinite,
                 executeOnlyOnce: false);
+
+            _exitApplicationEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ExitApplicationEventName);
+            _exitApplicationWaitRegistration = ThreadPool.RegisterWaitForSingleObject(
+                _exitApplicationEvent,
+                static (state, _) =>
+                {
+                    if (state is App app && !app.IsShuttingDown)
+                    {
+                        app.Dispatcher.InvokeAsync(async () => await app.ExitApplicationAsync());
+                    }
+                },
+                this,
+                Timeout.Infinite,
+                executeOnlyOnce: true);
 
             return true;
         }
@@ -218,6 +285,14 @@ public partial class App : Application
     {
         EngineLogger.Error("App", $"Unhandled UI dispatcher exception: {e.Exception.Message}", e.Exception);
         LogUiException("DispatcherUnhandledException", e.Exception);
+
+        // Never swallow catastrophic runtime/memory corruption faults.
+        if (e.Exception is OutOfMemoryException or AccessViolationException or StackOverflowException)
+        {
+            e.Handled = false;
+            return;
+        }
+
         NotifyTrayError($"Nieoczekiwany błąd interfejsu: {e.Exception.Message}");
         e.Handled = true;
     }
@@ -295,7 +370,7 @@ public partial class App : Application
 
     private void OnGlobalHotkeyPressed(object? sender, EventArgs e)
     {
-        if (_isShuttingDown || !_replayEngine.IsRecording)
+        if (IsShuttingDown || !_replayEngine.IsRecording)
         {
             return;
         }
@@ -335,7 +410,7 @@ public partial class App : Application
 
     private void ShowMainWindow()
     {
-        if (_isShuttingDown)
+        if (IsShuttingDown)
         {
             return;
         }
@@ -415,7 +490,7 @@ public partial class App : Application
 
     private async Task SaveReplayFromTrayAsync()
     {
-        if (_isShuttingDown || !_replayEngine.IsRecording)
+        if (IsShuttingDown || !_replayEngine.IsRecording)
         {
             return;
         }
@@ -430,7 +505,7 @@ public partial class App : Application
 
     private async Task ToggleRecordingAsync()
     {
-        if (_isShuttingDown || Interlocked.CompareExchange(ref _toggleRecordingInProgress, 1, 0) != 0)
+        if (IsShuttingDown || Interlocked.CompareExchange(ref _toggleRecordingInProgress, 1, 0) != 0)
         {
             return;
         }
@@ -476,7 +551,7 @@ public partial class App : Application
     /// </summary>
     public void NotifyTrayError(string message)
     {
-        if (_isShuttingDown || string.IsNullOrWhiteSpace(message))
+        if (IsShuttingDown || string.IsNullOrWhiteSpace(message))
         {
             return;
         }
@@ -486,7 +561,7 @@ public partial class App : Application
 
         Dispatcher.InvokeAsync(() =>
         {
-            if (_isShuttingDown || _notifyIcon is null)
+            if (IsShuttingDown || _notifyIcon is null)
             {
                 return;
             }
@@ -518,14 +593,14 @@ public partial class App : Application
 
     private void OnEngineReplaySaved(string filePath)
     {
-        if (_isShuttingDown)
+        if (IsShuttingDown)
         {
             return;
         }
 
         Dispatcher.InvokeAsync(() =>
         {
-            if (_isShuttingDown || _notifyIcon is null)
+            if (IsShuttingDown || _notifyIcon is null)
             {
                 return;
             }
@@ -541,7 +616,7 @@ public partial class App : Application
 
     private void SyncTrayState()
     {
-        if (_isShuttingDown)
+        if (IsShuttingDown)
         {
             return;
         }
@@ -616,15 +691,23 @@ public partial class App : Application
             "ClipThat");
         string logPath = Path.Combine(logDirectory, "ui-errors.log");
 
-        try
+        lock (UiLogLock)
         {
-            Directory.CreateDirectory(logDirectory);
-            string entry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {context}\r\n{fullDetails}\r\n{new string('-', 80)}\r\n";
-            File.AppendAllText(logPath, entry);
-        }
-        catch
-        {
-            // Ignore file logging failures so error reporting itself never throws.
+            try
+            {
+                Directory.CreateDirectory(logDirectory);
+                if (File.Exists(logPath) && new FileInfo(logPath).Length >= MaxUiLogBytes)
+                {
+                    File.Move(logPath, logPath + ".old", overwrite: true);
+                }
+
+                string entry = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {context}\r\n{fullDetails}\r\n{new string('-', 80)}\r\n";
+                File.AppendAllText(logPath, entry);
+            }
+            catch
+            {
+                // Ignore file logging failures so error reporting itself never throws.
+            }
         }
 
         return logPath;
@@ -632,7 +715,7 @@ public partial class App : Application
 
     private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
-        if (_isShuttingDown)
+        if (IsShuttingDown)
         {
             return;
         }
@@ -675,8 +758,24 @@ public partial class App : Application
             }
         }
 
+        RegisteredWaitHandle? exitWaitReg = Interlocked.Exchange(ref _exitApplicationWaitRegistration, null);
+        if (exitWaitReg is not null)
+        {
+            try
+            {
+                exitWaitReg.Unregister(null);
+            }
+            catch
+            {
+                // Ignore wait handle unregister errors on exit.
+            }
+        }
+
         EventWaitHandle? showEvent = Interlocked.Exchange(ref _showWindowEvent, null);
         showEvent?.Dispose();
+
+        EventWaitHandle? exitEvent = Interlocked.Exchange(ref _exitApplicationEvent, null);
+        exitEvent?.Dispose();
 
         Mutex? mutex = Interlocked.Exchange(ref _singleInstanceMutex, null);
         if (mutex is not null)
@@ -711,12 +810,11 @@ public partial class App : Application
 
     private async Task ExitApplicationAsync()
     {
-        if (_isShuttingDown)
+        if (Interlocked.Exchange(ref _shuttingDown, 1) != 0)
         {
             return;
         }
 
-        _isShuttingDown = true;
         UnsubscribeGlobalExceptionHandlers();
         UnsubscribeUserPreferenceChanged();
 

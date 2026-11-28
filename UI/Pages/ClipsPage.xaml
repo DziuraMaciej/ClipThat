@@ -720,7 +720,8 @@
                                             Grid.Column="0"
                                             PlaceholderText="Nazwa pliku wyjściowego..."
                                             VerticalAlignment="Center"
-                                            IsEnabled="False" />
+                                            IsEnabled="False"
+                                            TextChanged="ExportFileNameTextBox_TextChanged" />
 
                                 <Border Grid.Column="1"
                                         Background="#262626"

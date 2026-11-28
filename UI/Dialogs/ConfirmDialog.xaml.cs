@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
 using Wpf.Ui.Controls;
 
 namespace ClipThat.UI.Dialogs;
@@ -9,6 +10,8 @@ namespace ClipThat.UI.Dialogs;
 /// </summary>
 public partial class ConfirmDialog : FluentWindow
 {
+    private bool _isClosing;
+
     public ConfirmDialog(
         string title,
         string message,
@@ -34,23 +37,55 @@ public partial class ConfirmDialog : FluentWindow
         CancelButton.Focus();
     }
 
+    protected override void OnClosed(EventArgs e)
+    {
+        Loaded -= ConfirmDialog_Loaded;
+        base.OnClosed(e);
+    }
+
     private void HeaderArea_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (e.ChangedButton == MouseButton.Left)
+        if (e.ChangedButton == MouseButton.Left &&
+            e.ButtonState == MouseButtonState.Pressed &&
+            e.ClickCount == 1)
         {
-            DragMove();
+            try
+            {
+                DragMove();
+            }
+            catch (InvalidOperationException)
+            {
+                // Ignore if the mouse button was released before WPF began the drag operation.
+            }
         }
     }
 
     private void ConfirmButton_Click(object sender, RoutedEventArgs e)
     {
-        DialogResult = true;
-        Close();
+        CompleteDialog(result: true);
     }
 
     private void CancelButton_Click(object sender, RoutedEventArgs e)
     {
-        DialogResult = false;
-        Close();
+        CompleteDialog(result: false);
+    }
+
+    private void CompleteDialog(bool result)
+    {
+        if (_isClosing)
+        {
+            return;
+        }
+
+        _isClosing = true;
+
+        if (ComponentDispatcher.IsThreadModal)
+        {
+            DialogResult = result;
+        }
+        else
+        {
+            Close();
+        }
     }
 }
